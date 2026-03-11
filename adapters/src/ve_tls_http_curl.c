@@ -1,0 +1,231 @@
+#include "../../core/include/ve_tls_http.h"
+
+#include <curl/curl.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+
+typedef struct {
+    unsigned char * data;
+    size_t size;
+} ve_tls_buf;
+
+static size_t ve_tls_write_cb(char * ptr, size_t size, size_t nmemb, void * userdata) {
+    size_t total = size * nmemb;
+    ve_tls_buf * buf = (ve_tls_buf *)userdata;
+    unsigned char * next = (unsigned char *)realloc(buf->data, buf->size + total + 1);
+    if (!next) {
+        return 0;
+    }
+    buf->data = next;
+    memcpy(buf->data + buf->size, ptr, total);
+    buf->size += total;
+    buf->data[buf->size] = 0;
+    return total;
+}
+
+static size_t ve_tls_header_cb(char * ptr, size_t size, size_t nmemb, void * userdata) {
+    size_t total = size * nmemb;
+    ve_tls_http_response * resp = (ve_tls_http_response *)userdata;
+    const char * key = "x-tls-requestid:";
+    if (total > strlen(key) && strncasecmp(ptr, key, strlen(key)) == 0) {
+        char * start = ptr + strlen(key);
+        while (*start == ' ' || *start == '\t') {
+            start++;
+        }
+        char * end = ptr + total;
+        while (end > start && (end[-1] == '\r' || end[-1] == '\n')) {
+            end--;
+        }
+        size_t len = (size_t)(end - start);
+        char * id = (char *)calloc(1, len + 1);
+        if (id) {
+            memcpy(id, start, len);
+            resp->request_id = id;
+        }
+    }
+    return total;
+}
+
+static int ve_tls_curl_retryable(CURLcode code) {
+    switch (code) {
+        case CURLE_COULDNT_RESOLVE_PROXY:
+        case CURLE_COULDNT_RESOLVE_HOST:
+        case CURLE_COULDNT_CONNECT:
+        case CURLE_OPERATION_TIMEDOUT:
+        case CURLE_SEND_ERROR:
+        case CURLE_RECV_ERROR:
+        case CURLE_GOT_NOTHING:
+        case CURLE_PARTIAL_FILE:
+        case CURLE_SSL_CONNECT_ERROR:
+            return 1;
+        default:
+            return 0;
+    }
+}
+
+static const char * ve_tls_curl_error_code(CURLcode code) {
+    switch (code) {
+        case CURLE_OPERATION_TIMEDOUT:
+            return "TimeoutError";
+        case CURLE_COULDNT_RESOLVE_HOST:
+        case CURLE_COULDNT_RESOLVE_PROXY:
+            return "DNSError";
+        case CURLE_COULDNT_CONNECT:
+            return "ConnectError";
+        case CURLE_SSL_CONNECT_ERROR:
+            return "SSLError";
+        case CURLE_SEND_ERROR:
+            return "SendError";
+        case CURLE_RECV_ERROR:
+        case CURLE_GOT_NOTHING:
+        case CURLE_PARTIAL_FILE:
+            return "RecvError";
+        default:
+            return "TransportError";
+    }
+}
+
+static int ve_tls_http_curl_do(ve_tls_http_client * client, const ve_tls_http_request * req, ve_tls_http_response * resp) {
+    (void)client;
+    CURL * curl = curl_easy_init();
+    if (!curl) {
+        return -1;
+    }
+    ve_tls_buf body = {0};
+    struct curl_slist * headers = NULL;
+    if (req->headers && req->headers[0] != 0) {
+        const char * p = req->headers;
+        const char * start = p;
+        while (*p) {
+            if (*p == '\n') {
+                size_t len = (size_t)(p - start);
+                if (len > 0) {
+                    char * h = (char *)calloc(1, len + 1);
+                    if (h) {
+                        memcpy(h, start, len);
+                        headers = curl_slist_append(headers, h);
+                        free(h);
+                    }
+                }
+                start = p + 1;
+            }
+            p++;
+        }
+        if (p != start) {
+            size_t len = (size_t)(p - start);
+            char * h = (char *)calloc(1, len + 1);
+            if (h) {
+                memcpy(h, start, len);
+                headers = curl_slist_append(headers, h);
+                free(h);
+            }
+        }
+    }
+
+    curl_easy_setopt(curl, CURLOPT_URL, req->url);
+    curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, req->method);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, ve_tls_write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &body);
+    curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, ve_tls_header_cb);
+    curl_easy_setopt(curl, CURLOPT_HEADERDATA, resp);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+    if (req->tls_verify_peer == 0) {
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+    } else {
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+    }
+    if (req->tls_verify_host == 0) {
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
+    } else {
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
+    }
+    if (req->ca_cert_path && req->ca_cert_path[0] != 0) {
+        curl_easy_setopt(curl, CURLOPT_CAINFO, req->ca_cert_path);
+    }
+    if (req->proxy && req->proxy[0] != 0) {
+        curl_easy_setopt(curl, CURLOPT_PROXY, req->proxy);
+    }
+    if (req->user_agent && req->user_agent[0] != 0) {
+        curl_easy_setopt(curl, CURLOPT_USERAGENT, req->user_agent);
+    }
+    if (req->tcp_keepalive > 0) {
+        curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
+        if (req->tcp_keepidle > 0) {
+            curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, (long)req->tcp_keepidle);
+        }
+        if (req->tcp_keepintvl > 0) {
+            curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, (long)req->tcp_keepintvl);
+        }
+    }
+    if (req->connect_timeout_ms > 0) {
+        curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, (long)req->connect_timeout_ms);
+    }
+    if (req->timeout_ms > 0) {
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, (long)req->timeout_ms);
+    }
+    if (req->body && req->body_size > 0) {
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, req->body);
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)req->body_size);
+    }
+
+    CURLcode code = curl_easy_perform(curl);
+    if (code != CURLE_OK) {
+        resp->transport_kind = VE_TLS_TRANSPORT_CURL;
+        resp->transport_code = (int32_t)code;
+        resp->transport_retryable = ve_tls_curl_retryable(code) ? 1 : 0;
+        resp->error_code = strdup(ve_tls_curl_error_code(code));
+        const char * err = curl_easy_strerror(code);
+        if (err) {
+            resp->error_message = strdup(err);
+        }
+        curl_slist_free_all(headers);
+        curl_easy_cleanup(curl);
+        free(body.data);
+        return -1;
+    }
+    long http_code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+    resp->status_code = (int32_t)http_code;
+    resp->body = body.data;
+    resp->body_size = body.size;
+    resp->transport_kind = VE_TLS_TRANSPORT_NONE;
+    resp->transport_code = 0;
+    resp->transport_retryable = 0;
+    resp->error_code = NULL;
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+    return 0;
+}
+
+static void ve_tls_http_curl_free(ve_tls_http_client * client, ve_tls_http_response * resp) {
+    (void)client;
+    if (!resp) {
+        return;
+    }
+    free(resp->body);
+    free(resp->request_id);
+    free(resp->error_code);
+    free(resp->error_message);
+    resp->body = NULL;
+    resp->request_id = NULL;
+    resp->error_message = NULL;
+    resp->body_size = 0;
+    resp->error_code = NULL;
+    resp->status_code = 0;
+    resp->transport_kind = VE_TLS_TRANSPORT_NONE;
+    resp->transport_code = 0;
+    resp->transport_retryable = 0;
+}
+
+
+void ve_tls_http_client_init_curl(ve_tls_http_client * client) {
+    if (!client) {
+        return;
+    }
+    curl_global_init(CURL_GLOBAL_DEFAULT);
+    client->do_request = ve_tls_http_curl_do;
+    client->free_response = ve_tls_http_curl_free;
+    client->user_data = NULL;
+}
