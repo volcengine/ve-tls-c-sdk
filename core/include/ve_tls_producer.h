@@ -56,6 +56,7 @@ typedef struct {
     const ve_tls_kv * log_tags;
     size_t log_tag_count;
     const char * hash_key;
+    int32_t enable_time_ns;
     const char * access_key_id;
     const char * access_key_secret;
     const char * security_token;
@@ -164,10 +165,11 @@ void ve_tls_producer_set_send_done_v2(ve_tls_producer * producer, ve_tls_send_do
 void ve_tls_producer_get_metrics(ve_tls_producer * producer, ve_tls_metrics * out);
 
 ve_tls_result ve_tls_producer_add_log_raw(ve_tls_producer * producer, const char * log_buf, size_t log_size, int flush);
+ve_tls_result ve_tls_producer_add_log_raw_time_parts(ve_tls_producer * producer, int64_t time_ms, int32_t has_time_ns, uint32_t time_ns, const char * log_buf, size_t log_size, int flush);
 ve_tls_result ve_tls_producer_add_log_kv(ve_tls_producer * producer, int64_t time_ms, const ve_tls_kv * kvs, size_t kv_count, int flush);
-ve_tls_result ve_tls_producer_add_log_kv_ns(ve_tls_producer * producer, int64_t time_unix_ns, const ve_tls_kv * kvs, size_t kv_count, int flush);
 ve_tls_result ve_tls_producer_add_log_kv_hashkey(ve_tls_producer * producer, int64_t time_ms, const char * hash_key, const ve_tls_kv * kvs, size_t kv_count, int flush);
-ve_tls_result ve_tls_producer_add_log_kv_ns_hashkey(ve_tls_producer * producer, int64_t time_unix_ns, const char * hash_key, const ve_tls_kv * kvs, size_t kv_count, int flush);
+ve_tls_result ve_tls_producer_add_log_kv_time_parts(ve_tls_producer * producer, int64_t time_ms, int32_t has_time_ns, uint32_t time_ns, const ve_tls_kv * kvs, size_t kv_count, int flush);
+ve_tls_result ve_tls_producer_add_log_kv_time_parts_hashkey(ve_tls_producer * producer, int64_t time_ms, int32_t has_time_ns, uint32_t time_ns, const char * hash_key, const ve_tls_kv * kvs, size_t kv_count, int flush);
 ve_tls_result ve_tls_producer_flush(ve_tls_producer * producer);
 ve_tls_result ve_tls_producer_recover(ve_tls_producer * producer);
 ve_tls_result ve_tls_producer_export_raw_buffer(ve_tls_producer * producer, unsigned char ** out_buf, size_t * out_size);

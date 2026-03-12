@@ -12,6 +12,7 @@ typedef void * (*ve_tls_thread_fn)(void * arg);
 
 typedef struct {
     int64_t (*time_ms)(void);
+    int64_t (*time_unix_ns)(void);
     void (*sleep_ms)(int64_t ms);
     ve_tls_mutex * (*mutex_create)(void);
     void (*mutex_destroy)(ve_tls_mutex * m);

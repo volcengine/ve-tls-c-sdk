@@ -62,6 +62,7 @@ void ve_tls_producer_config_init(ve_tls_config * config) {
     config->agg_max_log_group_logs = 10000;
     config->agg_max_raw_bytes_per_request = 10 * 1024 * 1024;
     config->agg_max_compressed_bytes_per_request = 5 * 1024 * 1024;
+    config->enable_time_ns = 0;
     config->key_queue_max_active = 0;
     config->key_queue_bucket_count = 1024;
     config->key_queue_idle_ttl_ms = 0;

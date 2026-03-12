@@ -23,6 +23,12 @@ static int64_t ve_tls_posix_time_ms(void) {
     return (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
 }
 
+static int64_t ve_tls_posix_time_unix_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+}
+
 static void ve_tls_posix_sleep_ms(int64_t ms) {
     if (ms <= 0) {
         return;
@@ -122,6 +128,7 @@ void ve_tls_platform_init_default(ve_tls_platform * platform) {
         return;
     }
     platform->time_ms = ve_tls_posix_time_ms;
+    platform->time_unix_ns = ve_tls_posix_time_unix_ns;
     platform->sleep_ms = ve_tls_posix_sleep_ms;
     platform->mutex_create = ve_tls_pthread_mutex_create;
     platform->mutex_destroy = ve_tls_pthread_mutex_destroy;

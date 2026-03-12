@@ -357,6 +357,115 @@ static int test_export_import_raw_buffer(void) {
     return ok;
 }
 
+static int test_time_parts_roundtrip_in_raw_buffer(void) {
+    ve_tls_config cfg;
+    ve_tls_config_init(&cfg);
+    cfg.endpoint = "https://example.com";
+    cfg.region = "cn-beijing";
+    cfg.topic_id = "t";
+    cfg.access_key_id = "ak";
+    cfg.access_key_secret = "sk";
+    cfg.retry_policy.max_attempts = 1;
+    cfg.flush_interval_ms = 0;
+    cfg.enable_time_ns = 1;
+    cfg.platform.time_ms = NULL;
+    cfg.platform.time_unix_ns = NULL;
+
+    ve_tls_producer * p = ve_tls_producer_create(&cfg);
+    if (!p) {
+        return -1;
+    }
+    ve_tls_kv kvs[1];
+    kvs[0].key = "k1";
+    kvs[0].value = "v1";
+    if (ve_tls_producer_add_log_kv_time_parts(p, 1710000000000LL, 1, 123456, kvs, 1, 0) != VE_TLS_OK) {
+        ve_tls_producer_destroy(p);
+        return -1;
+    }
+    unsigned char * b = NULL;
+    size_t n = 0;
+    if (ve_tls_producer_export_raw_buffer(p, &b, &n) != VE_TLS_OK || !b || n == 0) {
+        ve_tls_producer_destroy(p);
+        return -1;
+    }
+    int ok = 0;
+    size_t off = 0;
+    if (n >= 4 + 4 + 4 + 8) {
+        off = 4 + 4 + 4 + 8;
+        if (off + 8 + 8 + 1 + 4 <= n) {
+            off += 8;
+            uint64_t tm = 0;
+            for (int i = 0; i < 8; i++) {
+                tm |= ((uint64_t)b[off + i]) << (8 * i);
+            }
+            off += 8;
+            unsigned char has = b[off++];
+            uint32_t ns = 0;
+            for (int i = 0; i < 4; i++) {
+                ns |= ((uint32_t)b[off + i]) << (8 * i);
+            }
+            ok = (tm == (uint64_t)1710000000000LL && has == 1 && ns == 123456) ? 1 : 0;
+        }
+    }
+    ve_tls_producer_free_raw_buffer(b);
+    ve_tls_producer_destroy(p);
+    return ok ? 0 : -1;
+}
+
+static int64_t stub_time_ms(void) { return 0; }
+static int64_t stub_time_unix_ns(void) { return 1710000000000LL * 1000000LL + 654321; }
+
+static int test_auto_time_ns_when_time_missing(void) {
+    ve_tls_config cfg;
+    ve_tls_config_init(&cfg);
+    cfg.endpoint = "https://example.com";
+    cfg.region = "cn-beijing";
+    cfg.topic_id = "t";
+    cfg.access_key_id = "ak";
+    cfg.access_key_secret = "sk";
+    cfg.retry_policy.max_attempts = 1;
+    cfg.flush_interval_ms = 0;
+    cfg.enable_time_ns = 1;
+    cfg.platform.time_ms = stub_time_ms;
+    cfg.platform.time_unix_ns = stub_time_unix_ns;
+
+    ve_tls_producer * p = ve_tls_producer_create(&cfg);
+    if (!p) {
+        return -1;
+    }
+    ve_tls_kv kvs[1];
+    kvs[0].key = "k1";
+    kvs[0].value = "v1";
+    if (ve_tls_producer_add_log_kv_time_parts(p, 0, 0, 0, kvs, 1, 0) != VE_TLS_OK) {
+        ve_tls_producer_destroy(p);
+        return -1;
+    }
+    unsigned char * b = NULL;
+    size_t n = 0;
+    if (ve_tls_producer_export_raw_buffer(p, &b, &n) != VE_TLS_OK || !b || n == 0) {
+        ve_tls_producer_destroy(p);
+        return -1;
+    }
+    int ok = 0;
+    size_t off = 4 + 4 + 4 + 8 + 8;
+    if (n >= off + 8 + 1 + 4) {
+        uint64_t tm = 0;
+        for (int i = 0; i < 8; i++) {
+            tm |= ((uint64_t)b[off + i]) << (8 * i);
+        }
+        off += 8;
+        unsigned char has = b[off++];
+        uint32_t ns = 0;
+        for (int i = 0; i < 4; i++) {
+            ns |= ((uint32_t)b[off + i]) << (8 * i);
+        }
+        ok = (tm == (uint64_t)1710000000000LL && has == 1 && ns == 654321) ? 1 : 0;
+    }
+    ve_tls_producer_free_raw_buffer(b);
+    ve_tls_producer_destroy(p);
+    return ok ? 0 : -1;
+}
+
 static int g_metrics_done = 0;
 static int g_metrics_ok = 0;
 static int g_metrics_latency_events = 0;
@@ -2021,7 +2130,9 @@ int main(void) {
     if (test_structured_error_and_retryable() != 0) return 6;
     if (test_export_import_raw_buffer() != 0) return 7;
     if (test_manager_callback_no_raw_buffer_on_compress_error() != 0) return 8;
-    if (test_metrics_basic() != 0) return 9;
+    if (test_time_parts_roundtrip_in_raw_buffer() != 0) return 9;
+    if (test_auto_time_ns_when_time_missing() != 0) return 10;
+    if (test_metrics_basic() != 0) return 11;
     if (test_ordered_send_max_concurrency_one() != 0) return 9;
     if (test_hashkey_partition_parallelism() != 0) return 10;
     if (test_agg_strategy_split_by_compressed_limit() != 0) return 11;

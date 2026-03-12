@@ -101,6 +101,12 @@ ve_tls_producer_destroy(p);
 return rc == VE_TLS_OK ? 0 : 2;
 ```
 
+### 时间字段与 IO 统计头说明
+
+`time/timeNs` 与 `log-count/earliest-log-time/latest-log-time` 的语义、推荐用法与 raw 写入边界见：
+
+- [producer-time-and-io-stats.md](file:///Users/bytedance/workspace/src/sdk/volcengine-sdk/ve-tls-android-sdk/ve-tls-c-sdk/docs/producer-time-and-io-stats.md)
+
 ### 真实环境 Demo
 
 - 可执行 demo：`tools/real_demo.c`
