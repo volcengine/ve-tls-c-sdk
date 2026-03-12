@@ -19,7 +19,7 @@
 ## 错误与回调
 - 错误码结构包含 requestID、httpCode、errorCode、errorMessage
 - 发送回调返回成功/失败与可重试状态
-- 失败回调包含原始 buffer 引用用于诊断
+- 回调不返回原始 buffer（避免泄露），诊断依赖 requestID 与结构化错误
 
 ## 指标与观测
 - 关键路径错误日志输出

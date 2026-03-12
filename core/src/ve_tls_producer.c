@@ -3,6 +3,77 @@
 #include <stdlib.h>
 #include <string.h>
 
+static int ve_tls_str_empty(const char * s) {
+    return !s || s[0] == 0;
+}
+
+static char * ve_tls_dup_cstr(const char * s) {
+    return s ? strdup(s) : NULL;
+}
+
+static void ve_tls_secure_zero(void * p, size_t n) {
+    if (!p || n == 0) {
+        return;
+    }
+    volatile unsigned char * vp = (volatile unsigned char *)p;
+    while (n--) {
+        *vp++ = 0;
+    }
+}
+
+static void ve_tls_secure_free_str(char ** ps) {
+    if (!ps || !*ps) {
+        return;
+    }
+    size_t n = strlen(*ps);
+    ve_tls_secure_zero(*ps, n);
+    free(*ps);
+    *ps = NULL;
+}
+
+static int ve_tls_copy_log_tags(const ve_tls_kv * tags, size_t count, ve_tls_kv ** out_tags, size_t * out_count) {
+    *out_tags = NULL;
+    *out_count = 0;
+    if (!tags || count == 0) {
+        return 0;
+    }
+    ve_tls_kv * copy = (ve_tls_kv *)calloc(count, sizeof(ve_tls_kv));
+    if (!copy) {
+        return -1;
+    }
+    for (size_t i = 0; i < count; i++) {
+        copy[i].key = ve_tls_dup_cstr(tags[i].key);
+        copy[i].value = ve_tls_dup_cstr(tags[i].value);
+        if ((tags[i].key && !copy[i].key) || (tags[i].value && !copy[i].value)) {
+            for (size_t j = 0; j <= i; j++) {
+                free((void *)copy[j].key);
+                free((void *)copy[j].value);
+            }
+            free(copy);
+            return -1;
+        }
+    }
+    *out_tags = copy;
+    *out_count = count;
+    return 0;
+}
+
+static int ve_tls_is_http_url(const char * s) {
+    if (ve_tls_str_empty(s)) return 0;
+    return strncmp(s, "http://", 7) == 0 || strncmp(s, "https://", 8) == 0;
+}
+
+static int ve_tls_config_is_valid_for_create(const ve_tls_config * cfg) {
+    if (!cfg) return 0;
+    if (!ve_tls_is_http_url(cfg->endpoint)) return 0;
+    if (ve_tls_str_empty(cfg->region)) return 0;
+    if (ve_tls_str_empty(cfg->topic_id)) return 0;
+    if (!cfg->credentials_provider) {
+        if (ve_tls_str_empty(cfg->access_key_id) || ve_tls_str_empty(cfg->access_key_secret)) return 0;
+    }
+    return 1;
+}
+
 static int ve_tls_producer_is_drained_locked(ve_tls_producer * producer) {
     if (!producer) {
         return 1;
@@ -38,11 +109,62 @@ ve_tls_producer * ve_tls_producer_create(const ve_tls_config * config) {
     if (!config) {
         return NULL;
     }
+    if (!ve_tls_config_is_valid_for_create(config)) {
+        return NULL;
+    }
     ve_tls_producer * producer = (ve_tls_producer *)calloc(1, sizeof(ve_tls_producer));
     if (!producer) {
         return NULL;
     }
     producer->config = *config;
+    producer->cfg_endpoint = strdup(config->endpoint);
+    producer->cfg_region = strdup(config->region);
+    producer->cfg_project_id = ve_tls_dup_cstr(config->project_id);
+    producer->cfg_topic_id = strdup(config->topic_id);
+    producer->cfg_source = ve_tls_dup_cstr(config->source);
+    producer->cfg_file_name = ve_tls_dup_cstr(config->file_name);
+    producer->cfg_context_flow = ve_tls_dup_cstr(config->context_flow);
+    producer->cfg_hash_key = ve_tls_dup_cstr(config->hash_key);
+    producer->cfg_access_key_id = config->access_key_id ? strdup(config->access_key_id) : NULL;
+    producer->cfg_access_key_secret = config->access_key_secret ? strdup(config->access_key_secret) : NULL;
+    producer->cfg_security_token = (config->security_token && config->security_token[0] != 0) ? strdup(config->security_token) : NULL;
+    producer->cfg_api_version = ve_tls_dup_cstr(config->api_version);
+    producer->cfg_compress_type = ve_tls_dup_cstr(config->compress_type);
+    producer->cfg_ca_cert_path = ve_tls_dup_cstr(config->ca_cert_path);
+    producer->cfg_proxy = ve_tls_dup_cstr(config->proxy);
+    producer->cfg_user_agent = ve_tls_dup_cstr(config->user_agent);
+    producer->cfg_persistent_file_path = ve_tls_dup_cstr(config->persistent_file_path);
+    if (config->log_tag_count > 0 && !config->log_tags) {
+        ve_tls_producer_destroy(producer);
+        return NULL;
+    }
+    if (ve_tls_copy_log_tags(config->log_tags, config->log_tag_count, &producer->cfg_log_tags, &producer->cfg_log_tag_count) != 0) {
+        ve_tls_producer_destroy(producer);
+        return NULL;
+    }
+    if (!producer->cfg_endpoint || !producer->cfg_region || !producer->cfg_topic_id) {
+        ve_tls_producer_destroy(producer);
+        return NULL;
+    }
+    producer->config.endpoint = producer->cfg_endpoint;
+    producer->config.region = producer->cfg_region;
+    producer->config.project_id = producer->cfg_project_id;
+    producer->config.topic_id = producer->cfg_topic_id;
+    producer->config.source = producer->cfg_source;
+    producer->config.file_name = producer->cfg_file_name;
+    producer->config.context_flow = producer->cfg_context_flow;
+    producer->config.log_tags = producer->cfg_log_tags;
+    producer->config.log_tag_count = producer->cfg_log_tag_count;
+    producer->config.hash_key = producer->cfg_hash_key;
+    producer->config.access_key_id = producer->cfg_access_key_id;
+    producer->config.access_key_secret = producer->cfg_access_key_secret;
+    producer->config.security_token = producer->cfg_security_token;
+    producer->config.api_version = producer->cfg_api_version;
+    producer->config.compress_type = producer->cfg_compress_type;
+    producer->config.ca_cert_path = producer->cfg_ca_cert_path;
+    producer->config.proxy = producer->cfg_proxy;
+    producer->config.user_agent = producer->cfg_user_agent;
+    producer->config.persistent_file_path = producer->cfg_persistent_file_path;
     producer->mutex = producer->config.platform.mutex_create();
     producer->cond = producer->config.platform.cond_create();
     producer->send_cond = producer->config.platform.cond_create();
@@ -84,12 +206,106 @@ ve_tls_producer * ve_tls_producer_create(const ve_tls_config * config) {
     return producer;
 }
 
+ve_tls_result ve_tls_producer_update_endpoint(ve_tls_producer * producer, const char * endpoint, const char * region, const char * topic_id) {
+    if (!producer) {
+        return VE_TLS_INVALID;
+    }
+    if ((endpoint && !ve_tls_is_http_url(endpoint)) || (region && ve_tls_str_empty(region)) || (topic_id && ve_tls_str_empty(topic_id))) {
+        return VE_TLS_INVALID;
+    }
+    char * new_endpoint = endpoint ? strdup(endpoint) : NULL;
+    char * new_region = region ? strdup(region) : NULL;
+    char * new_topic_id = topic_id ? strdup(topic_id) : NULL;
+    if ((endpoint && !new_endpoint) || (region && !new_region) || (topic_id && !new_topic_id)) {
+        free(new_endpoint);
+        free(new_region);
+        free(new_topic_id);
+        return VE_TLS_DROP_ERROR;
+    }
+    producer->config.platform.mutex_lock(producer->mutex);
+    if (producer->stop || producer->closing || !producer->accepting) {
+        producer->config.platform.mutex_unlock(producer->mutex);
+        free(new_endpoint);
+        free(new_region);
+        free(new_topic_id);
+        return VE_TLS_CLOSED;
+    }
+    if (new_endpoint) {
+        free(producer->cfg_endpoint);
+        producer->cfg_endpoint = new_endpoint;
+        producer->config.endpoint = producer->cfg_endpoint;
+    }
+    if (new_region) {
+        free(producer->cfg_region);
+        producer->cfg_region = new_region;
+        producer->config.region = producer->cfg_region;
+    }
+    if (new_topic_id) {
+        free(producer->cfg_topic_id);
+        producer->cfg_topic_id = new_topic_id;
+        producer->config.topic_id = producer->cfg_topic_id;
+    }
+    producer->config.platform.mutex_unlock(producer->mutex);
+    ve_tls_metrics_emit(producer, "config_update_endpoint", 1, 0);
+    return VE_TLS_OK;
+}
+
+ve_tls_result ve_tls_producer_update_static_credentials(ve_tls_producer * producer, const char * access_key_id, const char * access_key_secret, const char * security_token) {
+    if (!producer) {
+        return VE_TLS_INVALID;
+    }
+    if ((access_key_id && ve_tls_str_empty(access_key_id)) || (access_key_secret && ve_tls_str_empty(access_key_secret))) {
+        return VE_TLS_INVALID;
+    }
+    if ((access_key_id && !access_key_secret) || (!access_key_id && access_key_secret)) {
+        return VE_TLS_INVALID;
+    }
+    char * new_ak = access_key_id ? strdup(access_key_id) : NULL;
+    char * new_sk = access_key_secret ? strdup(access_key_secret) : NULL;
+    char * new_tok = (security_token && security_token[0] != 0) ? strdup(security_token) : NULL;
+    if ((access_key_id && (!new_ak || !new_sk)) || (security_token && security_token[0] != 0 && !new_tok)) {
+        free(new_ak);
+        free(new_sk);
+        free(new_tok);
+        return VE_TLS_DROP_ERROR;
+    }
+    producer->config.platform.mutex_lock(producer->mutex);
+    if (producer->stop || producer->closing || !producer->accepting) {
+        producer->config.platform.mutex_unlock(producer->mutex);
+        free(new_ak);
+        free(new_sk);
+        free(new_tok);
+        return VE_TLS_CLOSED;
+    }
+    if (access_key_id) {
+        ve_tls_secure_free_str(&producer->cfg_access_key_id);
+        ve_tls_secure_free_str(&producer->cfg_access_key_secret);
+        producer->cfg_access_key_id = new_ak;
+        producer->cfg_access_key_secret = new_sk;
+        producer->config.access_key_id = producer->cfg_access_key_id;
+        producer->config.access_key_secret = producer->cfg_access_key_secret;
+    } else {
+        free(new_ak);
+        free(new_sk);
+    }
+    if (security_token) {
+        ve_tls_secure_free_str(&producer->cfg_security_token);
+        producer->cfg_security_token = new_tok;
+        producer->config.security_token = producer->cfg_security_token;
+    } else {
+        free(new_tok);
+    }
+    producer->config.platform.mutex_unlock(producer->mutex);
+    ve_tls_metrics_emit(producer, "config_update_credentials", 1, 0);
+    return VE_TLS_OK;
+}
+
 ve_tls_result ve_tls_producer_close(ve_tls_producer * producer, int32_t timeout_ms) {
     if (!producer) {
         return VE_TLS_INVALID;
     }
-    producer->config.platform.mutex_lock(producer->mutex);
     ve_tls_metrics_emit(producer, "close_start", 1, timeout_ms);
+    producer->config.platform.mutex_lock(producer->mutex);
     producer->accepting = 0;
     producer->closing = 1;
     producer->flush_requested = 1;
@@ -101,9 +317,11 @@ ve_tls_result ve_tls_producer_close(ve_tls_producer * producer, int32_t timeout_
     ve_tls_cond * wait_cond = producer->send_cond ? producer->send_cond : producer->cond;
     ve_tls_result rc = VE_TLS_OK;
     int join_threads = 0;
+    int emit_drain_ok = 0;
+    int emit_timeout = 0;
     for (;;) {
         if (ve_tls_producer_is_drained_locked(producer)) {
-            ve_tls_metrics_emit(producer, "close_drain_ok", 1, 0);
+            emit_drain_ok = 1;
             producer->closing = 0;
             producer->stop = 1;
             producer->config.platform.cond_broadcast(producer->cond);
@@ -114,7 +332,7 @@ ve_tls_result ve_tls_producer_close(ve_tls_producer * producer, int32_t timeout_
             break;
         }
         if (timeout_ms == 0) {
-            ve_tls_metrics_emit(producer, "close_timeout", 1, 0);
+            emit_timeout = 1;
             rc = VE_TLS_TIMEOUT;
             break;
         }
@@ -124,7 +342,7 @@ ve_tls_result ve_tls_producer_close(ve_tls_producer * producer, int32_t timeout_
             int64_t elapsed = now - start_ms;
             int64_t remain = (int64_t)timeout_ms - elapsed;
             if (remain <= 0) {
-                ve_tls_metrics_emit(producer, "close_timeout", 1, 0);
+                emit_timeout = 1;
                 rc = VE_TLS_TIMEOUT;
                 break;
             }
@@ -135,6 +353,11 @@ ve_tls_result ve_tls_producer_close(ve_tls_producer * producer, int32_t timeout_
         (void)producer->config.platform.cond_timedwait_ms(wait_cond, producer->mutex, wait_ms);
     }
     producer->config.platform.mutex_unlock(producer->mutex);
+    if (emit_drain_ok) {
+        ve_tls_metrics_emit(producer, "close_drain_ok", 1, 0);
+    } else if (emit_timeout) {
+        ve_tls_metrics_emit(producer, "close_timeout", 1, 0);
+    }
     if (join_threads) {
         if (producer->worker) {
             producer->config.platform.thread_join(producer->worker);
@@ -186,9 +409,52 @@ void ve_tls_producer_destroy(ve_tls_producer * producer) {
     ve_tls_queue_free_all(producer);
     ve_tls_key_map_free_all(producer);
     ve_tls_send_queue_destroy(&producer->send_queue);
-    free(producer->cred_access_key_id);
-    free(producer->cred_access_key_secret);
-    free(producer->cred_security_token);
+    free(producer->cfg_endpoint);
+    free(producer->cfg_region);
+    free(producer->cfg_project_id);
+    free(producer->cfg_topic_id);
+    free(producer->cfg_source);
+    free(producer->cfg_file_name);
+    free(producer->cfg_context_flow);
+    if (producer->cfg_log_tags) {
+        for (size_t i = 0; i < producer->cfg_log_tag_count; i++) {
+            free((void *)producer->cfg_log_tags[i].key);
+            free((void *)producer->cfg_log_tags[i].value);
+        }
+        free(producer->cfg_log_tags);
+    }
+    free(producer->cfg_hash_key);
+    ve_tls_secure_free_str(&producer->cfg_access_key_id);
+    ve_tls_secure_free_str(&producer->cfg_access_key_secret);
+    ve_tls_secure_free_str(&producer->cfg_security_token);
+    free(producer->cfg_api_version);
+    free(producer->cfg_compress_type);
+    free(producer->cfg_ca_cert_path);
+    free(producer->cfg_proxy);
+    free(producer->cfg_user_agent);
+    free(producer->cfg_persistent_file_path);
+    producer->cfg_endpoint = NULL;
+    producer->cfg_region = NULL;
+    producer->cfg_project_id = NULL;
+    producer->cfg_topic_id = NULL;
+    producer->cfg_source = NULL;
+    producer->cfg_file_name = NULL;
+    producer->cfg_context_flow = NULL;
+    producer->cfg_log_tags = NULL;
+    producer->cfg_log_tag_count = 0;
+    producer->cfg_hash_key = NULL;
+    producer->cfg_access_key_id = NULL;
+    producer->cfg_access_key_secret = NULL;
+    producer->cfg_security_token = NULL;
+    producer->cfg_api_version = NULL;
+    producer->cfg_compress_type = NULL;
+    producer->cfg_ca_cert_path = NULL;
+    producer->cfg_proxy = NULL;
+    producer->cfg_user_agent = NULL;
+    producer->cfg_persistent_file_path = NULL;
+    ve_tls_secure_free_str(&producer->cred_access_key_id);
+    ve_tls_secure_free_str(&producer->cred_access_key_secret);
+    ve_tls_secure_free_str(&producer->cred_security_token);
     producer->cred_access_key_id = NULL;
     producer->cred_access_key_secret = NULL;
     producer->cred_security_token = NULL;
@@ -211,16 +477,28 @@ void ve_tls_producer_set_send_done(ve_tls_producer * producer, ve_tls_send_done_
     if (!producer) {
         return;
     }
+    if (producer->mutex) {
+        producer->config.platform.mutex_lock(producer->mutex);
+    }
     producer->send_done = callback;
     producer->send_done_param = user_param;
+    if (producer->mutex) {
+        producer->config.platform.mutex_unlock(producer->mutex);
+    }
 }
 
 void ve_tls_producer_set_send_done_v2(ve_tls_producer * producer, ve_tls_send_done_v2_fn callback, void * user_param) {
     if (!producer) {
         return;
     }
+    if (producer->mutex) {
+        producer->config.platform.mutex_lock(producer->mutex);
+    }
     producer->send_done_v2 = callback;
     producer->send_done_v2_param = user_param;
+    if (producer->mutex) {
+        producer->config.platform.mutex_unlock(producer->mutex);
+    }
 }
 
 void ve_tls_producer_get_metrics(ve_tls_producer * producer, ve_tls_metrics * out) {
@@ -268,12 +546,13 @@ ve_tls_result ve_tls_producer_add_log_raw(ve_tls_producer * producer, const char
     }
     ve_tls_metric_inc_u64(&producer->m_logs_enqueued_total, 1);
     ve_tls_metric_inc_u64(&producer->m_bytes_enqueued_total, log_size);
-    ve_tls_metrics_emit(producer, "log_enqueued", 1, (int64_t)log_size);
+    int64_t emit_size = (int64_t)log_size;
     if (flush) {
         producer->flush_requested = 1;
     }
     producer->config.platform.cond_signal(producer->cond);
     producer->config.platform.mutex_unlock(producer->mutex);
+    ve_tls_metrics_emit(producer, "log_enqueued", 1, emit_size);
     return VE_TLS_OK;
 }
 
@@ -321,12 +600,13 @@ ve_tls_result ve_tls_producer_add_log_kv_hashkey(ve_tls_producer * producer, int
     }
     ve_tls_metric_inc_u64(&producer->m_logs_enqueued_total, 1);
     ve_tls_metric_inc_u64(&producer->m_bytes_enqueued_total, b.size);
-    ve_tls_metrics_emit(producer, "log_enqueued", 1, (int64_t)b.size);
+    int64_t emit_size = (int64_t)b.size;
     if (flush) {
         producer->flush_requested = 1;
     }
     producer->config.platform.cond_signal(producer->cond);
     producer->config.platform.mutex_unlock(producer->mutex);
+    ve_tls_metrics_emit(producer, "log_enqueued", 1, emit_size);
     ve_tls_bytes_free(&b);
     return VE_TLS_OK;
 }
@@ -377,12 +657,13 @@ ve_tls_result ve_tls_producer_add_log_kv_ns_hashkey(ve_tls_producer * producer, 
     }
     ve_tls_metric_inc_u64(&producer->m_logs_enqueued_total, 1);
     ve_tls_metric_inc_u64(&producer->m_bytes_enqueued_total, b.size);
-    ve_tls_metrics_emit(producer, "log_enqueued", 1, (int64_t)b.size);
+    int64_t emit_size = (int64_t)b.size;
     if (flush) {
         producer->flush_requested = 1;
     }
     producer->config.platform.cond_signal(producer->cond);
     producer->config.platform.mutex_unlock(producer->mutex);
+    ve_tls_metrics_emit(producer, "log_enqueued", 1, emit_size);
     ve_tls_bytes_free(&b);
     return VE_TLS_OK;
 }
@@ -460,13 +741,36 @@ ve_tls_result ve_tls_producer_export_raw_buffer(ve_tls_producer * producer, unsi
     *out_size = 0;
 
     producer->config.platform.mutex_lock(producer->mutex);
+    if (producer->queue_count > 0xFFFFFFFFu) {
+        producer->config.platform.mutex_unlock(producer->mutex);
+        return VE_TLS_DROP_ERROR;
+    }
     uint32_t count = (uint32_t)producer->queue_count;
     size_t total = 4 + 4 + 4 + 8;
     for (size_t i = 0; i < producer->queue_count; i++) {
         size_t idx = (producer->queue_head + i) % producer->queue_cap;
         ve_tls_log_item * it = &producer->queue[idx];
-        uint32_t hk_len = it->hash_key ? (uint32_t)strlen(it->hash_key) : 0;
-        total += 8 + 8 + 1 + 4 + 4 + 4 + (size_t)hk_len + it->size;
+        size_t hk_len_sz = it->hash_key ? strlen(it->hash_key) : 0;
+        if (hk_len_sz > 0xFFFFFFFFu || it->size > 0xFFFFFFFFu) {
+            producer->config.platform.mutex_unlock(producer->mutex);
+            return VE_TLS_DROP_ERROR;
+        }
+        size_t add = 8 + 8 + 1 + 4 + 4 + 4;
+        if (add > (size_t)-1 - hk_len_sz) {
+            producer->config.platform.mutex_unlock(producer->mutex);
+            return VE_TLS_DROP_ERROR;
+        }
+        add += hk_len_sz;
+        if (add > (size_t)-1 - it->size) {
+            producer->config.platform.mutex_unlock(producer->mutex);
+            return VE_TLS_DROP_ERROR;
+        }
+        add += it->size;
+        if (total > (size_t)-1 - add) {
+            producer->config.platform.mutex_unlock(producer->mutex);
+            return VE_TLS_DROP_ERROR;
+        }
+        total += add;
     }
     unsigned char * buf = (unsigned char *)malloc(total);
     if (!buf) {
@@ -549,8 +853,16 @@ ve_tls_result ve_tls_producer_import_raw_buffer(ve_tls_producer * producer, cons
             ve_tls_read_u8(buf, size, &off, &has_ns) != 0 ||
             ve_tls_read_u32_le(buf, size, &off, &time_ns) != 0 ||
             (version == 2 && ve_tls_read_u32_le(buf, size, &off, &hk_len) != 0) ||
-            ve_tls_read_u32_le(buf, size, &off, &data_size) != 0 ||
-            off + (size_t)hk_len + data_size > size) {
+            ve_tls_read_u32_le(buf, size, &off, &data_size) != 0) {
+            producer->config.platform.mutex_unlock(producer->mutex);
+            return VE_TLS_INVALID;
+        }
+        if (off > size) {
+            producer->config.platform.mutex_unlock(producer->mutex);
+            return VE_TLS_INVALID;
+        }
+        size_t remain = size - off;
+        if (remain < (size_t)hk_len) {
             producer->config.platform.mutex_unlock(producer->mutex);
             return VE_TLS_INVALID;
         }
@@ -569,6 +881,11 @@ ve_tls_result ve_tls_producer_import_raw_buffer(ve_tls_producer * producer, cons
             hk[hk_len] = 0;
         }
         off += (size_t)hk_len;
+        if (off > size || (size - off) < (size_t)data_size) {
+            free(hk);
+            producer->config.platform.mutex_unlock(producer->mutex);
+            return VE_TLS_INVALID;
+        }
         if (ve_tls_queue_push(producer, buf + off, data_size, (int64_t)id, (int64_t)time_ms, time_ns, has_ns ? 1 : 0, hk) != 0) {
             free(hk);
             producer->config.platform.mutex_unlock(producer->mutex);

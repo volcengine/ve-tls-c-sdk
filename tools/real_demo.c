@@ -1,4 +1,4 @@
-#include "../core/include/ve_tls_producer.h"
+#include "ve_tls_producer.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -138,7 +138,7 @@ static void metrics_emit(const char * name, int64_t v1, int64_t v2, void * user_
     fprintf(stderr, "metric name=%s v1=%lld v2=%lld\n", name, (long long)v1, (long long)v2);
 }
 
-static void print_cfg(const ve_tls_config * cfg, int demo_count, int interval_ms, int wait_ms, int debug, int metrics) {
+static void print_cfg(const ve_tls_config * cfg, int demo_count, int interval_ms, int wait_ms, int debug, int metrics, int http_debug) {
     if (!cfg) return;
     int ak_set = cfg->access_key_id && cfg->access_key_id[0] != 0;
     int sk_set = cfg->access_key_secret && cfg->access_key_secret[0] != 0;
@@ -168,15 +168,15 @@ static void print_cfg(const ve_tls_config * cfg, int demo_count, int interval_ms
         "io-stats headers x-tls-bodyrawsize x-tls-compresstype log-count earliest-log-time latest-log-time\n"
     );
     fprintf(stderr,
-        "auth ak_set=%d sk_set=%d token_set=%d demo count=%d interval_ms=%d wait_ms=%d debug=%d metrics=%d\n",
-        ak_set, sk_set, token_set, demo_count, interval_ms, wait_ms, debug, metrics
+        "auth ak_set=%d sk_set=%d token_set=%d demo count=%d interval_ms=%d wait_ms=%d debug=%d metrics=%d http_debug=%d\n",
+        ak_set, sk_set, token_set, demo_count, interval_ms, wait_ms, debug, metrics, http_debug
     );
 }
 
 static void usage(const char * argv0) {
     fprintf(stderr, "usage: %s [--config path] [--count N] [--interval-ms M] [--wait-ms M] [--duration-s S]\n", argv0 ? argv0 : "ve_tls_demo_real");
     fprintf(stderr, "required env/config keys: VE_TLS_ENDPOINT VE_TLS_REGION VE_TLS_TOPIC_ID VE_TLS_ACCESS_KEY_ID VE_TLS_ACCESS_KEY_SECRET\n");
-    fprintf(stderr, "optional keys: VE_TLS_SECURITY_TOKEN VE_TLS_COMPRESS_TYPE VE_TLS_SEND_THREAD_COUNT VE_TLS_FLUSH_INTERVAL_MS VE_TLS_REQUEST_TIMEOUT_MS VE_TLS_CONNECT_TIMEOUT_MS VE_TLS_CA_CERT_PATH VE_TLS_PROXY VE_TLS_TLS_VERIFY_PEER VE_TLS_TLS_VERIFY_HOST VE_TLS_USER_AGENT VE_TLS_HASH_KEY\n");
+    fprintf(stderr, "optional keys: VE_TLS_SECURITY_TOKEN VE_TLS_COMPRESS_TYPE VE_TLS_SEND_THREAD_COUNT VE_TLS_FLUSH_INTERVAL_MS VE_TLS_REQUEST_TIMEOUT_MS VE_TLS_CONNECT_TIMEOUT_MS VE_TLS_CA_CERT_PATH VE_TLS_PROXY VE_TLS_TLS_VERIFY_PEER VE_TLS_TLS_VERIFY_HOST VE_TLS_USER_AGENT VE_TLS_HASH_KEY VE_TLS_HTTP_DEBUG\n");
     fprintf(stderr, "demo keys: VE_TLS_DEMO_MESSAGE VE_TLS_DEMO_DEBUG VE_TLS_DEMO_METRICS VE_TLS_DEMO_RATE_LPS VE_TLS_DEMO_DURATION_S VE_TLS_DEMO_FLUSH_EVERY_N\n");
 }
 
@@ -252,6 +252,7 @@ int main(int argc, char ** argv) {
     cfg.proxy = get_str(&conf, "VE_TLS_PROXY", cfg.proxy);
     cfg.user_agent = get_str(&conf, "VE_TLS_USER_AGENT", cfg.user_agent);
     cfg.hash_key = get_str(&conf, "VE_TLS_HASH_KEY", cfg.hash_key);
+    cfg.http_debug = get_i32(&conf, "VE_TLS_HTTP_DEBUG", cfg.http_debug);
 
     int demo_debug = get_i32(&conf, "VE_TLS_DEMO_DEBUG", 0);
     int demo_metrics = get_i32(&conf, "VE_TLS_DEMO_METRICS", 0);
@@ -274,7 +275,7 @@ int main(int argc, char ** argv) {
     }
 
     const char * msg = get_str(&conf, "VE_TLS_DEMO_MESSAGE", "hello");
-    print_cfg(&cfg, (int)count, (int)interval_ms, (int)wait_ms, demo_debug, demo_metrics);
+    print_cfg(&cfg, (int)count, (int)interval_ms, (int)wait_ms, demo_debug, demo_metrics, cfg.http_debug);
 
     ve_tls_producer * p = ve_tls_producer_create(&cfg);
     if (!p) {

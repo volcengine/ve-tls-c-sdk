@@ -1,10 +1,10 @@
-#include "../core/include/ve_tls_hash.h"
-#include "../core/include/ve_tls_compress.h"
-#include "../core/include/ve_tls_proto.h"
-#include "../core/include/ve_tls_sign.h"
-#include "../core/include/ve_tls_producer.h"
-#include "../core/include/ve_tls_version.h"
-#include "../core/src/producer/ve_tls_producer_internal.h"
+#include "ve_tls_hash.h"
+#include "ve_tls_compress.h"
+#include "ve_tls_proto.h"
+#include "ve_tls_sign.h"
+#include "ve_tls_producer.h"
+#include "ve_tls_version.h"
+#include "producer/ve_tls_producer_internal.h"
 
 #include <string.h>
 #include <stdlib.h>
@@ -77,11 +77,14 @@ static void on_send_done_v2(
 ) {
     (void)log_bytes;
     (void)compressed_bytes;
-    (void)raw_buffer;
     (void)user_param;
     (void)start_id;
     (void)end_id;
     g_http_done = 1;
+    if (raw_buffer != NULL) {
+        g_http_ok = 0;
+        return;
+    }
     if (result != VE_TLS_DROP_ERROR || !error) {
         g_http_ok = 0;
         return;
@@ -145,6 +148,154 @@ static int test_structured_error_and_retryable(void) {
     }
     ve_tls_producer_destroy(p);
     return g_http_ok ? 0 : -1;
+}
+
+static int g_mgr_done = 0;
+static int g_mgr_ok = 0;
+
+static void on_send_done_mgr_v2(
+    ve_tls_result result,
+    size_t log_bytes,
+    size_t compressed_bytes,
+    const ve_tls_error * error,
+    const unsigned char * raw_buffer,
+    void * user_param,
+    int64_t start_id,
+    int64_t end_id
+) {
+    (void)log_bytes;
+    (void)compressed_bytes;
+    (void)user_param;
+    (void)start_id;
+    (void)end_id;
+    g_mgr_done = 1;
+    if (raw_buffer != NULL) {
+        g_mgr_ok = 0;
+        return;
+    }
+    if (result != VE_TLS_DROP_ERROR || !error) {
+        g_mgr_ok = 0;
+        return;
+    }
+    if (!error->error_code || strcmp(error->error_code, "ClientError") != 0) {
+        g_mgr_ok = 0;
+        return;
+    }
+    if (!error->error_message || strcmp(error->error_message, "unsupported compress_type") != 0) {
+        g_mgr_ok = 0;
+        return;
+    }
+    g_mgr_ok = 1;
+}
+
+static int test_manager_callback_no_raw_buffer_on_compress_error(void) {
+    g_mgr_done = 0;
+    g_mgr_ok = 0;
+
+    ve_tls_config cfg;
+    ve_tls_config_init(&cfg);
+    cfg.endpoint = "https://example.com";
+    cfg.region = "cn-beijing";
+    cfg.topic_id = "t";
+    cfg.access_key_id = "ak";
+    cfg.access_key_secret = "sk";
+    cfg.retry_policy.max_attempts = 1;
+    cfg.flush_interval_ms = 0;
+
+    cfg.agg_strategy = 1;
+    cfg.agg_max_compressed_bytes_per_request = 1;
+    cfg.compress_type = "bad";
+
+    ve_tls_producer * p = ve_tls_producer_create(&cfg);
+    if (!p) {
+        return -1;
+    }
+    ve_tls_producer_set_send_done_v2(p, on_send_done_mgr_v2, NULL);
+
+    ve_tls_kv kvs[1];
+    kvs[0].key = "k1";
+    kvs[0].value = "v1";
+    if (ve_tls_producer_add_log_kv(p, 0, kvs, 1, 1) != VE_TLS_OK) {
+        ve_tls_producer_destroy(p);
+        return -1;
+    }
+    for (int i = 0; i < 200 && !g_mgr_done; i++) {
+        cfg.platform.sleep_ms(10);
+    }
+    ve_tls_producer_destroy(p);
+    return g_mgr_ok ? 0 : -1;
+}
+
+static int g_deepcopy_done = 0;
+static int g_deepcopy_ok = 0;
+
+static int test_http_assert_proxy_ua_do(ve_tls_http_client * client, const ve_tls_http_request * req, ve_tls_http_response * resp) {
+    (void)client;
+    if (!req || !resp) {
+        return -1;
+    }
+    g_deepcopy_done = 1;
+    if (!req->proxy || strcmp(req->proxy, "http://proxy.example") != 0) {
+        g_deepcopy_ok = 0;
+    } else if (!req->user_agent || strcmp(req->user_agent, "ua-test") != 0) {
+        g_deepcopy_ok = 0;
+    } else {
+        g_deepcopy_ok = 1;
+    }
+    resp->status_code = 200;
+    resp->request_id = strdup("rid-deepcopy");
+    resp->body = NULL;
+    resp->body_size = 0;
+    return 0;
+}
+
+static int test_create_deep_copies_string_fields(void) {
+    g_deepcopy_done = 0;
+    g_deepcopy_ok = 0;
+
+    ve_tls_config cfg;
+    ve_tls_config_init(&cfg);
+
+    cfg.endpoint = "https://example.com";
+    cfg.region = "cn-beijing";
+    cfg.topic_id = "t";
+    cfg.access_key_id = "ak";
+    cfg.access_key_secret = "sk";
+    cfg.retry_policy.max_attempts = 1;
+    cfg.flush_interval_ms = 0;
+
+    char proxy_buf[64];
+    snprintf(proxy_buf, sizeof(proxy_buf), "%s", "http://proxy.example");
+    cfg.proxy = proxy_buf;
+
+    char ua_buf[32];
+    snprintf(ua_buf, sizeof(ua_buf), "%s", "ua-test");
+    cfg.user_agent = ua_buf;
+
+    cfg.http_client.do_request = test_http_assert_proxy_ua_do;
+    cfg.http_client.free_response = test_http_free;
+    cfg.http_client.user_data = NULL;
+
+    ve_tls_producer * p = ve_tls_producer_create(&cfg);
+    if (!p) {
+        return -1;
+    }
+
+    memset(proxy_buf, 'X', sizeof(proxy_buf));
+    memset(ua_buf, 'Y', sizeof(ua_buf));
+
+    ve_tls_kv kvs[1];
+    kvs[0].key = "k1";
+    kvs[0].value = "v1";
+    if (ve_tls_producer_add_log_kv(p, 0, kvs, 1, 1) != VE_TLS_OK) {
+        ve_tls_producer_destroy(p);
+        return -1;
+    }
+    for (int i = 0; i < 200 && !g_deepcopy_done; i++) {
+        cfg.platform.sleep_ms(10);
+    }
+    ve_tls_producer_destroy(p);
+    return g_deepcopy_ok ? 0 : -1;
 }
 
 static int test_export_import_raw_buffer(void) {
@@ -424,6 +575,152 @@ static int test_close_rejects_new_writes(void) {
     }
     ve_tls_producer_destroy(p);
     return a.rc == VE_TLS_OK ? 0 : -1;
+}
+
+static int g_update_called = 0;
+static char g_update_seen_url[256];
+static char g_update_seen_ak[128];
+
+static int test_http_capture_url_and_ak_do(ve_tls_http_client * client, const ve_tls_http_request * req, ve_tls_http_response * resp) {
+    (void)client;
+    if (!req || !resp) {
+        return -1;
+    }
+    g_update_called++;
+    if (req->url) {
+        snprintf(g_update_seen_url, sizeof(g_update_seen_url), "%s", req->url);
+    } else {
+        g_update_seen_url[0] = 0;
+    }
+    g_update_seen_ak[0] = 0;
+    if (req->headers) {
+        const char * p = strstr(req->headers, "Credential=");
+        if (p) {
+            p += strlen("Credential=");
+            const char * end = strchr(p, '/');
+            size_t n = end ? (size_t)(end - p) : strlen(p);
+            if (n >= sizeof(g_update_seen_ak)) n = sizeof(g_update_seen_ak) - 1;
+            memcpy(g_update_seen_ak, p, n);
+            g_update_seen_ak[n] = 0;
+        }
+    }
+    resp->status_code = 200;
+    resp->request_id = strdup("rid-update");
+    resp->body = NULL;
+    resp->body_size = 0;
+    return 0;
+}
+
+static int test_create_fail_fast_missing_required(void) {
+    ve_tls_config cfg;
+    ve_tls_config_init(&cfg);
+    cfg.endpoint = NULL;
+    cfg.region = "cn-beijing";
+    cfg.topic_id = "t";
+    cfg.access_key_id = "ak";
+    cfg.access_key_secret = "sk";
+    ve_tls_producer * p = ve_tls_producer_create(&cfg);
+    if (p) {
+        ve_tls_producer_destroy(p);
+        return -1;
+    }
+    return 0;
+}
+
+static int test_runtime_config_update_effective_for_new_requests(void) {
+    g_update_called = 0;
+    g_update_seen_url[0] = 0;
+    g_update_seen_ak[0] = 0;
+
+    ve_tls_config cfg;
+    ve_tls_config_init(&cfg);
+    cfg.endpoint = "https://old.example.com";
+    cfg.region = "cn-beijing";
+    cfg.topic_id = "old-topic";
+    cfg.access_key_id = "ak1";
+    cfg.access_key_secret = "sk1";
+    cfg.retry_policy.max_attempts = 1;
+    cfg.flush_interval_ms = 0;
+    cfg.http_client.do_request = test_http_capture_url_and_ak_do;
+    cfg.http_client.free_response = test_http_ok_free;
+    cfg.http_client.user_data = NULL;
+
+    ve_tls_producer * p = ve_tls_producer_create(&cfg);
+    if (!p) {
+        return -1;
+    }
+    if (ve_tls_producer_update_endpoint(p, "https://new.example.com", "cn-beijing", "new-topic") != VE_TLS_OK) {
+        ve_tls_producer_destroy(p);
+        return -1;
+    }
+    if (ve_tls_producer_update_static_credentials(p, "ak2", "sk2", "") != VE_TLS_OK) {
+        ve_tls_producer_destroy(p);
+        return -1;
+    }
+
+    ve_tls_kv kvs[1];
+    kvs[0].key = "k";
+    kvs[0].value = "v";
+    if (ve_tls_producer_add_log_kv(p, 0, kvs, 1, 1) != VE_TLS_OK) {
+        ve_tls_producer_destroy(p);
+        return -1;
+    }
+    for (int i = 0; i < 200 && g_update_called == 0; i++) {
+        cfg.platform.sleep_ms(10);
+    }
+    int ok = 0;
+    if (g_update_called > 0 && strstr(g_update_seen_url, "https://new.example.com") != NULL && strcmp(g_update_seen_ak, "ak2") == 0) {
+        ok = 1;
+    }
+    ve_tls_producer_destroy(p);
+    return ok ? 0 : -1;
+}
+
+static int test_runtime_update_rejected_during_close(void) {
+    ve_tls_config cfg;
+    ve_tls_config_init(&cfg);
+    cfg.endpoint = "https://example.com";
+    cfg.region = "cn-beijing";
+    cfg.topic_id = "t";
+    cfg.access_key_id = "ak";
+    cfg.access_key_secret = "sk";
+    cfg.retry_policy.max_attempts = 1;
+    cfg.flush_interval_ms = 0;
+
+    close_http_state s;
+    memset(&s, 0, sizeof(s));
+    s.platform = &cfg.platform;
+    s.sleep_ms = 300;
+    cfg.http_client.do_request = test_http_sleep_ok_do;
+    cfg.http_client.free_response = test_http_ok_free;
+    cfg.http_client.user_data = &s;
+
+    ve_tls_producer * p = ve_tls_producer_create(&cfg);
+    if (!p) {
+        return -1;
+    }
+    ve_tls_kv kvs[1];
+    kvs[0].key = "k";
+    kvs[0].value = "v";
+    if (ve_tls_producer_add_log_kv(p, 0, kvs, 1, 1) != VE_TLS_OK) {
+        ve_tls_producer_destroy(p);
+        return -1;
+    }
+
+    close_arg a;
+    memset(&a, 0, sizeof(a));
+    a.p = p;
+    a.timeout_ms = 2000;
+    ve_tls_thread * th = cfg.platform.thread_create(close_thread, &a);
+    if (!th) {
+        ve_tls_producer_destroy(p);
+        return -1;
+    }
+    cfg.platform.sleep_ms(10);
+    ve_tls_result rc = ve_tls_producer_update_endpoint(p, "https://new.example.com", NULL, NULL);
+    cfg.platform.thread_join(th);
+    ve_tls_producer_destroy(p);
+    return rc == VE_TLS_CLOSED ? 0 : -1;
 }
 
 static int test_http_capture_token_do(ve_tls_http_client * client, const ve_tls_http_request * req, ve_tls_http_response * resp) {
@@ -1723,7 +2020,8 @@ int main(void) {
     if (test_proto_log_tags_and_context_flow() != 0) return 5;
     if (test_structured_error_and_retryable() != 0) return 6;
     if (test_export_import_raw_buffer() != 0) return 7;
-    if (test_metrics_basic() != 0) return 8;
+    if (test_manager_callback_no_raw_buffer_on_compress_error() != 0) return 8;
+    if (test_metrics_basic() != 0) return 9;
     if (test_ordered_send_max_concurrency_one() != 0) return 9;
     if (test_hashkey_partition_parallelism() != 0) return 10;
     if (test_agg_strategy_split_by_compressed_limit() != 0) return 11;
@@ -1752,11 +2050,15 @@ int main(void) {
     if (test_graceful_close_ok() != 0) return 20;
     if (test_graceful_close_timeout() != 0) return 21;
     if (test_close_rejects_new_writes() != 0) return 22;
+    if (test_create_fail_fast_missing_required() != 0) return 23;
+    if (test_create_deep_copies_string_fields() != 0) return 24;
+    if (test_runtime_config_update_effective_for_new_requests() != 0) return 25;
+    if (test_runtime_update_rejected_during_close() != 0) return 26;
 #if defined(VE_TLS_HAVE_ZLIB)
-    if (test_zlib_compress_roundtrip() != 0) return 23;
+    if (test_zlib_compress_roundtrip() != 0) return 27;
 #endif
 #if defined(VE_TLS_HAVE_LZ4)
-    if (test_lz4_compress_roundtrip() != 0) return 24;
+    if (test_lz4_compress_roundtrip() != 0) return 28;
 #endif
     return 0;
 }

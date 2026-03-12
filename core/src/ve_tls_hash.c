@@ -1,4 +1,4 @@
-#include "../include/ve_tls_hash.h"
+#include "ve_tls_hash.h"
 
 #include <string.h>
 
@@ -196,4 +196,3 @@ void ve_tls_hex_lower(const unsigned char * data, size_t len, char * out_hex, si
     }
     out_hex[len * 2] = 0;
 }
-

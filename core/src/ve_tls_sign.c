@@ -1,6 +1,6 @@
-#include "../include/ve_tls_sign.h"
+#include "ve_tls_sign.h"
 
-#include "../include/ve_tls_hash.h"
+#include "ve_tls_hash.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -24,10 +24,21 @@ static void ve_tls_pair_free(ve_tls_kv_pair * p) {
 }
 
 static int ve_tls_buf_append(char ** buf, size_t * len, size_t * cap, const char * s) {
+    if (!buf || !len || !cap || !s) {
+        return -1;
+    }
     size_t n = strlen(s);
-    if (*len + n + 1 > *cap) {
+    if (*len > (size_t)-1 - n - 1) {
+        return -1;
+    }
+    size_t required = *len + n + 1;
+    if (required > *cap) {
         size_t next = *cap ? *cap : 256;
-        while (next < *len + n + 1) {
+        while (next < required) {
+            if (next > (size_t)-1 / 2) {
+                next = required;
+                break;
+            }
             next *= 2;
         }
         char * p = (char *)realloc(*buf, next);
@@ -72,7 +83,11 @@ static char * ve_tls_url_encode(const char * s) {
             hex_count++;
         }
     }
-    size_t n = strlen(s) + hex_count * 2 + 1;
+    size_t slen = strlen(s);
+    if (hex_count > ((size_t)-1 - slen - 1) / 2) {
+        return NULL;
+    }
+    size_t n = slen + hex_count * 2 + 1;
     char * out = (char *)calloc(1, n);
     if (!out) {
         return NULL;
@@ -97,6 +112,9 @@ static char * ve_tls_norm_uri(const char * path) {
         return strdup("/");
     }
     size_t len = strlen(path);
+    if (len > ((size_t)-1 - 2) / 3) {
+        return NULL;
+    }
     char * out = (char *)calloc(1, len * 3 + 2);
     if (!out) {
         return NULL;

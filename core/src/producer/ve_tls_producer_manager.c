@@ -3,6 +3,61 @@
 #include <stdlib.h>
 #include <string.h>
 
+typedef struct {
+    ve_tls_send_done_fn cb;
+    void * cb_param;
+    ve_tls_send_done_v2_fn cb2;
+    void * cb2_param;
+} ve_tls_send_callbacks;
+
+static ve_tls_send_callbacks ve_tls_capture_callbacks(ve_tls_producer * producer) {
+    ve_tls_send_callbacks out;
+    memset(&out, 0, sizeof(out));
+    if (!producer) {
+        return out;
+    }
+    producer->config.platform.mutex_lock(producer->mutex);
+    out.cb = producer->send_done;
+    out.cb_param = producer->send_done_param;
+    out.cb2 = producer->send_done_v2;
+    out.cb2_param = producer->send_done_v2_param;
+    producer->config.platform.mutex_unlock(producer->mutex);
+    return out;
+}
+
+static void ve_tls_manager_drop_item(ve_tls_producer * producer, size_t bytes, int64_t id, const char * code, const char * message) {
+    ve_tls_send_callbacks cbs = ve_tls_capture_callbacks(producer);
+    ve_tls_error err;
+    memset(&err, 0, sizeof(err));
+    err.http_code = -1;
+    err.transport_kind = VE_TLS_TRANSPORT_GENERIC;
+    err.transport_code = 0;
+    err.retryable = 0;
+    err.error_code = (code && code[0] != 0) ? strdup(code) : strdup("ClientError");
+    err.error_message = (message && message[0] != 0) ? strdup(message) : strdup("drop");
+    if (cbs.cb) {
+        cbs.cb(VE_TLS_DROP_ERROR, bytes, 0, NULL, err.error_message, NULL, cbs.cb_param, id, id);
+    }
+    if (cbs.cb2) {
+        cbs.cb2(VE_TLS_DROP_ERROR, bytes, 0, &err, NULL, cbs.cb2_param, id, id);
+    }
+    ve_tls_error_free_fields(&err);
+}
+
+static int ve_tls_manager_requeue_item(ve_tls_producer * producer, const ve_tls_log_item * item) {
+    if (!producer || !item || !item->data || item->size == 0) {
+        return -1;
+    }
+    producer->config.platform.mutex_lock(producer->mutex);
+    int rc = ve_tls_queue_push(producer, item->data, item->size, item->id, item->time_ms, item->time_ns, item->has_time_ns, item->hash_key);
+    if (rc == 0) {
+        producer->flush_requested = 1;
+        producer->config.platform.cond_signal(producer->cond);
+    }
+    producer->config.platform.mutex_unlock(producer->mutex);
+    return rc;
+}
+
 void * ve_tls_worker_main(void * arg) {
     ve_tls_producer * producer = (ve_tls_producer *)arg;
     int64_t last_flush = producer->config.platform.time_ms();
@@ -134,6 +189,14 @@ void * ve_tls_worker_main(void * arg) {
                         size_t next = groups_cap ? groups_cap * 2 : 8;
                         ve_tls_group * p = (ve_tls_group *)realloc(groups, next * sizeof(ve_tls_group));
                         if (!p) {
+                            ve_tls_metrics_emit(producer, "agg_groups_alloc_failed", 1, 0);
+                            if (ve_tls_manager_requeue_item(producer, &items[i]) != 0) {
+                                ve_tls_metric_inc_u64(&producer->m_logs_dropped_total, 1);
+                                ve_tls_metric_inc_u64(&producer->m_bytes_dropped_total, items[i].size);
+                                ve_tls_metrics_emit(producer, "log_dropped", 1, (int64_t)items[i].size);
+                                ve_tls_manager_drop_item(producer, items[i].size, items[i].id, "MemoryAllocFailed", "groups realloc failed");
+                            }
+                            ve_tls_item_free(&items[i]);
                             continue;
                         }
                         groups = p;
@@ -142,6 +205,17 @@ void * ve_tls_worker_main(void * arg) {
                     memset(&groups[groups_len], 0, sizeof(ve_tls_group));
                     if (key) {
                         groups[groups_len].key = strdup(key);
+                        if (!groups[groups_len].key) {
+                            ve_tls_metrics_emit(producer, "agg_groups_alloc_failed", 1, 0);
+                            if (ve_tls_manager_requeue_item(producer, &items[i]) != 0) {
+                                ve_tls_metric_inc_u64(&producer->m_logs_dropped_total, 1);
+                                ve_tls_metric_inc_u64(&producer->m_bytes_dropped_total, items[i].size);
+                                ve_tls_metrics_emit(producer, "log_dropped", 1, (int64_t)items[i].size);
+                                ve_tls_manager_drop_item(producer, items[i].size, items[i].id, "MemoryAllocFailed", "group key strdup failed");
+                            }
+                            ve_tls_item_free(&items[i]);
+                            continue;
+                        }
                     }
                     groups[groups_len].earliest = items[i].time_ms;
                     groups[groups_len].latest = items[i].time_ms;
@@ -152,21 +226,34 @@ void * ve_tls_worker_main(void * arg) {
                 ve_tls_group * g = &groups[gi];
                 if (g->count + 1 > g->cap) {
                     size_t next = g->cap ? g->cap * 2 : 256;
-                    ve_tls_bytes * p = (ve_tls_bytes *)realloc(g->logs, next * sizeof(ve_tls_bytes));
-                    if (!p) {
+                    ve_tls_bytes * logs = (ve_tls_bytes *)malloc(next * sizeof(ve_tls_bytes));
+                    int64_t * times = (int64_t *)malloc(next * sizeof(int64_t));
+                    int64_t * ids = (int64_t *)malloc(next * sizeof(int64_t));
+                    if (!logs || !times || !ids) {
+                        free(logs);
+                        free(times);
+                        free(ids);
+                        ve_tls_metrics_emit(producer, "agg_group_alloc_failed", 1, 0);
+                        if (ve_tls_manager_requeue_item(producer, &items[i]) != 0) {
+                            ve_tls_metric_inc_u64(&producer->m_logs_dropped_total, 1);
+                            ve_tls_metric_inc_u64(&producer->m_bytes_dropped_total, items[i].size);
+                            ve_tls_metrics_emit(producer, "log_dropped", 1, (int64_t)items[i].size);
+                            ve_tls_manager_drop_item(producer, items[i].size, items[i].id, "MemoryAllocFailed", "group alloc failed");
+                        }
+                        ve_tls_item_free(&items[i]);
                         continue;
                     }
-                    int64_t * pt = (int64_t *)realloc(g->times, next * sizeof(int64_t));
-                    if (!pt) {
-                        continue;
+                    if (g->count > 0) {
+                        memcpy(logs, g->logs, g->count * sizeof(ve_tls_bytes));
+                        memcpy(times, g->times, g->count * sizeof(int64_t));
+                        memcpy(ids, g->ids, g->count * sizeof(int64_t));
                     }
-                    int64_t * pid = (int64_t *)realloc(g->ids, next * sizeof(int64_t));
-                    if (!pid) {
-                        continue;
-                    }
-                    g->logs = p;
-                    g->times = pt;
-                    g->ids = pid;
+                    free(g->logs);
+                    free(g->times);
+                    free(g->ids);
+                    g->logs = logs;
+                    g->times = times;
+                    g->ids = ids;
                     g->cap = next;
                 }
                 g->logs[g->count].data = items[i].data;
@@ -246,11 +333,12 @@ void * ve_tls_worker_main(void * arg) {
                             err.retryable = 0;
                             err.error_code = strdup("ClientError");
                             err.error_message = strdup(c_rc == -1 ? "compress failed" : "unsupported compress_type");
-                            if (producer->send_done) {
-                                producer->send_done(VE_TLS_DROP_ERROR, g->bytes, 0, NULL, err.error_message, body.data, producer->send_done_param, g->start_id, g->end_id);
+                            ve_tls_send_callbacks cbs = ve_tls_capture_callbacks(producer);
+                            if (cbs.cb) {
+                                cbs.cb(VE_TLS_DROP_ERROR, g->bytes, 0, NULL, err.error_message, NULL, cbs.cb_param, g->start_id, g->end_id);
                             }
-                            if (producer->send_done_v2) {
-                                producer->send_done_v2(VE_TLS_DROP_ERROR, g->bytes, 0, &err, body.data, producer->send_done_v2_param, g->start_id, g->end_id);
+                            if (cbs.cb2) {
+                                cbs.cb2(VE_TLS_DROP_ERROR, g->bytes, 0, &err, NULL, cbs.cb2_param, g->start_id, g->end_id);
                             }
                             ve_tls_error_free_fields(&err);
                             ve_tls_bytes_free(&c);
@@ -272,11 +360,12 @@ void * ve_tls_worker_main(void * arg) {
                             err.retryable = 0;
                             err.error_code = strdup("PayloadTooLarge");
                             err.error_message = strdup("payload too large after compression");
-                            if (producer->send_done) {
-                                producer->send_done(VE_TLS_DROP_ERROR, g->logs[r.start].size, 0, NULL, err.error_message, g->logs[r.start].data, producer->send_done_param, g->ids[r.start], g->ids[r.start]);
+                            ve_tls_send_callbacks cbs = ve_tls_capture_callbacks(producer);
+                            if (cbs.cb) {
+                                cbs.cb(VE_TLS_DROP_ERROR, g->logs[r.start].size, 0, NULL, err.error_message, NULL, cbs.cb_param, g->ids[r.start], g->ids[r.start]);
                             }
-                            if (producer->send_done_v2) {
-                                producer->send_done_v2(VE_TLS_DROP_ERROR, g->logs[r.start].size, 0, &err, g->logs[r.start].data, producer->send_done_v2_param, g->ids[r.start], g->ids[r.start]);
+                            if (cbs.cb2) {
+                                cbs.cb2(VE_TLS_DROP_ERROR, g->logs[r.start].size, 0, &err, NULL, cbs.cb2_param, g->ids[r.start], g->ids[r.start]);
                             }
                             ve_tls_error_free_fields(&err);
                             continue;
@@ -285,6 +374,13 @@ void * ve_tls_worker_main(void * arg) {
                         size_t right = r.count - left;
                         if (stack_len + 2 > stack_cap) {
                             size_t next = stack_cap ? stack_cap * 2 : 8;
+                            if (next < stack_len + 2) {
+                                next = stack_len + 2;
+                            }
+                            if (next > (size_t)-1 / sizeof(ve_tls_range)) {
+                                stack_len = 0;
+                                break;
+                            }
                             ve_tls_range * ns = (ve_tls_range *)realloc(stack, next * sizeof(ve_tls_range));
                             if (!ns) {
                                 stack_len = 0;
@@ -350,11 +446,12 @@ void * ve_tls_worker_main(void * arg) {
                         err.retryable = 0;
                         err.error_code = strdup("KeyQueueLimitExceeded");
                         err.error_message = strdup("key queue limit exceeded");
-                        if (producer->send_done) {
-                            producer->send_done(VE_TLS_DROP_ERROR, t.batch_bytes, 0, NULL, err.error_message, t.body, producer->send_done_param, t.start_id, t.end_id);
+                        ve_tls_send_callbacks cbs = ve_tls_capture_callbacks(producer);
+                        if (cbs.cb) {
+                            cbs.cb(VE_TLS_DROP_ERROR, t.batch_bytes, 0, NULL, err.error_message, NULL, cbs.cb_param, t.start_id, t.end_id);
                         }
-                        if (producer->send_done_v2) {
-                            producer->send_done_v2(VE_TLS_DROP_ERROR, t.batch_bytes, 0, &err, t.body, producer->send_done_v2_param, t.start_id, t.end_id);
+                        if (cbs.cb2) {
+                            cbs.cb2(VE_TLS_DROP_ERROR, t.batch_bytes, 0, &err, NULL, cbs.cb2_param, t.start_id, t.end_id);
                         }
                         ve_tls_error_free_fields(&err);
                         ve_tls_send_task_free(&t);
@@ -402,11 +499,12 @@ void * ve_tls_worker_main(void * arg) {
                             err.error_code = strdup("SendQueueFull");
                             err.error_message = strdup("send queue full");
                         }
-                        if (producer->send_done) {
-                            producer->send_done(VE_TLS_DROP_ERROR, t.batch_bytes, 0, NULL, err.error_message, t.body, producer->send_done_param, t.start_id, t.end_id);
+                        ve_tls_send_callbacks cbs = ve_tls_capture_callbacks(producer);
+                        if (cbs.cb) {
+                            cbs.cb(VE_TLS_DROP_ERROR, t.batch_bytes, 0, NULL, err.error_message, NULL, cbs.cb_param, t.start_id, t.end_id);
                         }
-                        if (producer->send_done_v2) {
-                            producer->send_done_v2(VE_TLS_DROP_ERROR, t.batch_bytes, 0, &err, t.body, producer->send_done_v2_param, t.start_id, t.end_id);
+                        if (cbs.cb2) {
+                            cbs.cb2(VE_TLS_DROP_ERROR, t.batch_bytes, 0, &err, NULL, cbs.cb2_param, t.start_id, t.end_id);
                         }
                         ve_tls_error_free_fields(&err);
                         ve_tls_send_task_free(&t);

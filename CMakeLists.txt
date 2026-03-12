@@ -66,9 +66,13 @@ target_link_libraries(ve_tls_demo PRIVATE ve_tls_core)
 add_executable(ve_tls_demo_real tools/real_demo.c)
 target_link_libraries(ve_tls_demo_real PRIVATE ve_tls_core)
 
+add_executable(ve_tls_bench tools/bench.c)
+target_link_libraries(ve_tls_bench PRIVATE ve_tls_core)
+
 if(VE_TLS_BUILD_TESTS)
     enable_testing()
     add_executable(ve_tls_test_basic tests/test_basic.c)
     target_link_libraries(ve_tls_test_basic PRIVATE ve_tls_core)
+    target_include_directories(ve_tls_test_basic PRIVATE core/src)
     add_test(NAME ve_tls_test_basic COMMAND ve_tls_test_basic)
 endif()

@@ -26,6 +26,7 @@ typedef struct {
     int32_t tcp_keepalive;
     int32_t tcp_keepidle;
     int32_t tcp_keepintvl;
+    int32_t debug_log;
 } ve_tls_http_request;
 
 typedef struct {

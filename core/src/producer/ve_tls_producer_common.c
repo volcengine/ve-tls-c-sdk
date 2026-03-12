@@ -32,11 +32,12 @@ void ve_tls_rate_limit_wait(ve_tls_producer * producer, size_t bytes) {
     double req_need = rps > 0 ? 1.0 : 0.0;
     double byte_need = bps > 0 ? (double)bytes : 0.0;
     for (;;) {
-        if (producer->stop) {
-            return;
-        }
         int64_t now = producer->config.platform.time_ms();
         producer->config.platform.mutex_lock(producer->mutex);
+        if (producer->stop) {
+            producer->config.platform.mutex_unlock(producer->mutex);
+            return;
+        }
         if (producer->rl_last_ms == 0) {
             producer->rl_last_ms = now;
             producer->rl_req_tokens = rps > 0 ? (double)rps : 0.0;

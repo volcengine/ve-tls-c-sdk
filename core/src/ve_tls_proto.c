@@ -1,4 +1,4 @@
-#include "../include/ve_tls_proto.h"
+#include "ve_tls_proto.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -13,8 +13,16 @@ static int ve_tls_buf_reserve(ve_tls_buf * b, size_t n) {
     if (b->len + n <= b->cap) {
         return 0;
     }
+    if (b->len > (size_t)-1 - n) {
+        return -1;
+    }
+    size_t target = b->len + n;
     size_t next = b->cap ? b->cap : 128;
-    while (next < b->len + n) {
+    while (next < target) {
+        if (next > (size_t)-1 / 2) {
+            next = target;
+            break;
+        }
         next *= 2;
     }
     unsigned char * p = (unsigned char *)realloc(b->data, next);

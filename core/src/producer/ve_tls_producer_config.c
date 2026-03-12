@@ -2,10 +2,10 @@
 
 #include <string.h>
 
-#include "../../include/ve_tls_version.h"
+#include "ve_tls_version.h"
 
 #if defined(VE_TLS_HAVE_CURL)
-#include "../../../adapters/include/ve_tls_http_curl.h"
+#include "ve_tls_http_curl.h"
 #endif
 
 static int ve_tls_http_noop_do(ve_tls_http_client * client, const ve_tls_http_request * req, ve_tls_http_response * resp) {
@@ -73,6 +73,7 @@ void ve_tls_producer_config_init(ve_tls_config * config) {
     config->request_timeout_ms = 10000;
     config->tls_verify_peer = 1;
     config->tls_verify_host = 1;
+    config->http_debug = 0;
     config->tcp_keepalive = 0;
     config->tcp_keepidle = 60;
     config->tcp_keepintvl = 30;

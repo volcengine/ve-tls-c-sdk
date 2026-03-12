@@ -1,11 +1,11 @@
 #ifndef VE_TLS_PRODUCER_INTERNAL_H
 #define VE_TLS_PRODUCER_INTERNAL_H
 
-#include "../../include/ve_tls_producer.h"
-#include "../../include/ve_tls_proto.h"
-#include "../../include/ve_tls_compress.h"
-#include "../../include/ve_tls_retry.h"
-#include "../../include/ve_tls_error.h"
+#include "ve_tls_producer.h"
+#include "ve_tls_proto.h"
+#include "ve_tls_compress.h"
+#include "ve_tls_retry.h"
+#include "ve_tls_error.h"
 
 #include <stdint.h>
 #include <stddef.h>
@@ -125,6 +125,25 @@ struct ve_tls_producer {
     char * cred_access_key_id;
     char * cred_access_key_secret;
     char * cred_security_token;
+    char * cfg_endpoint;
+    char * cfg_region;
+    char * cfg_project_id;
+    char * cfg_topic_id;
+    char * cfg_source;
+    char * cfg_file_name;
+    char * cfg_context_flow;
+    ve_tls_kv * cfg_log_tags;
+    size_t cfg_log_tag_count;
+    char * cfg_hash_key;
+    char * cfg_access_key_id;
+    char * cfg_access_key_secret;
+    char * cfg_security_token;
+    char * cfg_api_version;
+    char * cfg_compress_type;
+    char * cfg_ca_cert_path;
+    char * cfg_proxy;
+    char * cfg_user_agent;
+    char * cfg_persistent_file_path;
     uint64_t m_logs_enqueued_total;
     uint64_t m_logs_dropped_total;
     uint64_t m_bytes_enqueued_total;

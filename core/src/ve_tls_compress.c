@@ -1,7 +1,8 @@
-#include "../include/ve_tls_compress.h"
+#include "ve_tls_compress.h"
 
 #include <string.h>
 #include <stdlib.h>
+#include <limits.h>
 
 #if defined(VE_TLS_HAVE_ZLIB)
 #include <zlib.h>
@@ -44,6 +45,9 @@ int ve_tls_compress_apply(const char * compress_type, const unsigned char * in, 
 
     if (ve_tls_str_ieq(compress_type, "zlib")) {
 #if defined(VE_TLS_HAVE_ZLIB)
+        if (in_size > (size_t)UINT_MAX) {
+            return -1;
+        }
         z_stream strm;
         memset(&strm, 0, sizeof(strm));
         int rc = deflateInit(&strm, Z_DEFAULT_COMPRESSION);
@@ -52,6 +56,10 @@ int ve_tls_compress_apply(const char * compress_type, const unsigned char * in, 
             return -1;
         }
         uLong bound = deflateBound(&strm, (uLong)in_size);
+        if (bound > (uLong)UINT_MAX) {
+            deflateEnd(&strm);
+            return -1;
+        }
         unsigned char * buf = (unsigned char *)malloc((size_t)bound);
         if (!buf) {
             deflateEnd(&strm);
@@ -80,6 +88,9 @@ int ve_tls_compress_apply(const char * compress_type, const unsigned char * in, 
 
     if (ve_tls_str_ieq(compress_type, "lz4")) {
 #if defined(VE_TLS_HAVE_LZ4)
+        if (in_size > (size_t)INT_MAX) {
+            return -1;
+        }
         int bound = LZ4_compressBound((int)in_size);
         if (bound <= 0) {
             return -1;

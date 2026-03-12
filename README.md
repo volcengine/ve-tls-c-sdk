@@ -122,13 +122,18 @@ cmake --build build
 - 强制退出：`ve_tls_producer_destroy(p)`
   - 立即停止 worker/sender 并释放资源，允许丢弃未处理数据
 
+## 可靠性边界（master）
+
+- master 分支默认仅使用内存队列，不提供落盘与崩溃恢复能力
+- 正常退出建议：先停止业务侧产生新日志，再调用 `ve_tls_producer_close(p, timeout_ms)`，最后 `ve_tls_producer_destroy(p)` 回收资源
+- 若业务必须具备 at-least-once（崩溃后恢复）语义，请使用 persistent 分支或在上层自行做外部持久化
+
 ## 文档索引
 
 - master 能力清单：docs/master-capabilities.md
 - 配置字段：docs/config-fields.md
+- 调优指南：docs/tuning.md
 - 重试策略：docs/retry-policy.md
 - 签名：docs/signing.md
 - 错误模型：docs/error-model.md
 - 指标：docs/metrics.md
-ve_tls_producer_destroy(p);
-```

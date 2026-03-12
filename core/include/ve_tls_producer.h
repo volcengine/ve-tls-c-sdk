@@ -7,7 +7,7 @@
 #include "ve_tls_retry.h"
 #include "ve_tls_http.h"
 #include "ve_tls_error.h"
-#include "../../adapters/include/ve_tls_platform.h"
+#include "ve_tls_platform.h"
 
 typedef struct ve_tls_producer ve_tls_producer;
 
@@ -48,8 +48,7 @@ typedef int (*ve_tls_credentials_provider_fn)(ve_tls_credentials * out, void * u
 typedef struct {
     const char * endpoint;
     const char * region;
-    const char * project;
-    const char * logstore;
+    const char * project_id;
     const char * topic_id;
     const char * source;
     const char * file_name;
@@ -99,6 +98,7 @@ typedef struct {
     const char * ca_cert_path;
     const char * proxy;
     const char * user_agent;
+    int32_t http_debug;
     int32_t tcp_keepalive;
     int32_t tcp_keepidle;
     int32_t tcp_keepintvl;
@@ -154,6 +154,8 @@ typedef struct {
 void ve_tls_config_init(ve_tls_config * config);
 
 ve_tls_producer * ve_tls_producer_create(const ve_tls_config * config);
+ve_tls_result ve_tls_producer_update_endpoint(ve_tls_producer * producer, const char * endpoint, const char * region, const char * topic_id);
+ve_tls_result ve_tls_producer_update_static_credentials(ve_tls_producer * producer, const char * access_key_id, const char * access_key_secret, const char * security_token);
 ve_tls_result ve_tls_producer_close(ve_tls_producer * producer, int32_t timeout_ms);
 void ve_tls_producer_destroy(ve_tls_producer * producer);
 

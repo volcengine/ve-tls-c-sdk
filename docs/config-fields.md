@@ -3,8 +3,8 @@
 ## 通用配置
 - endpoint
 - region
-- project
-- logstore
+- project_id（对应 ve_tls_config.project_id）
+- topic_id（对应 ve_tls_config.topic_id）
 - access_key_id
 - access_key_secret
 - security_token
