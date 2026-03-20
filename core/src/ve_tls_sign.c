@@ -1,6 +1,7 @@
 #include "ve_tls_sign.h"
 
 #include "ve_tls_hash.h"
+#include "ve_tls_alloc.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -17,8 +18,8 @@ static void ve_tls_pair_free(ve_tls_kv_pair * p) {
     if (!p) {
         return;
     }
-    free(p->key);
-    free(p->value);
+    ve_tls_free(p->key);
+    ve_tls_free(p->value);
     p->key = NULL;
     p->value = NULL;
 }
@@ -41,7 +42,7 @@ static int ve_tls_buf_append(char ** buf, size_t * len, size_t * cap, const char
             }
             next *= 2;
         }
-        char * p = (char *)realloc(*buf, next);
+        char * p = (char *)ve_tls_realloc(*buf, next);
         if (!p) {
             return -1;
         }
@@ -88,7 +89,7 @@ static char * ve_tls_url_encode(const char * s) {
         return NULL;
     }
     size_t n = slen + hex_count * 2 + 1;
-    char * out = (char *)calloc(1, n);
+    char * out = (char *)ve_tls_calloc(1, n);
     if (!out) {
         return NULL;
     }
@@ -109,13 +110,13 @@ static char * ve_tls_url_encode(const char * s) {
 
 static char * ve_tls_norm_uri(const char * path) {
     if (!path || path[0] == 0) {
-        return strdup("/");
+        return ve_tls_strdup("/");
     }
     size_t len = strlen(path);
     if (len > ((size_t)-1 - 2) / 3) {
         return NULL;
     }
-    char * out = (char *)calloc(1, len * 3 + 2);
+    char * out = (char *)ve_tls_calloc(1, len * 3 + 2);
     if (!out) {
         return NULL;
     }
@@ -153,7 +154,7 @@ static int ve_tls_pair_cmp(const void * a, const void * b) {
 
 static char * ve_tls_norm_query(const char * query) {
     if (!query || query[0] == 0) {
-        return strdup("");
+        return ve_tls_strdup("");
     }
     ve_tls_kv_pair * pairs = NULL;
     size_t cap = 0;
@@ -167,42 +168,42 @@ static char * ve_tls_norm_query(const char * query) {
         const char * v_start = eq ? (eq + 1) : end;
         size_t k_len = (size_t)(k_end - p);
         size_t v_len = (size_t)(end - v_start);
-        char * k_raw = (char *)calloc(1, k_len + 1);
-        char * v_raw = (char *)calloc(1, v_len + 1);
+        char * k_raw = (char *)ve_tls_calloc(1, k_len + 1);
+        char * v_raw = (char *)ve_tls_calloc(1, v_len + 1);
         if (!k_raw || !v_raw) {
-            free(k_raw);
-            free(v_raw);
+            ve_tls_free(k_raw);
+            ve_tls_free(v_raw);
             for (size_t i = 0; i < len; i++) {
                 ve_tls_pair_free(&pairs[i]);
             }
-            free(pairs);
+            ve_tls_free(pairs);
             return NULL;
         }
         memcpy(k_raw, p, k_len);
         memcpy(v_raw, v_start, v_len);
         char * k = ve_tls_url_encode(k_raw);
         char * v = ve_tls_url_encode(v_raw);
-        free(k_raw);
-        free(v_raw);
+        ve_tls_free(k_raw);
+        ve_tls_free(v_raw);
         if (!k || !v) {
-            free(k);
-            free(v);
+            ve_tls_free(k);
+            ve_tls_free(v);
             for (size_t i = 0; i < len; i++) {
                 ve_tls_pair_free(&pairs[i]);
             }
-            free(pairs);
+            ve_tls_free(pairs);
             return NULL;
         }
         if (len + 1 > cap) {
             size_t next = cap ? cap * 2 : 8;
-            ve_tls_kv_pair * np = (ve_tls_kv_pair *)realloc(pairs, next * sizeof(ve_tls_kv_pair));
+            ve_tls_kv_pair * np = (ve_tls_kv_pair *)ve_tls_realloc(pairs, next * sizeof(ve_tls_kv_pair));
             if (!np) {
-                free(k);
-                free(v);
+                ve_tls_free(k);
+                ve_tls_free(v);
                 for (size_t i = 0; i < len; i++) {
                     ve_tls_pair_free(&pairs[i]);
                 }
-                free(pairs);
+                ve_tls_free(pairs);
                 return NULL;
             }
             pairs = np;
@@ -232,16 +233,16 @@ static char * ve_tls_norm_query(const char * query) {
     for (size_t i = 0; i < len; i++) {
         ve_tls_pair_free(&pairs[i]);
     }
-    free(pairs);
+    ve_tls_free(pairs);
     if (!out) {
-        out = strdup("");
+        out = ve_tls_strdup("");
     }
     return out;
 }
 
 static char * ve_tls_lower_dup(const char * s) {
     size_t n = strlen(s);
-    char * out = (char *)calloc(1, n + 1);
+    char * out = (char *)ve_tls_calloc(1, n + 1);
     if (!out) {
         return NULL;
     }
@@ -269,42 +270,42 @@ static int ve_tls_parse_headers(const char * headers, ve_tls_kv_pair ** out_pair
         if (colon) {
             size_t k_len = (size_t)(colon - p);
             size_t v_len = (size_t)(end - (colon + 1));
-            char * k_raw = (char *)calloc(1, k_len + 1);
-            char * v_raw = (char *)calloc(1, v_len + 1);
+            char * k_raw = (char *)ve_tls_calloc(1, k_len + 1);
+            char * v_raw = (char *)ve_tls_calloc(1, v_len + 1);
             if (!k_raw || !v_raw) {
-                free(k_raw);
-                free(v_raw);
+                ve_tls_free(k_raw);
+                ve_tls_free(v_raw);
                 for (size_t i = 0; i < len; i++) {
                     ve_tls_pair_free(&pairs[i]);
                 }
-                free(pairs);
+                ve_tls_free(pairs);
                 return -1;
             }
             memcpy(k_raw, p, k_len);
             memcpy(v_raw, colon + 1, v_len);
             char * k = ve_tls_lower_dup(ve_tls_trim(k_raw));
-            char * v = strdup(ve_tls_trim(v_raw));
-            free(k_raw);
-            free(v_raw);
+            char * v = ve_tls_strdup(ve_tls_trim(v_raw));
+            ve_tls_free(k_raw);
+            ve_tls_free(v_raw);
             if (!k || !v) {
-                free(k);
-                free(v);
+                ve_tls_free(k);
+                ve_tls_free(v);
                 for (size_t i = 0; i < len; i++) {
                     ve_tls_pair_free(&pairs[i]);
                 }
-                free(pairs);
+                ve_tls_free(pairs);
                 return -1;
             }
             if (len + 1 > cap) {
                 size_t next = cap ? cap * 2 : 16;
-                ve_tls_kv_pair * np = (ve_tls_kv_pair *)realloc(pairs, next * sizeof(ve_tls_kv_pair));
+                ve_tls_kv_pair * np = (ve_tls_kv_pair *)ve_tls_realloc(pairs, next * sizeof(ve_tls_kv_pair));
                 if (!np) {
-                    free(k);
-                    free(v);
+                    ve_tls_free(k);
+                    ve_tls_free(v);
                     for (size_t i = 0; i < len; i++) {
                         ve_tls_pair_free(&pairs[i]);
                     }
-                    free(pairs);
+                    ve_tls_free(pairs);
                     return -1;
                 }
                 pairs = np;
@@ -360,7 +361,7 @@ static int ve_tls_build_canonical_headers(ve_tls_kv_pair * pairs, size_t pair_le
             sign_len++;
         }
     }
-    sign_pairs = (ve_tls_kv_pair *)calloc(sign_len, sizeof(ve_tls_kv_pair));
+    sign_pairs = (ve_tls_kv_pair *)ve_tls_calloc(sign_len, sizeof(ve_tls_kv_pair));
     if (!sign_pairs && sign_len > 0) {
         return -1;
     }
@@ -382,32 +383,32 @@ static int ve_tls_build_canonical_headers(ve_tls_kv_pair * pairs, size_t pair_le
             ve_tls_buf_append(&canon, &canon_len, &canon_cap, ":") != 0 ||
             ve_tls_buf_append(&canon, &canon_len, &canon_cap, sign_pairs[i].value) != 0 ||
             ve_tls_buf_append(&canon, &canon_len, &canon_cap, "\n") != 0) {
-            free(canon);
-            free(signed_headers);
-            free(sign_pairs);
+            ve_tls_free(canon);
+            ve_tls_free(signed_headers);
+            ve_tls_free(sign_pairs);
             return -1;
         }
         if (i > 0) {
             if (ve_tls_buf_append(&signed_headers, &sh_len, &sh_cap, ";") != 0) {
-                free(canon);
-                free(signed_headers);
-                free(sign_pairs);
+                ve_tls_free(canon);
+                ve_tls_free(signed_headers);
+                ve_tls_free(sign_pairs);
                 return -1;
             }
         }
         if (ve_tls_buf_append(&signed_headers, &sh_len, &sh_cap, sign_pairs[i].key) != 0) {
-            free(canon);
-            free(signed_headers);
-            free(sign_pairs);
+            ve_tls_free(canon);
+            ve_tls_free(signed_headers);
+            ve_tls_free(sign_pairs);
             return -1;
         }
     }
-    free(sign_pairs);
+    ve_tls_free(sign_pairs);
     if (!canon) {
-        canon = strdup("");
+        canon = ve_tls_strdup("");
     }
     if (!signed_headers) {
-        signed_headers = strdup("");
+        signed_headers = ve_tls_strdup("");
     }
     *out_canon = canon;
     *out_signed_headers = signed_headers;
@@ -417,7 +418,7 @@ static int ve_tls_build_canonical_headers(ve_tls_kv_pair * pairs, size_t pair_le
 static char * ve_tls_sha256_hex(const unsigned char * data, size_t len) {
     unsigned char out[32];
     ve_tls_sha256(data, len, out);
-    char * hex = (char *)calloc(1, 65);
+    char * hex = (char *)ve_tls_calloc(1, 65);
     if (!hex) {
         return NULL;
     }
@@ -428,7 +429,7 @@ static char * ve_tls_sha256_hex(const unsigned char * data, size_t len) {
 static char * ve_tls_hmac_hex(const unsigned char * key, size_t key_len, const unsigned char * data, size_t len) {
     unsigned char out[32];
     ve_tls_hmac_sha256(key, key_len, data, len, out);
-    char * hex = (char *)calloc(1, 65);
+    char * hex = (char *)ve_tls_calloc(1, 65);
     if (!hex) {
         return NULL;
     }
@@ -477,21 +478,35 @@ int ve_tls_sign_v4_append(
         return -1;
     }
 
-    ve_tls_kv_pair * np = (ve_tls_kv_pair *)realloc(pairs, (pair_len + 4) * sizeof(ve_tls_kv_pair));
+    ve_tls_kv_pair * np = (ve_tls_kv_pair *)ve_tls_realloc(pairs, (pair_len + 4) * sizeof(ve_tls_kv_pair));
     if (!np) {
         for (size_t i = 0; i < pair_len; i++) {
             ve_tls_pair_free(&pairs[i]);
         }
-        free(pairs);
+        ve_tls_free(pairs);
         return -1;
     }
     pairs = np;
-    pairs[pair_len].key = strdup("host");
-    pairs[pair_len].value = strdup(host);
+    pairs[pair_len].key = ve_tls_strdup("host");
+    pairs[pair_len].value = ve_tls_strdup(host);
+    if (!pairs[pair_len].key || !pairs[pair_len].value) {
+        for (size_t i = 0; i <= pair_len; i++) {
+            ve_tls_pair_free(&pairs[i]);
+        }
+        ve_tls_free(pairs);
+        return -1;
+    }
     pair_len++;
 
-    pairs[pair_len].key = strdup("x-date");
-    pairs[pair_len].value = strdup(xdate);
+    pairs[pair_len].key = ve_tls_strdup("x-date");
+    pairs[pair_len].value = ve_tls_strdup(xdate);
+    if (!pairs[pair_len].key || !pairs[pair_len].value) {
+        for (size_t i = 0; i <= pair_len; i++) {
+            ve_tls_pair_free(&pairs[i]);
+        }
+        ve_tls_free(pairs);
+        return -1;
+    }
     pair_len++;
 
     char * payload_hash = ve_tls_sha256_hex(body ? body : (const unsigned char *)"", body ? body_size : 0);
@@ -499,16 +514,32 @@ int ve_tls_sign_v4_append(
         for (size_t i = 0; i < pair_len; i++) {
             ve_tls_pair_free(&pairs[i]);
         }
-        free(pairs);
+        ve_tls_free(pairs);
         return -1;
     }
-    pairs[pair_len].key = strdup("x-content-sha256");
+    pairs[pair_len].key = ve_tls_strdup("x-content-sha256");
     pairs[pair_len].value = payload_hash;
+    if (!pairs[pair_len].key) {
+        for (size_t i = 0; i < pair_len; i++) {
+            ve_tls_pair_free(&pairs[i]);
+        }
+        ve_tls_free(payload_hash);
+        ve_tls_free(pairs);
+        return -1;
+    }
     pair_len++;
 
     if (security_token && security_token[0] != 0) {
-        pairs[pair_len].key = strdup("x-security-token");
-        pairs[pair_len].value = strdup(security_token);
+        pairs[pair_len].key = ve_tls_strdup("x-security-token");
+        pairs[pair_len].value = ve_tls_strdup(security_token);
+        if (!pairs[pair_len].key || !pairs[pair_len].value) {
+            for (size_t i = 0; i < pair_len; i++) {
+                ve_tls_pair_free(&pairs[i]);
+            }
+            ve_tls_pair_free(&pairs[pair_len]);
+            ve_tls_free(pairs);
+            return -1;
+        }
         pair_len++;
     }
 
@@ -518,21 +549,21 @@ int ve_tls_sign_v4_append(
         for (size_t i = 0; i < pair_len; i++) {
             ve_tls_pair_free(&pairs[i]);
         }
-        free(pairs);
+        ve_tls_free(pairs);
         return -1;
     }
 
     char * norm_uri = ve_tls_norm_uri(path);
     char * norm_query = ve_tls_norm_query(query);
     if (!norm_uri || !norm_query) {
-        free(norm_uri);
-        free(norm_query);
-        free(canon_headers);
-        free(signed_headers);
+        ve_tls_free(norm_uri);
+        ve_tls_free(norm_query);
+        ve_tls_free(canon_headers);
+        ve_tls_free(signed_headers);
         for (size_t i = 0; i < pair_len; i++) {
             ve_tls_pair_free(&pairs[i]);
         }
-        free(pairs);
+        ve_tls_free(pairs);
         return -1;
     }
 
@@ -550,32 +581,32 @@ int ve_tls_sign_v4_append(
         ve_tls_buf_append(&canon_req, &cr_len, &cr_cap, signed_headers) != 0 ||
         ve_tls_buf_append(&canon_req, &cr_len, &cr_cap, "\n") != 0 ||
         ve_tls_buf_append(&canon_req, &cr_len, &cr_cap, payload_hash) != 0) {
-        free(canon_req);
+        ve_tls_free(canon_req);
         canon_req = NULL;
     }
 
-    free(norm_uri);
-    free(norm_query);
+    ve_tls_free(norm_uri);
+    ve_tls_free(norm_query);
 
     if (!canon_req) {
-        free(canon_headers);
-        free(signed_headers);
+        ve_tls_free(canon_headers);
+        ve_tls_free(signed_headers);
         for (size_t i = 0; i < pair_len; i++) {
             ve_tls_pair_free(&pairs[i]);
         }
-        free(pairs);
+        ve_tls_free(pairs);
         return -1;
     }
 
     char * canon_req_hash = ve_tls_sha256_hex((const unsigned char *)canon_req, strlen(canon_req));
-    free(canon_req);
+    ve_tls_free(canon_req);
     if (!canon_req_hash) {
-        free(canon_headers);
-        free(signed_headers);
+        ve_tls_free(canon_headers);
+        ve_tls_free(signed_headers);
         for (size_t i = 0; i < pair_len; i++) {
             ve_tls_pair_free(&pairs[i]);
         }
-        free(pairs);
+        ve_tls_free(pairs);
         return -1;
     }
 
@@ -591,31 +622,31 @@ int ve_tls_sign_v4_append(
         ve_tls_buf_append(&sts, &sts_len, &sts_cap, scope) != 0 ||
         ve_tls_buf_append(&sts, &sts_len, &sts_cap, "\n") != 0 ||
         ve_tls_buf_append(&sts, &sts_len, &sts_cap, canon_req_hash) != 0) {
-        free(sts);
+        ve_tls_free(sts);
         sts = NULL;
     }
-    free(canon_req_hash);
+    ve_tls_free(canon_req_hash);
     if (!sts) {
-        free(canon_headers);
-        free(signed_headers);
+        ve_tls_free(canon_headers);
+        ve_tls_free(signed_headers);
         for (size_t i = 0; i < pair_len; i++) {
             ve_tls_pair_free(&pairs[i]);
         }
-        free(pairs);
+        ve_tls_free(pairs);
         return -1;
     }
 
     unsigned char signing_key[32];
     ve_tls_signing_key(access_key_secret, date8, region, service, signing_key);
     char * signature = ve_tls_hmac_hex(signing_key, 32, (const unsigned char *)sts, strlen(sts));
-    free(sts);
+    ve_tls_free(sts);
     if (!signature) {
-        free(canon_headers);
-        free(signed_headers);
+        ve_tls_free(canon_headers);
+        ve_tls_free(signed_headers);
         for (size_t i = 0; i < pair_len; i++) {
             ve_tls_pair_free(&pairs[i]);
         }
-        free(pairs);
+        ve_tls_free(pairs);
         return -1;
     }
 
@@ -630,10 +661,10 @@ int ve_tls_sign_v4_append(
         ve_tls_buf_append(&auth, &a_len, &a_cap, signed_headers) != 0 ||
         ve_tls_buf_append(&auth, &a_len, &a_cap, ", Signature=") != 0 ||
         ve_tls_buf_append(&auth, &a_len, &a_cap, signature) != 0) {
-        free(auth);
+        ve_tls_free(auth);
         auth = NULL;
     }
-    free(signature);
+    ve_tls_free(signature);
     int rc = -1;
     char * out = NULL;
     size_t out_len = 0;
@@ -676,13 +707,13 @@ int ve_tls_sign_v4_append(
     out = NULL;
     rc = 0;
 cleanup:
-    free(out);
-    free(auth);
-    free(canon_headers);
-    free(signed_headers);
+    ve_tls_free(out);
+    ve_tls_free(auth);
+    ve_tls_free(canon_headers);
+    ve_tls_free(signed_headers);
     for (size_t i = 0; i < pair_len; i++) {
         ve_tls_pair_free(&pairs[i]);
     }
-    free(pairs);
+    ve_tls_free(pairs);
     return rc;
 }

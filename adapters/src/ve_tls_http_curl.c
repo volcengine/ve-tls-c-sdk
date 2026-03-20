@@ -4,6 +4,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#if !defined(_WIN32)
+#include <pthread.h>
+#endif
 
 typedef struct {
     unsigned char * data;
@@ -50,6 +53,7 @@ static size_t ve_tls_header_cb(char * ptr, size_t size, size_t nmemb, void * use
         char * id = (char *)calloc(1, len + 1);
         if (id) {
             memcpy(id, start, len);
+            free(resp->request_id);
             resp->request_id = id;
         }
     }
@@ -95,63 +99,79 @@ static const char * ve_tls_curl_error_code(CURLcode code) {
     }
 }
 
+#if !defined(_WIN32)
+static pthread_once_t g_easy_key_once = PTHREAD_ONCE_INIT;
+static pthread_key_t g_easy_key;
+
+static void ve_tls_easy_key_cleanup(void * p) {
+    if (p) {
+        curl_easy_cleanup((CURL *)p);
+    }
+}
+
+static void ve_tls_easy_key_init(void) {
+    (void)pthread_key_create(&g_easy_key, ve_tls_easy_key_cleanup);
+}
+
+static CURL * ve_tls_easy_get(void) {
+    (void)pthread_once(&g_easy_key_once, ve_tls_easy_key_init);
+    CURL * curl = (CURL *)pthread_getspecific(g_easy_key);
+    if (!curl) {
+        curl = curl_easy_init();
+        if (curl) {
+            (void)pthread_setspecific(g_easy_key, curl);
+        }
+    }
+    return curl;
+}
+#else
+static _Thread_local CURL * g_tls_easy = NULL;
+static CURL * ve_tls_easy_get(void) {
+    if (!g_tls_easy) {
+        g_tls_easy = curl_easy_init();
+    }
+    return g_tls_easy;
+}
+#endif
+
 static int ve_tls_http_curl_do(ve_tls_http_client * client, const ve_tls_http_request * req, ve_tls_http_response * resp) {
     (void)client;
-    CURL * curl = curl_easy_init();
+    CURL * curl = ve_tls_easy_get();
     if (!curl) {
         return -1;
     }
+    curl_easy_reset(curl);
     ve_tls_buf body = {0};
     struct curl_slist * headers = NULL;
     if (req->headers && req->headers[0] != 0) {
-        const char * p = req->headers;
-        const char * start = p;
-        while (*p) {
-            if (*p == '\n') {
-                size_t len = (size_t)(p - start);
-                if (len > 0) {
-                    char * h = (char *)calloc(1, len + 1);
-                    if (!h) {
-                        curl_slist_free_all(headers);
-                        curl_easy_cleanup(curl);
-                        free(body.data);
-                        return -1;
-                    }
-                    memcpy(h, start, len);
-                    struct curl_slist * nh = curl_slist_append(headers, h);
-                    free(h);
+        char * tmp = strdup(req->headers);
+        if (!tmp) {
+            curl_slist_free_all(headers);
+            free(body.data);
+            return -1;
+        }
+        char * line = tmp;
+        for (char * p = tmp;; p++) {
+            if (*p == '\n' || *p == 0) {
+                char end = *p;
+                *p = 0;
+                if (line[0] != 0) {
+                    struct curl_slist * nh = curl_slist_append(headers, line);
                     if (!nh) {
+                        free(tmp);
                         curl_slist_free_all(headers);
-                        curl_easy_cleanup(curl);
                         free(body.data);
                         return -1;
                     }
                     headers = nh;
                 }
-                start = p + 1;
+                if (end == 0) {
+                    break;
+                }
+                line = p + 1;
             }
-            p++;
         }
-        if (p != start) {
-            size_t len = (size_t)(p - start);
-            char * h = (char *)calloc(1, len + 1);
-            if (!h) {
-                curl_slist_free_all(headers);
-                curl_easy_cleanup(curl);
-                free(body.data);
-                return -1;
-            }
-            memcpy(h, start, len);
-            struct curl_slist * nh = curl_slist_append(headers, h);
-            free(h);
-            if (!nh) {
-                curl_slist_free_all(headers);
-                curl_easy_cleanup(curl);
-                free(body.data);
-                return -1;
-            }
-            headers = nh;
-        }
+        free(tmp);
     }
 
     curl_easy_setopt(curl, CURLOPT_URL, req->url);
@@ -212,7 +232,6 @@ static int ve_tls_http_curl_do(ve_tls_http_client * client, const ve_tls_http_re
             resp->error_message = strdup(err);
         }
         curl_slist_free_all(headers);
-        curl_easy_cleanup(curl);
         free(body.data);
         return -1;
     }
@@ -226,7 +245,6 @@ static int ve_tls_http_curl_do(ve_tls_http_client * client, const ve_tls_http_re
     resp->transport_retryable = 0;
     resp->error_code = NULL;
     curl_slist_free_all(headers);
-    curl_easy_cleanup(curl);
     return 0;
 }
 

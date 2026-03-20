@@ -154,6 +154,10 @@ struct ve_tls_producer {
     uint64_t m_retries_total;
     uint64_t m_bytes_sent_total;
     uint64_t m_latency_buckets[8];
+    int32_t use_global_env;
+    int32_t env_in_queue;
+    int32_t env_inflight;
+    ve_tls_producer * env_next;
 };
 
 void ve_tls_producer_config_init(ve_tls_config * config);
@@ -169,6 +173,7 @@ uint64_t ve_tls_metric_load_u64(uint64_t * p);
 
 void ve_tls_queue_free_all(ve_tls_producer * producer);
 int ve_tls_queue_push(ve_tls_producer * producer, const unsigned char * data, size_t size, int64_t id, int64_t time_ms, uint32_t time_ns, int32_t has_time_ns, const char * hash_key);
+int ve_tls_queue_push_owned(ve_tls_producer * producer, unsigned char * data, size_t size, int64_t id, int64_t time_ms, uint32_t time_ns, int32_t has_time_ns, char * hash_key);
 int ve_tls_queue_pop(ve_tls_producer * producer, ve_tls_log_item * out);
 void ve_tls_item_free(ve_tls_log_item * item);
 void ve_tls_send_task_free(ve_tls_send_task * t);
@@ -190,6 +195,12 @@ void ve_tls_idle_cleanup(ve_tls_producer * producer);
 const char * ve_tls_normalize_hash_key(ve_tls_producer * producer, const char * hash_key);
 ve_tls_key_queue * ve_tls_ready_pop(ve_tls_producer * producer);
 void ve_tls_delayed_add_sorted(ve_tls_producer * producer, ve_tls_key_queue * q, int64_t next_ready_ms);
+
+int ve_tls_producer_is_drained_locked(ve_tls_producer * producer);
+int ve_tls_sender_step(ve_tls_producer * producer);
+int ve_tls_env_register_producer(ve_tls_producer * producer);
+void ve_tls_env_unregister_producer(ve_tls_producer * producer);
+void ve_tls_env_notify(ve_tls_producer * producer);
 
 void * ve_tls_worker_main(void * arg);
 void * ve_tls_sender_main(void * arg);

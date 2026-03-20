@@ -6,6 +6,8 @@
 ## 指标项（建议最小集）
 - logs_enqueued_total
 - logs_dropped_total（按原因维度）
+  - log_dropped_buffer_full
+  - log_dropped_enqueue_alloc_failed
 - batches_sent_total
 - batches_failed_total（按 http_code/error_code 维度）
 - retries_total

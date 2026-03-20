@@ -10,6 +10,8 @@ typedef struct {
     double multiplier;
     double randomization_factor;
     int32_t max_attempts;
+    double (*rand01)(void * user_param);
+    void * rand01_param;
 } ve_tls_retry_policy;
 
 void ve_tls_retry_policy_init(ve_tls_retry_policy * policy);

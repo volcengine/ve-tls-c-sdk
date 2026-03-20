@@ -29,6 +29,9 @@ void ve_tls_rate_limit_wait(ve_tls_producer * producer, size_t bytes) {
     if (rps <= 0 && bps <= 0) {
         return;
     }
+    if (!producer->config.platform.time_ms) {
+        return;
+    }
     double req_need = rps > 0 ? 1.0 : 0.0;
     double byte_need = bps > 0 ? (double)bytes : 0.0;
     for (;;) {
@@ -84,6 +87,9 @@ void ve_tls_breaker_wait_open(ve_tls_producer * producer) {
     if (!producer || producer->config.breaker_fail_threshold <= 0) {
         return;
     }
+    if (!producer->config.platform.time_ms) {
+        return;
+    }
     for (;;) {
         int64_t now = producer->config.platform.time_ms();
         producer->config.platform.mutex_lock(producer->mutex);
@@ -112,6 +118,9 @@ int ve_tls_breaker_try_enter_half_open(ve_tls_producer * producer) {
     if (!producer || producer->config.breaker_fail_threshold <= 0) {
         return 1;
     }
+    if (!producer->config.platform.time_ms) {
+        return 1;
+    }
     int64_t now = producer->config.platform.time_ms();
     producer->config.platform.mutex_lock(producer->mutex);
     if (producer->breaker_open_until_ms == 0 || now >= producer->breaker_open_until_ms) {
@@ -129,6 +138,9 @@ int ve_tls_breaker_try_enter_half_open(ve_tls_producer * producer) {
 
 void ve_tls_breaker_leave_half_open(ve_tls_producer * producer, int ok) {
     if (!producer || producer->config.breaker_fail_threshold <= 0) {
+        return;
+    }
+    if (!producer->config.platform.time_ms) {
         return;
     }
     int64_t now = producer->config.platform.time_ms();
@@ -152,6 +164,9 @@ void ve_tls_breaker_leave_half_open(ve_tls_producer * producer, int ok) {
 
 void ve_tls_breaker_on_final_result(ve_tls_producer * producer, int ok) {
     if (!producer || producer->config.breaker_fail_threshold <= 0) {
+        return;
+    }
+    if (!producer->config.platform.time_ms) {
         return;
     }
     int64_t now = producer->config.platform.time_ms();

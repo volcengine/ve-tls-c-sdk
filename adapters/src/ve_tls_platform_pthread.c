@@ -69,7 +69,13 @@ static ve_tls_cond * ve_tls_pthread_cond_create(void) {
     if (!c) {
         return NULL;
     }
-    pthread_cond_init(&c->cond, NULL);
+    pthread_condattr_t attr;
+    pthread_condattr_init(&attr);
+#if defined(CLOCK_MONOTONIC) && defined(_POSIX_CLOCK_SELECTION) && (_POSIX_CLOCK_SELECTION > 0)
+    pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
+#endif
+    pthread_cond_init(&c->cond, &attr);
+    pthread_condattr_destroy(&attr);
     return c;
 }
 
@@ -87,10 +93,14 @@ static void ve_tls_pthread_cond_wait(ve_tls_cond * c, ve_tls_mutex * m) {
 
 static int ve_tls_pthread_cond_timedwait_ms(ve_tls_cond * c, ve_tls_mutex * m, int64_t timeout_ms) {
     struct timespec ts;
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    int64_t nanos = (int64_t)tv.tv_usec * 1000 + (timeout_ms % 1000) * 1000000;
-    ts.tv_sec = tv.tv_sec + (timeout_ms / 1000) + nanos / 1000000000;
+    struct timespec now;
+#if defined(CLOCK_MONOTONIC)
+    clock_gettime(CLOCK_MONOTONIC, &now);
+#else
+    clock_gettime(CLOCK_REALTIME, &now);
+#endif
+    int64_t nanos = (int64_t)now.tv_nsec + (timeout_ms % 1000) * 1000000;
+    ts.tv_sec = now.tv_sec + (timeout_ms / 1000) + nanos / 1000000000;
     ts.tv_nsec = nanos % 1000000000;
     return pthread_cond_timedwait(&c->cond, &m->mutex, &ts);
 }

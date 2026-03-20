@@ -1,8 +1,10 @@
 #include "ve_tls_compress.h"
+#include "ve_tls_alloc.h"
 
 #include <string.h>
 #include <stdlib.h>
 #include <limits.h>
+#include <stdint.h>
 
 #if defined(VE_TLS_HAVE_ZLIB)
 #include <zlib.h>
@@ -12,10 +14,27 @@
 #include "lz4.h"
 #endif
 
-static int ve_tls_str_ieq(const char * a, const char * b) {
-    if (!a || !b) {
-        return 0;
+#if defined(VE_TLS_HAVE_ZLIB)
+static voidpf ve_tls_zlib_alloc(voidpf opaque, uInt items, uInt size) {
+    (void)opaque;
+    if (items == 0 || size == 0) {
+        return NULL;
     }
+    size_t n = (size_t)items;
+    size_t s = (size_t)size;
+    if (n > (SIZE_MAX / s)) {
+        return NULL;
+    }
+    return ve_tls_calloc(n, s);
+}
+
+static void ve_tls_zlib_free(voidpf opaque, voidpf address) {
+    (void)opaque;
+    ve_tls_free(address);
+}
+#endif
+
+static int ve_tls_str_ieq(const char * a, const char * b) {
     while (*a && *b) {
         char ca = *a;
         char cb = *b;
@@ -50,6 +69,9 @@ int ve_tls_compress_apply(const char * compress_type, const unsigned char * in, 
         }
         z_stream strm;
         memset(&strm, 0, sizeof(strm));
+        strm.zalloc = ve_tls_zlib_alloc;
+        strm.zfree = ve_tls_zlib_free;
+        strm.opaque = NULL;
         int rc = deflateInit(&strm, Z_DEFAULT_COMPRESSION);
         if (rc != Z_OK) {
             deflateEnd(&strm);
@@ -60,7 +82,7 @@ int ve_tls_compress_apply(const char * compress_type, const unsigned char * in, 
             deflateEnd(&strm);
             return -1;
         }
-        unsigned char * buf = (unsigned char *)malloc((size_t)bound);
+        unsigned char * buf = (unsigned char *)ve_tls_malloc((size_t)bound);
         if (!buf) {
             deflateEnd(&strm);
             return -1;
@@ -73,7 +95,7 @@ int ve_tls_compress_apply(const char * compress_type, const unsigned char * in, 
 
         rc = deflate(&strm, Z_FINISH);
         if (rc != Z_STREAM_END) {
-            free(buf);
+            ve_tls_free(buf);
             deflateEnd(&strm);
             return -1;
         }
@@ -95,13 +117,13 @@ int ve_tls_compress_apply(const char * compress_type, const unsigned char * in, 
         if (bound <= 0) {
             return -1;
         }
-        unsigned char * buf = (unsigned char *)malloc((size_t)bound);
+        unsigned char * buf = (unsigned char *)ve_tls_malloc((size_t)bound);
         if (!buf) {
             return -1;
         }
         int n = LZ4_compress_default((const char *)in, (char *)buf, (int)in_size, bound);
         if (n <= 0) {
-            free(buf);
+            ve_tls_free(buf);
             return -1;
         }
         out->data = buf;

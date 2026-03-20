@@ -70,7 +70,7 @@
 ```
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
-./build/ve_tls_bench --duration-s 10 --rate-lps 5000 --message-bytes 256
+./build/ve_tls_bench --duration-s 10 --writer-threads 4 --rate-lps 5000 --message-bytes 256
 ```
 
 输出包含：

@@ -101,6 +101,35 @@ ve_tls_producer_destroy(p);
 return rc == VE_TLS_OK ? 0 : 2;
 ```
 
+### 多 Producer 场景（共享 sender 线程池）
+
+当同一进程需要创建多个 Producer（例如按 Source/Topic 隔离），建议初始化全局 Env，并让 Producer 选择使用共享 sender。
+
+```c
+ve_tls_result erc = ve_tls_env_init(2);
+if (erc != VE_TLS_OK) {
+  return 1;
+}
+
+ve_tls_config cfg;
+ve_tls_config_init(&cfg);
+cfg.endpoint = "https://tls-cn-beijing.volces.com";
+cfg.region = "cn-beijing";
+cfg.topic_id = "your-topic-id";
+cfg.access_key_id = "your-ak";
+cfg.access_key_secret = "your-sk";
+cfg.use_global_env = 1;
+
+ve_tls_producer * p1 = ve_tls_producer_create(&cfg);
+ve_tls_producer * p2 = ve_tls_producer_create(&cfg);
+
+// ... 写入与 close/destroy
+
+ve_tls_producer_destroy(p1);
+ve_tls_producer_destroy(p2);
+(void)ve_tls_env_destroy(3000);
+```
+
 ### 时间字段与 IO 统计头说明
 
 `time/timeNs` 与 `log-count/earliest-log-time/latest-log-time` 的语义、推荐用法与 raw 写入边界见：

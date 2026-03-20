@@ -8,6 +8,7 @@
 #include "ve_tls_http_curl.h"
 #endif
 
+#if !defined(VE_TLS_HAVE_CURL)
 static int ve_tls_http_noop_do(ve_tls_http_client * client, const ve_tls_http_request * req, ve_tls_http_response * resp) {
     (void)client;
     (void)req;
@@ -28,6 +29,7 @@ static void ve_tls_http_client_init_noop(ve_tls_http_client * client) {
     client->free_response = ve_tls_http_noop_free;
     client->user_data = NULL;
 }
+#endif
 
 void ve_tls_producer_config_init(ve_tls_config * config) {
     if (!config) {
@@ -44,6 +46,7 @@ void ve_tls_producer_config_init(ve_tls_config * config) {
     config->compress_type = "none";
 #endif
     config->send_thread_count = 1;
+    config->use_global_env = 0;
     config->ordered_send = 0;
     config->rate_limit_rps = 0;
     config->rate_limit_bps = 0;

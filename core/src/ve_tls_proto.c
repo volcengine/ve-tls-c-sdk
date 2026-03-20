@@ -1,4 +1,5 @@
 #include "ve_tls_proto.h"
+#include "ve_tls_alloc.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -25,7 +26,7 @@ static int ve_tls_buf_reserve(ve_tls_buf * b, size_t n) {
         }
         next *= 2;
     }
-    unsigned char * p = (unsigned char *)realloc(b->data, next);
+    unsigned char * p = (unsigned char *)ve_tls_realloc(b->data, next);
     if (!p) {
         return -1;
     }
@@ -102,44 +103,44 @@ static int ve_tls_put_fixed32(ve_tls_buf * b, uint32_t field_number, uint32_t v)
 static int ve_tls_encode_log_content(const ve_tls_kv * kv, ve_tls_buf * out) {
     ve_tls_buf tmp = {0};
     if (ve_tls_put_string(&tmp, 1, kv->key) != 0) {
-        free(tmp.data);
+        ve_tls_free(tmp.data);
         return -1;
     }
     if (ve_tls_put_string(&tmp, 2, kv->value) != 0) {
-        free(tmp.data);
+        ve_tls_free(tmp.data);
         return -1;
     }
     if (ve_tls_put_key(out, 2, 2) != 0) {
-        free(tmp.data);
+        ve_tls_free(tmp.data);
         return -1;
     }
     if (ve_tls_put_len_delimited(out, tmp.data, tmp.len) != 0) {
-        free(tmp.data);
+        ve_tls_free(tmp.data);
         return -1;
     }
-    free(tmp.data);
+    ve_tls_free(tmp.data);
     return 0;
 }
 
 static int ve_tls_encode_log_tag(const ve_tls_kv * kv, ve_tls_buf * out) {
     ve_tls_buf tmp = {0};
     if (ve_tls_put_string(&tmp, 1, kv->key) != 0) {
-        free(tmp.data);
+        ve_tls_free(tmp.data);
         return -1;
     }
     if (ve_tls_put_string(&tmp, 2, kv->value) != 0) {
-        free(tmp.data);
+        ve_tls_free(tmp.data);
         return -1;
     }
     if (ve_tls_put_key(out, 3, 2) != 0) {
-        free(tmp.data);
+        ve_tls_free(tmp.data);
         return -1;
     }
     if (ve_tls_put_len_delimited(out, tmp.data, tmp.len) != 0) {
-        free(tmp.data);
+        ve_tls_free(tmp.data);
         return -1;
     }
-    free(tmp.data);
+    ve_tls_free(tmp.data);
     return 0;
 }
 
@@ -159,18 +160,18 @@ int ve_tls_proto_encode_log_ex(int64_t time_ms, uint32_t time_ns, int32_t has_ti
         time_ns = 0;
     }
     if (ve_tls_put_int64(&b, 1, time_ms) != 0) {
-        free(b.data);
+        ve_tls_free(b.data);
         return -1;
     }
     for (size_t i = 0; i < kv_count; i++) {
         if (ve_tls_encode_log_content(&kvs[i], &b) != 0) {
-            free(b.data);
+            ve_tls_free(b.data);
             return -1;
         }
     }
     if (has_time_ns) {
         if (ve_tls_put_fixed32(&b, 3, time_ns) != 0) {
-            free(b.data);
+            ve_tls_free(b.data);
             return -1;
         }
     }
@@ -183,49 +184,49 @@ static int ve_tls_encode_log_group(const ve_tls_bytes * logs, size_t log_count, 
     ve_tls_buf tmp = {0};
     for (size_t i = 0; i < log_count; i++) {
         if (ve_tls_put_key(&tmp, 1, 2) != 0) {
-            free(tmp.data);
+            ve_tls_free(tmp.data);
             return -1;
         }
         if (ve_tls_put_len_delimited(&tmp, logs[i].data, logs[i].size) != 0) {
-            free(tmp.data);
+            ve_tls_free(tmp.data);
             return -1;
         }
     }
     if (source && source[0] != 0) {
         if (ve_tls_put_string(&tmp, 2, source) != 0) {
-            free(tmp.data);
+            ve_tls_free(tmp.data);
             return -1;
         }
     }
     if (file_name && file_name[0] != 0) {
         if (ve_tls_put_string(&tmp, 4, file_name) != 0) {
-            free(tmp.data);
+            ve_tls_free(tmp.data);
             return -1;
         }
     }
     if (log_tags && log_tag_count > 0) {
         for (size_t i = 0; i < log_tag_count; i++) {
             if (ve_tls_encode_log_tag(&log_tags[i], &tmp) != 0) {
-                free(tmp.data);
+                ve_tls_free(tmp.data);
                 return -1;
             }
         }
     }
     if (context_flow && context_flow[0] != 0) {
         if (ve_tls_put_string(&tmp, 5, context_flow) != 0) {
-            free(tmp.data);
+            ve_tls_free(tmp.data);
             return -1;
         }
     }
     if (ve_tls_put_key(out, 1, 2) != 0) {
-        free(tmp.data);
+        ve_tls_free(tmp.data);
         return -1;
     }
     if (ve_tls_put_len_delimited(out, tmp.data, tmp.len) != 0) {
-        free(tmp.data);
+        ve_tls_free(tmp.data);
         return -1;
     }
-    free(tmp.data);
+    ve_tls_free(tmp.data);
     return 0;
 }
 
@@ -256,7 +257,7 @@ int ve_tls_proto_encode_log_group_list_ex2(const ve_tls_bytes * logs, size_t log
             n = per_group;
         }
         if (ve_tls_encode_log_group(logs + off, n, source, file_name, log_tags, log_tag_count, context_flow, &b) != 0) {
-            free(b.data);
+            ve_tls_free(b.data);
             return -1;
         }
     }
@@ -269,7 +270,7 @@ void ve_tls_bytes_free(ve_tls_bytes * b) {
     if (!b) {
         return;
     }
-    free(b->data);
+    ve_tls_free(b->data);
     b->data = NULL;
     b->size = 0;
 }

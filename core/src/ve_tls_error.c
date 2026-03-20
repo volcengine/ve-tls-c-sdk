@@ -1,4 +1,5 @@
 #include "ve_tls_error.h"
+#include "ve_tls_alloc.h"
 
 #include <stdlib.h>
 
@@ -6,9 +7,9 @@ void ve_tls_error_free_fields(ve_tls_error * err) {
     if (!err) {
         return;
     }
-    free(err->error_code);
-    free(err->error_message);
-    free(err->request_id);
+    ve_tls_free(err->error_code);
+    ve_tls_free(err->error_message);
+    ve_tls_free(err->request_id);
     err->error_code = NULL;
     err->error_message = NULL;
     err->request_id = NULL;

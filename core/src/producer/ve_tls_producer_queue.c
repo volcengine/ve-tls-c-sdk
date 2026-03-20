@@ -1,4 +1,5 @@
 #include "ve_tls_producer_internal.h"
+#include "ve_tls_alloc.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -8,14 +9,14 @@ void ve_tls_queue_free_all(ve_tls_producer * producer) {
         return;
     }
     for (size_t i = 0; i < producer->queue_cap; i++) {
-        free(producer->queue[i].hash_key);
-        free(producer->queue[i].data);
+        ve_tls_free(producer->queue[i].hash_key);
+        ve_tls_free(producer->queue[i].data);
         producer->queue[i].hash_key = NULL;
         producer->queue[i].data = NULL;
         producer->queue[i].size = 0;
         producer->queue[i].id = 0;
     }
-    free(producer->queue);
+    ve_tls_free(producer->queue);
     producer->queue = NULL;
     producer->queue_cap = 0;
     producer->queue_head = 0;
@@ -27,14 +28,14 @@ void ve_tls_queue_free_all(ve_tls_producer * producer) {
 static int ve_tls_queue_ensure(ve_tls_producer * producer) {
     if (producer->queue_cap == 0) {
         producer->queue_cap = 1024;
-        producer->queue = (ve_tls_log_item *)calloc(producer->queue_cap, sizeof(ve_tls_log_item));
+        producer->queue = (ve_tls_log_item *)ve_tls_calloc(producer->queue_cap, sizeof(ve_tls_log_item));
         return producer->queue ? 0 : -1;
     }
     if (producer->queue_count < producer->queue_cap) {
         return 0;
     }
     size_t next_cap = producer->queue_cap * 2;
-    ve_tls_log_item * next = (ve_tls_log_item *)calloc(next_cap, sizeof(ve_tls_log_item));
+    ve_tls_log_item * next = (ve_tls_log_item *)ve_tls_calloc(next_cap, sizeof(ve_tls_log_item));
     if (!next) {
         return -1;
     }
@@ -45,7 +46,7 @@ static int ve_tls_queue_ensure(ve_tls_producer * producer) {
         producer->queue[idx].data = NULL;
         producer->queue[idx].size = 0;
     }
-    free(producer->queue);
+    ve_tls_free(producer->queue);
     producer->queue = next;
     producer->queue_cap = next_cap;
     producer->queue_head = 0;
@@ -53,35 +54,47 @@ static int ve_tls_queue_ensure(ve_tls_producer * producer) {
     return 0;
 }
 
-int ve_tls_queue_push(ve_tls_producer * producer, const unsigned char * data, size_t size, int64_t id, int64_t time_ms, uint32_t time_ns, int32_t has_time_ns, const char * hash_key) {
+int ve_tls_queue_push_owned(ve_tls_producer * producer, unsigned char * data, size_t size, int64_t id, int64_t time_ms, uint32_t time_ns, int32_t has_time_ns, char * hash_key) {
+    if (!producer || !data || size == 0) {
+        return -1;
+    }
     if (ve_tls_queue_ensure(producer) != 0) {
         return -1;
-    }
-    unsigned char * copy = (unsigned char *)malloc(size);
-    if (!copy) {
-        return -1;
-    }
-    memcpy(copy, data, size);
-    char * hk = NULL;
-    if (hash_key && hash_key[0] != 0) {
-        hk = strdup(hash_key);
-        if (!hk) {
-            free(copy);
-            return -1;
-        }
     }
     ve_tls_log_item item;
     item.id = id;
     item.time_ms = time_ms;
     item.time_ns = time_ns;
     item.has_time_ns = has_time_ns;
-    item.hash_key = hk;
-    item.data = copy;
+    item.hash_key = hash_key;
+    item.data = data;
     item.size = size;
     producer->queue[producer->queue_tail] = item;
     producer->queue_tail = (producer->queue_tail + 1) % producer->queue_cap;
     producer->queue_count++;
     producer->queue_bytes += size;
+    return 0;
+}
+
+int ve_tls_queue_push(ve_tls_producer * producer, const unsigned char * data, size_t size, int64_t id, int64_t time_ms, uint32_t time_ns, int32_t has_time_ns, const char * hash_key) {
+    unsigned char * copy = (unsigned char *)ve_tls_malloc(size);
+    if (!copy) {
+        return -1;
+    }
+    memcpy(copy, data, size);
+    char * hk = NULL;
+    if (hash_key && hash_key[0] != 0) {
+        hk = ve_tls_strdup(hash_key);
+        if (!hk) {
+            ve_tls_free(copy);
+            return -1;
+        }
+    }
+    if (ve_tls_queue_push_owned(producer, copy, size, id, time_ms, time_ns, has_time_ns, hk) != 0) {
+        ve_tls_free(copy);
+        ve_tls_free(hk);
+        return -1;
+    }
     return 0;
 }
 
@@ -104,8 +117,8 @@ void ve_tls_item_free(ve_tls_log_item * item) {
     if (!item) {
         return;
     }
-    free(item->hash_key);
-    free(item->data);
+    ve_tls_free(item->hash_key);
+    ve_tls_free(item->data);
     item->hash_key = NULL;
     item->data = NULL;
     item->size = 0;
@@ -119,9 +132,9 @@ void ve_tls_send_task_free(ve_tls_send_task * t) {
     if (!t) {
         return;
     }
-    free(t->hash_key);
-    free(t->precompressed);
-    free(t->body);
+    ve_tls_free(t->hash_key);
+    ve_tls_free(t->precompressed);
+    ve_tls_free(t->body);
     memset(t, 0, sizeof(*t));
 }
 
@@ -132,7 +145,7 @@ int ve_tls_send_queue_init(ve_tls_send_queue * q, ve_tls_platform * platform, si
     memset(q, 0, sizeof(*q));
     q->platform = platform;
     q->cap = cap;
-    q->buf = (ve_tls_send_task *)calloc(q->cap, sizeof(ve_tls_send_task));
+    q->buf = (ve_tls_send_task *)ve_tls_calloc(q->cap, sizeof(ve_tls_send_task));
     q->mutex = platform->mutex_create();
     q->not_empty = platform->cond_create();
     q->not_full = platform->cond_create();
@@ -235,7 +248,7 @@ void ve_tls_send_queue_destroy(ve_tls_send_queue * q) {
         for (size_t i = 0; i < q->cap; i++) {
             ve_tls_send_task_free(&q->buf[i]);
         }
-        free(q->buf);
+        ve_tls_free(q->buf);
         q->buf = NULL;
     }
     if (q->platform) {
@@ -284,14 +297,14 @@ const char * ve_tls_normalize_hash_key(ve_tls_producer * producer, const char * 
 static int ve_tls_key_queue_ensure(ve_tls_key_queue * q) {
     if (q->cap == 0) {
         q->cap = 64;
-        q->q = (ve_tls_send_task *)calloc(q->cap, sizeof(ve_tls_send_task));
+        q->q = (ve_tls_send_task *)ve_tls_calloc(q->cap, sizeof(ve_tls_send_task));
         return q->q ? 0 : -1;
     }
     if (q->count < q->cap) {
         return 0;
     }
     size_t next_cap = q->cap * 2;
-    ve_tls_send_task * next = (ve_tls_send_task *)calloc(next_cap, sizeof(ve_tls_send_task));
+    ve_tls_send_task * next = (ve_tls_send_task *)ve_tls_calloc(next_cap, sizeof(ve_tls_send_task));
     if (!next) {
         return -1;
     }
@@ -303,7 +316,7 @@ static int ve_tls_key_queue_ensure(ve_tls_key_queue * q) {
         q->q[idx].body = NULL;
         q->q[idx].body_size = 0;
     }
-    free(q->q);
+    ve_tls_free(q->q);
     q->q = next;
     q->cap = next_cap;
     q->head = 0;
@@ -466,7 +479,7 @@ void ve_tls_idle_cleanup(ve_tls_producer * producer) {
     if (ttl <= 0) {
         return;
     }
-    int64_t now = producer->config.platform.time_ms();
+    int64_t now = producer->config.platform.time_ms ? producer->config.platform.time_ms() : 0;
     ve_tls_key_queue * q = producer->idle_head;
     while (q) {
         ve_tls_key_queue * next = q->inext;
@@ -511,13 +524,13 @@ static ve_tls_key_queue * ve_tls_key_queue_get_or_create(ve_tls_producer * produ
     if (producer->config.key_queue_max_active > 0 && producer->key_queue_count >= (size_t)producer->config.key_queue_max_active) {
         return NULL;
     }
-    ve_tls_key_queue * q = (ve_tls_key_queue *)calloc(1, sizeof(ve_tls_key_queue));
+    ve_tls_key_queue * q = (ve_tls_key_queue *)ve_tls_calloc(1, sizeof(ve_tls_key_queue));
     if (!q) {
         return NULL;
     }
-    q->key = strdup(norm_key);
+    q->key = ve_tls_strdup(norm_key);
     if (!q->key) {
-        free(q);
+        ve_tls_free(q);
         return NULL;
     }
     q->hash = h;
@@ -549,14 +562,14 @@ static void ve_tls_key_queue_remove_and_free(ve_tls_producer * producer, ve_tls_
     }
     if (q->q) {
         for (size_t i = 0; i < q->cap; i++) {
-            free(q->q[i].hash_key);
-            free(q->q[i].precompressed);
-            free(q->q[i].body);
+            ve_tls_free(q->q[i].hash_key);
+            ve_tls_free(q->q[i].precompressed);
+            ve_tls_free(q->q[i].body);
         }
-        free(q->q);
+        ve_tls_free(q->q);
     }
-    free(q->key);
-    free(q);
+    ve_tls_free(q->key);
+    ve_tls_free(q);
     if (producer->key_queue_count > 0) {
         producer->key_queue_count--;
     }
@@ -615,7 +628,7 @@ void ve_tls_key_queue_finish(ve_tls_producer * producer, ve_tls_key_queue * q) {
     }
     q->inflight = 0;
     if (q->count > 0) {
-        int64_t now = producer->config.platform.time_ms();
+        int64_t now = producer->config.platform.time_ms ? producer->config.platform.time_ms() : 0;
         if (producer->config.key_breaker_fail_threshold > 0 && q->breaker_open_until_ms > now) {
             ve_tls_delayed_add_sorted(producer, q, q->breaker_open_until_ms);
         } else {
@@ -626,7 +639,7 @@ void ve_tls_key_queue_finish(ve_tls_producer * producer, ve_tls_key_queue * q) {
     }
     int32_t ttl = producer->config.key_queue_idle_ttl_ms;
     if (ttl > 0) {
-        ve_tls_idle_add(producer, q, producer->config.platform.time_ms());
+        ve_tls_idle_add(producer, q, producer->config.platform.time_ms ? producer->config.platform.time_ms() : 0);
     } else {
         ve_tls_key_queue_remove_and_free(producer, q);
     }
@@ -643,19 +656,19 @@ void ve_tls_key_map_free_all(ve_tls_producer * producer) {
             ve_tls_key_queue * n = p->hnext;
             if (p->q) {
                 for (size_t j = 0; j < p->cap; j++) {
-                    free(p->q[j].hash_key);
-                    free(p->q[j].precompressed);
-                    free(p->q[j].body);
+                    ve_tls_free(p->q[j].hash_key);
+                    ve_tls_free(p->q[j].precompressed);
+                    ve_tls_free(p->q[j].body);
                 }
-                free(p->q);
+                ve_tls_free(p->q);
             }
-            free(p->key);
-            free(p);
+            ve_tls_free(p->key);
+            ve_tls_free(p);
             p = n;
         }
         producer->key_buckets[i] = NULL;
     }
-    free(producer->key_buckets);
+    ve_tls_free(producer->key_buckets);
     producer->key_buckets = NULL;
     producer->key_bucket_count = 0;
     producer->key_queue_count = 0;
