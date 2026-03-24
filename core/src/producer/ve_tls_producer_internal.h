@@ -20,6 +20,25 @@ typedef struct {
     size_t size;
 } ve_tls_log_item;
 
+typedef struct ve_tls_log_group_builder ve_tls_log_group_builder;
+
+struct ve_tls_log_group_builder {
+    char * norm_key;
+    unsigned char * logs;
+    size_t logs_len;
+    size_t logs_cap;
+    int32_t log_count;
+    int64_t earliest;
+    int64_t latest;
+    int64_t last_time_ms;
+    uint32_t last_time_ns;
+    int32_t last_has_time_ns;
+    int64_t start_id;
+    int64_t end_id;
+    int64_t first_append_ms;
+    ve_tls_log_group_builder * next;
+};
+
 typedef struct {
     unsigned char * body;
     size_t body_size;
@@ -77,6 +96,7 @@ struct ve_tls_key_queue {
     ve_tls_key_queue * inext;
     ve_tls_key_queue * dprev;
     ve_tls_key_queue * dnext;
+    ve_tls_log_group_builder * builder;
 };
 
 struct ve_tls_producer {
@@ -114,6 +134,10 @@ struct ve_tls_producer {
     size_t queue_tail;
     size_t queue_count;
     size_t queue_bytes;
+    ve_tls_log_group_builder * sealed_head;
+    ve_tls_log_group_builder * sealed_tail;
+    unsigned char * cfg_group_suffix;
+    size_t cfg_group_suffix_len;
     int64_t rl_last_ms;
     double rl_req_tokens;
     double rl_byte_tokens;
@@ -179,6 +203,13 @@ int ve_tls_queue_pop(ve_tls_producer * producer, ve_tls_log_item * out);
 void ve_tls_item_free(ve_tls_log_item * item);
 void ve_tls_send_task_free(ve_tls_send_task * t);
 
+ve_tls_log_group_builder * ve_tls_log_builder_create(const char * norm_key);
+void ve_tls_log_builder_free(ve_tls_log_group_builder * b);
+size_t ve_tls_log_builder_log_entry_size(int64_t time_ms, uint32_t time_ns, int32_t has_time_ns, const ve_tls_kv * kvs, size_t kv_count);
+int ve_tls_log_builder_add_kv(ve_tls_log_group_builder * b, int64_t id, int64_t time_ms, uint32_t time_ns, int32_t has_time_ns, const ve_tls_kv * kvs, size_t kv_count);
+int ve_tls_producer_build_group_suffix(ve_tls_producer * producer);
+int ve_tls_builder_to_send_task(ve_tls_producer * producer, ve_tls_log_group_builder * b, ve_tls_send_task * out);
+
 int ve_tls_send_queue_init(ve_tls_send_queue * q, ve_tls_platform * platform, size_t cap);
 int ve_tls_send_queue_push(ve_tls_send_queue * q, const ve_tls_send_task * t, int wait_ms);
 int ve_tls_send_queue_pop(ve_tls_send_queue * q, ve_tls_send_task * out, int wait_ms);
@@ -186,6 +217,7 @@ void ve_tls_send_queue_stop(ve_tls_send_queue * q);
 void ve_tls_send_queue_destroy(ve_tls_send_queue * q);
 
 void ve_tls_key_map_free_all(ve_tls_producer * producer);
+ve_tls_key_queue * ve_tls_key_queue_get_or_create(ve_tls_producer * producer, const char * norm_key);
 int ve_tls_key_queue_push_task(ve_tls_producer * producer, const char * norm_key, const ve_tls_send_task * t);
 int ve_tls_key_queue_reserve(ve_tls_producer * producer, const char * norm_key);
 int ve_tls_key_queue_pop_task(ve_tls_key_queue * q, ve_tls_send_task * out);

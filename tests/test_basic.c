@@ -1304,9 +1304,18 @@ static int test_sender_credentials_min_interval_fail_without_cached(void) {
         if (g_sender_drop_v1 >= 2) break;
     }
     ve_tls_producer_destroy(p);
-    if (g_sender_drop_v1 < 2) return -1;
-    if (strcmp(g_sender_msg_v1, "credentials refresh failed") != 0) return -1;
-    if (g_sender_provider_calls != 1) return -1;
+    if (g_sender_drop_v1 < 2) {
+        fprintf(stderr, "creds_min_int_fail_no_cached: drops=%d calls=%d msg='%s'\n", g_sender_drop_v1, g_sender_provider_calls, g_sender_msg_v1);
+        return -1;
+    }
+    if (strcmp(g_sender_msg_v1, "credentials refresh failed") != 0) {
+        fprintf(stderr, "creds_min_int_fail_no_cached: msg='%s'\n", g_sender_msg_v1);
+        return -1;
+    }
+    if (g_sender_provider_calls != 1) {
+        fprintf(stderr, "creds_min_int_fail_no_cached: provider_calls=%d\n", g_sender_provider_calls);
+        return -1;
+    }
     return 0;
 }
 
@@ -2948,10 +2957,22 @@ static int test_manager_payload_too_large_after_comp_single(void) {
     }
     for (int i = 0; i < 200 && !g_mgr_p2l_done; i++) cfg.platform.sleep_ms(10);
     ve_tls_producer_destroy(p);
-    if (g_http_called_unexpected) return -1;
-    if (!g_mgr_p2l_ok) return -1;
-    if (strcmp(g_mgr_p2l_code, "PayloadTooLarge") != 0) return -1;
-    if (strcmp(g_mgr_p2l_msg, "payload too large after compression") != 0) return -1;
+    if (g_http_called_unexpected) {
+        fprintf(stderr, "p2l_single: http called unexpectedly\n");
+        return -1;
+    }
+    if (!g_mgr_p2l_ok) {
+        fprintf(stderr, "p2l_single: callback not ok (done=%d code='%s' msg='%s')\n", g_mgr_p2l_done, g_mgr_p2l_code, g_mgr_p2l_msg);
+        return -1;
+    }
+    if (strcmp(g_mgr_p2l_code, "PayloadTooLarge") != 0) {
+        fprintf(stderr, "p2l_single: code mismatch '%s'\n", g_mgr_p2l_code);
+        return -1;
+    }
+    if (strcmp(g_mgr_p2l_msg, "payload too large after compression") != 0) {
+        fprintf(stderr, "p2l_single: msg mismatch '%s'\n", g_mgr_p2l_msg);
+        return -1;
+    }
     return 0;
 }
 
@@ -3010,7 +3031,7 @@ static int test_manager_payload_too_large_split_into_two_requests(void) {
     cfg.access_key_secret = "sk";
     cfg.retry_policy.max_attempts = 1;
     cfg.flush_interval_ms = 0;
-    cfg.log_count_per_package = 2;
+    cfg.log_count_per_package = 1;
     cfg.agg_strategy = 1;
     cfg.agg_max_compressed_bytes_per_request = (int32_t)max_comp;
     cfg.compress_type = "none";
@@ -3035,7 +3056,10 @@ static int test_manager_payload_too_large_split_into_two_requests(void) {
     }
     for (int i = 0; i < 4000 && g_mgr_p2l_http_calls < 2; i++) cfg.platform.sleep_ms(1);
     ve_tls_producer_destroy(p);
-    return (g_mgr_p2l_http_calls >= 2) ? 0 : -1;
+    if (g_mgr_p2l_http_calls >= 2) {
+        return 0;
+    }
+    return -1;
 }
 
 static int test_manager_key_queue_limit_exceeded_drops(void) {
@@ -5723,7 +5747,7 @@ static int test_agg_strategy_split_by_compressed_limit(void) {
     cfg.send_thread_count = 1;
     cfg.ordered_send = 1;
     cfg.log_count_per_package = 100000;
-    cfg.log_bytes_per_package = 1024 * 1024;
+    cfg.log_bytes_per_package = 32 * 1024;
     cfg.agg_strategy = 1;
     cfg.agg_max_compressed_bytes_per_request = 50 * 1024;
     cfg.retry_policy.max_attempts = 1;

@@ -510,7 +510,7 @@ ve_tls_key_queue * ve_tls_ready_pop(ve_tls_producer * producer) {
     return q;
 }
 
-static ve_tls_key_queue * ve_tls_key_queue_get_or_create(ve_tls_producer * producer, const char * norm_key) {
+ve_tls_key_queue * ve_tls_key_queue_get_or_create(ve_tls_producer * producer, const char * norm_key) {
     if (!producer || !producer->key_buckets || producer->key_bucket_count == 0) {
         return NULL;
     }
@@ -569,6 +569,8 @@ static void ve_tls_key_queue_remove_and_free(ve_tls_producer * producer, ve_tls_
         }
         ve_tls_free(q->q);
     }
+    ve_tls_log_builder_free(q->builder);
+    q->builder = NULL;
     ve_tls_free(q->key);
     ve_tls_free(q);
     if (producer->key_queue_count > 0) {
@@ -663,6 +665,7 @@ void ve_tls_key_map_free_all(ve_tls_producer * producer) {
                 }
                 ve_tls_free(p->q);
             }
+            ve_tls_log_builder_free(p->builder);
             ve_tls_free(p->key);
             ve_tls_free(p);
             p = n;

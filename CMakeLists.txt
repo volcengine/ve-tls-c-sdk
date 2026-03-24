@@ -18,6 +18,7 @@ add_library(ve_tls_core)
 target_sources(ve_tls_core PRIVATE
     core/src/ve_tls_producer.c
     core/src/producer/ve_tls_producer_queue.c
+    core/src/producer/ve_tls_producer_builder.c
     core/src/producer/ve_tls_producer_common.c
     core/src/producer/ve_tls_producer_config.c
     core/src/producer/ve_tls_producer_manager.c
@@ -66,6 +67,10 @@ if(VE_TLS_ENABLE_PTHREAD)
     set(THREADS_PREFER_PTHREAD_FLAG ON)
     find_package(Threads REQUIRED)
     target_link_libraries(ve_tls_core PRIVATE Threads::Threads)
+endif()
+
+if(UNIX AND NOT APPLE)
+    target_link_libraries(ve_tls_core PUBLIC m)
 endif()
 
 add_executable(ve_tls_demo tools/demo.c)

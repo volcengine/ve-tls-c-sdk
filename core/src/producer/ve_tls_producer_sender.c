@@ -927,6 +927,39 @@ have_task: {
         }
     }
 
+    if (producer->config.agg_strategy == 1 && producer->config.agg_max_compressed_bytes_per_request > 0) {
+        size_t maxc = (size_t)producer->config.agg_max_compressed_bytes_per_request;
+        if (maxc > 0 && send_body_size > maxc) {
+            ve_tls_error err;
+            memset(&err, 0, sizeof(err));
+            err.http_code = -1;
+            err.transport_kind = VE_TLS_TRANSPORT_GENERIC;
+            err.transport_code = 0;
+            err.retryable = 0;
+            err.error_code = ve_tls_strdup("PayloadTooLarge");
+            err.error_message = ve_tls_strdup("payload too large after compression");
+            ve_tls_send_callbacks cbs = ve_tls_capture_callbacks(producer);
+            if (cbs.cb) {
+                cbs.cb(VE_TLS_DROP_ERROR, task.batch_bytes, 0, NULL, err.error_message, NULL, cbs.cb_param, task.start_id, task.end_id);
+            }
+            if (cbs.cb2) {
+                cbs.cb2(VE_TLS_DROP_ERROR, task.batch_bytes, 0, &err, NULL, cbs.cb2_param, task.start_id, task.end_id);
+            }
+            ve_tls_error_free_fields(&err);
+            if (compressed_owned) {
+                ve_tls_bytes_free(&compressed);
+            }
+            ve_tls_send_task_free(&task);
+            producer->config.platform.mutex_lock(producer->mutex);
+            ve_tls_key_queue_finish(producer, kq);
+            producer->config.platform.mutex_unlock(producer->mutex);
+            if (producer->use_global_env) {
+                ve_tls_env_notify(producer);
+            }
+            return 1;
+        }
+    }
+
     int32_t attempt = 0;
     int64_t start_time = producer->config.platform.time_ms ? producer->config.platform.time_ms() : 0;
     ve_tls_error err;
@@ -1249,6 +1282,36 @@ next_task:
                     cbs.cb2(VE_TLS_DROP_ERROR, task.batch_bytes, 0, &err, NULL, cbs.cb2_param, task.start_id, task.end_id);
                 }
                 ve_tls_error_free_fields(&err);
+                ve_tls_send_task_free(&task);
+                producer->config.platform.mutex_lock(producer->mutex);
+                ve_tls_key_queue_finish(producer, kq);
+                producer->config.platform.mutex_unlock(producer->mutex);
+                continue;
+            }
+        }
+
+        if (producer->config.agg_strategy == 1 && producer->config.agg_max_compressed_bytes_per_request > 0) {
+            size_t maxc = (size_t)producer->config.agg_max_compressed_bytes_per_request;
+            if (maxc > 0 && send_body_size > maxc) {
+                ve_tls_error err;
+                memset(&err, 0, sizeof(err));
+                err.http_code = -1;
+                err.transport_kind = VE_TLS_TRANSPORT_GENERIC;
+                err.transport_code = 0;
+                err.retryable = 0;
+                err.error_code = ve_tls_strdup("PayloadTooLarge");
+                err.error_message = ve_tls_strdup("payload too large after compression");
+                ve_tls_send_callbacks cbs = ve_tls_capture_callbacks(producer);
+                if (cbs.cb) {
+                    cbs.cb(VE_TLS_DROP_ERROR, task.batch_bytes, 0, NULL, err.error_message, NULL, cbs.cb_param, task.start_id, task.end_id);
+                }
+                if (cbs.cb2) {
+                    cbs.cb2(VE_TLS_DROP_ERROR, task.batch_bytes, 0, &err, NULL, cbs.cb2_param, task.start_id, task.end_id);
+                }
+                ve_tls_error_free_fields(&err);
+                if (compressed_owned) {
+                    ve_tls_bytes_free(&compressed);
+                }
                 ve_tls_send_task_free(&task);
                 producer->config.platform.mutex_lock(producer->mutex);
                 ve_tls_key_queue_finish(producer, kq);
