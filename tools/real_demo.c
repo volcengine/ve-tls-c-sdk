@@ -101,6 +101,120 @@ static int32_t get_i32(demo_conf * c, const char * key, int32_t defv) {
     return (int32_t)v;
 }
 
+static int str_ieq(const char * a, const char * b) {
+    if (!a || !b) return 0;
+    while (*a && *b) {
+        char ca = (char)tolower((unsigned char)*a);
+        char cb = (char)tolower((unsigned char)*b);
+        if (ca != cb) return 0;
+        a++;
+        b++;
+    }
+    return *a == 0 && *b == 0;
+}
+
+static ve_tls_send_queue_full_policy parse_send_queue_full_policy(demo_conf * c, const char * key, ve_tls_send_queue_full_policy defv) {
+    const char * s = get_str(c, key, NULL);
+    if (!s || s[0] == 0) return defv;
+    if (str_ieq(s, "block")) return VE_TLS_SEND_QUEUE_FULL_BLOCK;
+    if (str_ieq(s, "drop")) return VE_TLS_SEND_QUEUE_FULL_DROP;
+    if (str_ieq(s, "drop_sampled")) return VE_TLS_SEND_QUEUE_FULL_DROP_SAMPLED;
+    if (str_ieq(s, "drop-sampled")) return VE_TLS_SEND_QUEUE_FULL_DROP_SAMPLED;
+    return defv;
+}
+
+static int parse_log_tags(demo_conf * conf, const char * s, ve_tls_kv ** out_kvs, int32_t * out_n) {
+    if (!out_kvs || !out_n) return -1;
+    *out_kvs = NULL;
+    *out_n = 0;
+    if (!conf || !s || s[0] == 0) return 0;
+
+    char * buf = conf_strdup(conf, s);
+    if (!buf) return -1;
+
+    int32_t cap = 32;
+    ve_tls_kv * kvs = (ve_tls_kv *)malloc(sizeof(ve_tls_kv) * (size_t)cap);
+    if (!kvs) return -1;
+    memset(kvs, 0, sizeof(ve_tls_kv) * (size_t)cap);
+    if (conf->alloc_len < (int)(sizeof(conf->allocs) / sizeof(conf->allocs[0]))) {
+        conf->allocs[conf->alloc_len++] = (char *)kvs;
+    } else {
+        free(kvs);
+        return -1;
+    }
+
+    int32_t n = 0;
+    char * p = buf;
+    while (p && *p) {
+        char * token = p;
+        char * comma = strchr(p, ',');
+        if (comma) {
+            *comma = 0;
+            p = comma + 1;
+        } else {
+            p = NULL;
+        }
+
+        token = trim_inplace(token);
+        if (!token || token[0] == 0) continue;
+        char * eq = strchr(token, '=');
+        if (!eq) continue;
+        *eq = 0;
+        char * k = trim_inplace(token);
+        char * v = trim_inplace(eq + 1);
+        if (!k || k[0] == 0) continue;
+        if (!v) v = "";
+        if (n >= cap) break;
+        kvs[n].key = conf_strdup(conf, k);
+        kvs[n].value = conf_strdup(conf, v);
+        if (!kvs[n].key || !kvs[n].value) return -1;
+        n++;
+    }
+
+    *out_kvs = kvs;
+    *out_n = n;
+    return 0;
+}
+
+static int load_file_bytes(const char * path, unsigned char ** out, size_t * out_size) {
+    if (!path || !out || !out_size) return -1;
+    *out = NULL;
+    *out_size = 0;
+    FILE * f = fopen(path, "rb");
+    if (!f) return -1;
+    if (fseek(f, 0, SEEK_END) != 0) {
+        fclose(f);
+        return -1;
+    }
+    long n = ftell(f);
+    if (n <= 0) {
+        fclose(f);
+        return -1;
+    }
+    if ((size_t)n > (size_t)(64 * 1024 * 1024)) {
+        fclose(f);
+        return -1;
+    }
+    if (fseek(f, 0, SEEK_SET) != 0) {
+        fclose(f);
+        return -1;
+    }
+    unsigned char * p = (unsigned char *)malloc((size_t)n);
+    if (!p) {
+        fclose(f);
+        return -1;
+    }
+    size_t r = fread(p, 1, (size_t)n, f);
+    fclose(f);
+    if (r != (size_t)n) {
+        free(p);
+        return -1;
+    }
+    *out = p;
+    *out_size = (size_t)n;
+    return 0;
+}
+
 static void on_send_done_v2(
     ve_tls_result result,
     size_t log_bytes,
@@ -165,6 +279,13 @@ static void print_cfg(const ve_tls_config * cfg, int demo_count, int interval_ms
         cfg->hash_key ? cfg->hash_key : ""
     );
     fprintf(stderr,
+        "send-queue size=%d full_policy=%d block_timeout_ms=%d sample_every_n=%d\n",
+        (int)cfg->send_queue_size,
+        (int)cfg->send_queue_full_policy,
+        (int)cfg->send_queue_block_timeout_ms,
+        (int)cfg->send_queue_sample_every_n
+    );
+    fprintf(stderr,
         "io-stats headers x-tls-bodyrawsize x-tls-compresstype log-count earliest-log-time latest-log-time\n"
     );
     fprintf(stderr,
@@ -176,8 +297,8 @@ static void print_cfg(const ve_tls_config * cfg, int demo_count, int interval_ms
 static void usage(const char * argv0) {
     fprintf(stderr, "usage: %s [--config path] [--count N] [--interval-ms M] [--wait-ms M] [--duration-s S]\n", argv0 ? argv0 : "ve_tls_demo_real");
     fprintf(stderr, "required env/config keys: VE_TLS_ENDPOINT VE_TLS_REGION VE_TLS_TOPIC_ID VE_TLS_ACCESS_KEY_ID VE_TLS_ACCESS_KEY_SECRET\n");
-    fprintf(stderr, "optional keys: VE_TLS_SECURITY_TOKEN VE_TLS_COMPRESS_TYPE VE_TLS_SEND_THREAD_COUNT VE_TLS_FLUSH_INTERVAL_MS VE_TLS_REQUEST_TIMEOUT_MS VE_TLS_CONNECT_TIMEOUT_MS VE_TLS_CA_CERT_PATH VE_TLS_PROXY VE_TLS_TLS_VERIFY_PEER VE_TLS_TLS_VERIFY_HOST VE_TLS_USER_AGENT VE_TLS_HASH_KEY VE_TLS_HTTP_DEBUG\n");
-    fprintf(stderr, "demo keys: VE_TLS_DEMO_MESSAGE VE_TLS_DEMO_DEBUG VE_TLS_DEMO_METRICS VE_TLS_DEMO_RATE_LPS VE_TLS_DEMO_DURATION_S VE_TLS_DEMO_FLUSH_EVERY_N\n");
+    fprintf(stderr, "optional keys: VE_TLS_SECURITY_TOKEN VE_TLS_COMPRESS_TYPE VE_TLS_SEND_THREAD_COUNT VE_TLS_MAX_BUFFER_BYTES VE_TLS_LOG_BYTES_PER_PACKAGE VE_TLS_LOG_COUNT_PER_PACKAGE VE_TLS_AGG_MAX_RAW_BYTES_PER_REQUEST VE_TLS_AGG_MAX_COMPRESSED_BYTES_PER_REQUEST VE_TLS_LOG_TAGS VE_TLS_FLUSH_INTERVAL_MS VE_TLS_REQUEST_TIMEOUT_MS VE_TLS_CONNECT_TIMEOUT_MS VE_TLS_CA_CERT_PATH VE_TLS_PROXY VE_TLS_TLS_VERIFY_PEER VE_TLS_TLS_VERIFY_HOST VE_TLS_USER_AGENT VE_TLS_HASH_KEY VE_TLS_HTTP_DEBUG VE_TLS_SEND_QUEUE_SIZE VE_TLS_SEND_QUEUE_FULL_POLICY VE_TLS_SEND_QUEUE_BLOCK_TIMEOUT_MS VE_TLS_SEND_QUEUE_SAMPLE_EVERY_N\n");
+    fprintf(stderr, "demo keys: VE_TLS_DEMO_MESSAGE VE_TLS_DEMO_LOG_RAW_FILE VE_TLS_DEMO_DEBUG VE_TLS_DEMO_METRICS VE_TLS_DEMO_RATE_LPS VE_TLS_DEMO_DURATION_S VE_TLS_DEMO_FLUSH_EVERY_N\n");
 }
 
 int main(int argc, char ** argv) {
@@ -243,7 +364,25 @@ int main(int argc, char ** argv) {
 
     cfg.compress_type = get_str(&conf, "VE_TLS_COMPRESS_TYPE", cfg.compress_type);
     cfg.send_thread_count = get_i32(&conf, "VE_TLS_SEND_THREAD_COUNT", cfg.send_thread_count);
+    cfg.max_buffer_bytes = get_i32(&conf, "VE_TLS_MAX_BUFFER_BYTES", cfg.max_buffer_bytes);
+    cfg.log_bytes_per_package = get_i32(&conf, "VE_TLS_LOG_BYTES_PER_PACKAGE", cfg.log_bytes_per_package);
+    cfg.log_count_per_package = get_i32(&conf, "VE_TLS_LOG_COUNT_PER_PACKAGE", cfg.log_count_per_package);
+    cfg.agg_max_raw_bytes_per_request = get_i32(&conf, "VE_TLS_AGG_MAX_RAW_BYTES_PER_REQUEST", cfg.agg_max_raw_bytes_per_request);
+    cfg.agg_max_compressed_bytes_per_request = get_i32(&conf, "VE_TLS_AGG_MAX_COMPRESSED_BYTES_PER_REQUEST", cfg.agg_max_compressed_bytes_per_request);
+    ve_tls_kv * log_tags = NULL;
+    int32_t log_tag_count = 0;
+    if (parse_log_tags(&conf, get_str(&conf, "VE_TLS_LOG_TAGS", NULL), &log_tags, &log_tag_count) != 0) {
+        fprintf(stderr, "failed to parse VE_TLS_LOG_TAGS\n");
+        conf_free(&conf);
+        return 1;
+    }
+    cfg.log_tags = log_tags;
+    cfg.log_tag_count = (size_t)log_tag_count;
     cfg.flush_interval_ms = get_i32(&conf, "VE_TLS_FLUSH_INTERVAL_MS", cfg.flush_interval_ms);
+    cfg.send_queue_size = get_i32(&conf, "VE_TLS_SEND_QUEUE_SIZE", cfg.send_queue_size);
+    cfg.send_queue_full_policy = parse_send_queue_full_policy(&conf, "VE_TLS_SEND_QUEUE_FULL_POLICY", cfg.send_queue_full_policy);
+    cfg.send_queue_block_timeout_ms = get_i32(&conf, "VE_TLS_SEND_QUEUE_BLOCK_TIMEOUT_MS", cfg.send_queue_block_timeout_ms);
+    cfg.send_queue_sample_every_n = get_i32(&conf, "VE_TLS_SEND_QUEUE_SAMPLE_EVERY_N", cfg.send_queue_sample_every_n);
     cfg.request_timeout_ms = get_i32(&conf, "VE_TLS_REQUEST_TIMEOUT_MS", cfg.request_timeout_ms);
     cfg.connect_timeout_ms = get_i32(&conf, "VE_TLS_CONNECT_TIMEOUT_MS", cfg.connect_timeout_ms);
     cfg.tls_verify_peer = get_i32(&conf, "VE_TLS_TLS_VERIFY_PEER", cfg.tls_verify_peer);
@@ -275,18 +414,30 @@ int main(int argc, char ** argv) {
     }
 
     const char * msg = get_str(&conf, "VE_TLS_DEMO_MESSAGE", "hello");
+    const char * raw_file = get_str(&conf, "VE_TLS_DEMO_LOG_RAW_FILE", NULL);
+    unsigned char * raw_log = NULL;
+    size_t raw_log_size = 0;
+    int use_raw_log = 0;
+    if (raw_file && raw_file[0] != 0) {
+        if (load_file_bytes(raw_file, &raw_log, &raw_log_size) != 0) {
+            fprintf(stderr, "failed to load raw log file: %s\n", raw_file);
+            conf_free(&conf);
+            return 1;
+        }
+        use_raw_log = 1;
+    }
     print_cfg(&cfg, (int)count, (int)interval_ms, (int)wait_ms, demo_debug, demo_metrics, cfg.http_debug);
 
     ve_tls_producer * p = ve_tls_producer_create(&cfg);
     if (!p) {
         fprintf(stderr, "ve_tls_producer_create failed\n");
+        free(raw_log);
         conf_free(&conf);
         return 1;
     }
     ve_tls_producer_set_send_done_v2(p, on_send_done_v2, NULL);
 
     if (count < 1) count = 1;
-    if (count > 10000) count = 10000;
     if (interval_ms < 0) interval_ms = 0;
     if (wait_ms < 0) wait_ms = 0;
     if (duration_s < 0) duration_s = 0;
@@ -311,20 +462,26 @@ int main(int argc, char ** argv) {
         } else {
             if (sent >= count) break;
         }
-        char seq[32];
-        snprintf(seq, sizeof(seq), "%d", (int)seq_i++);
-        ve_tls_kv kvs[3];
-        kvs[0].key = "message";
-        kvs[0].value = msg;
-        kvs[1].key = "seq";
-        kvs[1].value = seq;
-        kvs[2].key = "pid";
-        kvs[2].value = "demo";
-        ve_tls_result rc = ve_tls_producer_add_log_kv_hashkey(p, 0, cfg.hash_key, kvs, 3, 0);
+        int32_t seq_n = seq_i++;
+        ve_tls_result rc;
+        if (use_raw_log) {
+            rc = ve_tls_producer_add_log_raw(p, (const char *)raw_log, raw_log_size, 0);
+        } else {
+            char seq[32];
+            snprintf(seq, sizeof(seq), "%d", (int)seq_n);
+            ve_tls_kv kvs[3];
+            kvs[0].key = "message";
+            kvs[0].value = msg;
+            kvs[1].key = "seq";
+            kvs[1].value = seq;
+            kvs[2].key = "pid";
+            kvs[2].value = "demo";
+            rc = ve_tls_producer_add_log_kv_hashkey(p, 0, cfg.hash_key, kvs, 3, 0);
+        }
         if (rc != VE_TLS_OK) {
             fprintf(stderr, "add_log failed: %d\n", (int)rc);
         } else if (demo_debug) {
-            fprintf(stderr, "add_log ok seq=%s\n", seq);
+            fprintf(stderr, "add_log ok seq=%d\n", (int)seq_n);
         }
         sent++;
         if (demo_flush_every_n > 0 && (sent % demo_flush_every_n) == 0) {
@@ -344,8 +501,9 @@ int main(int argc, char ** argv) {
     if (demo_debug) {
         fprintf(stderr, "flush requested\n");
     }
-    if (wait_ms > 0) {
-        cfg.platform.sleep_ms(wait_ms);
+    ve_tls_result close_rc = ve_tls_producer_close(p, wait_ms);
+    if (demo_debug || close_rc != VE_TLS_OK) {
+        fprintf(stderr, "close rc=%d\n", (int)close_rc);
     }
     ve_tls_metrics m;
     ve_tls_producer_get_metrics(p, &m);
@@ -362,6 +520,7 @@ int main(int argc, char ** argv) {
         (unsigned long long)m.bytes_sent_total
     );
     ve_tls_producer_destroy(p);
+    free(raw_log);
     conf_free(&conf);
     return 0;
 }

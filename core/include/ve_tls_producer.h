@@ -26,6 +26,11 @@ typedef enum {
     VE_TLS_SEND_QUEUE_FULL_DROP_SAMPLED = 2
 } ve_tls_send_queue_full_policy;
 
+typedef enum {
+    VE_TLS_BUFFER_FULL_DROP = 0,
+    VE_TLS_BUFFER_FULL_BLOCK = 1
+} ve_tls_buffer_full_policy;
+
 typedef struct {
     const char * key;
     const char * value;
@@ -75,6 +80,8 @@ typedef struct {
     int32_t breaker_open_ms;
     int32_t breaker_half_open_max_inflight;
     int32_t max_buffer_bytes;
+    ve_tls_buffer_full_policy buffer_full_policy;
+    int32_t buffer_full_block_timeout_ms;
     int32_t log_bytes_per_package;
     int32_t log_count_per_package;
     int32_t flush_interval_ms;

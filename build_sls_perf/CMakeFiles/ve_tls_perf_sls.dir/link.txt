@@ -1,0 +1,1 @@
+/usr/bin/cc -O3 -DNDEBUG -arch arm64 -Wl,-search_paths_first -Wl,-headerpad_max_install_names CMakeFiles/ve_tls_perf_sls.dir/tools/perf_sls.c.o -o ve_tls_perf_sls  libve_tls_core.a

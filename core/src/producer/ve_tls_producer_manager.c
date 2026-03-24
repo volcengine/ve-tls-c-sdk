@@ -485,7 +485,17 @@ void * ve_tls_worker_main(void * arg) {
                         if (push_rc == -2) {
                             ve_tls_metrics_emit(producer, "send_queue_timeout_drop", 1, 0);
                         } else {
-                            ve_tls_metrics_emit(producer, "send_queue_drop", 1, 0);
+                            int stopped = 0;
+                            if (producer->send_queue.platform && producer->send_queue.mutex) {
+                                producer->send_queue.platform->mutex_lock(producer->send_queue.mutex);
+                                stopped = producer->send_queue.stop ? 1 : 0;
+                                producer->send_queue.platform->mutex_unlock(producer->send_queue.mutex);
+                            }
+                            if (stopped) {
+                                ve_tls_metrics_emit(producer, "send_queue_stop_drop", 1, 0);
+                            } else {
+                                ve_tls_metrics_emit(producer, "send_queue_drop", 1, 0);
+                            }
                         }
                         ve_tls_error err;
                         memset(&err, 0, sizeof(err));
@@ -497,8 +507,19 @@ void * ve_tls_worker_main(void * arg) {
                             err.error_code = ve_tls_strdup("SendQueueTimeout");
                             err.error_message = ve_tls_strdup("send queue push timeout");
                         } else {
-                            err.error_code = ve_tls_strdup("SendQueueFull");
-                            err.error_message = ve_tls_strdup("send queue full");
+                            int stopped = 0;
+                            if (producer->send_queue.platform && producer->send_queue.mutex) {
+                                producer->send_queue.platform->mutex_lock(producer->send_queue.mutex);
+                                stopped = producer->send_queue.stop ? 1 : 0;
+                                producer->send_queue.platform->mutex_unlock(producer->send_queue.mutex);
+                            }
+                            if (stopped) {
+                                err.error_code = ve_tls_strdup("SendQueueStopped");
+                                err.error_message = ve_tls_strdup("send queue stopped");
+                            } else {
+                                err.error_code = ve_tls_strdup("SendQueueFull");
+                                err.error_message = ve_tls_strdup("send queue full");
+                            }
                         }
                         ve_tls_send_callbacks cbs = ve_tls_capture_callbacks(producer);
                         if (cbs.cb) {
@@ -535,6 +556,17 @@ void * ve_tls_worker_main(void * arg) {
         }
         ve_tls_free(items);
         producer->config.platform.mutex_lock(producer->mutex);
+        if (producer->stop) {
+            if (producer->queue_count > 0) {
+                producer->flush_requested = 1;
+            }
+        } else {
+            if (producer->config.log_count_per_package > 0 && producer->queue_count >= (size_t)producer->config.log_count_per_package) {
+                producer->flush_requested = 1;
+            } else if (byte_limit > 0 && producer->queue_bytes >= byte_limit) {
+                producer->flush_requested = 1;
+            }
+        }
         producer->worker_flushing = 0;
         producer->config.platform.cond_broadcast(producer->send_cond);
         producer->config.platform.mutex_unlock(producer->mutex);

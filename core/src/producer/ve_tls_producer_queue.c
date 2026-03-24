@@ -110,6 +110,7 @@ int ve_tls_queue_pop(ve_tls_producer * producer, ve_tls_log_item * out) {
     producer->queue_head = (producer->queue_head + 1) % producer->queue_cap;
     producer->queue_count--;
     producer->queue_bytes -= out->size;
+    producer->config.platform.cond_signal(producer->cond);
     return 0;
 }
 

@@ -98,6 +98,7 @@ struct ve_tls_producer {
     ve_tls_key_queue * ready_tail;
     ve_tls_key_queue * idle_head;
     ve_tls_key_queue * idle_tail;
+    int64_t idle_cleanup_next_ms;
     ve_tls_key_queue * delayed_head;
     ve_tls_key_queue * delayed_tail;
     ve_tls_send_queue send_queue;

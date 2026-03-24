@@ -1199,8 +1199,11 @@ next_task:
                     return NULL;
                 }
             }
-            ve_tls_idle_cleanup(producer);
             int64_t now1 = producer->config.platform.time_ms ? producer->config.platform.time_ms() : 0;
+            if (now1 > 0 && now1 >= producer->idle_cleanup_next_ms) {
+                producer->idle_cleanup_next_ms = now1 + 1000;
+                ve_tls_idle_cleanup(producer);
+            }
             int64_t deadline = producer->delayed_head ? producer->delayed_head->next_ready_ms : (now1 + 100);
             int64_t wait_ms = deadline - now1;
             if (wait_ms < 1) {

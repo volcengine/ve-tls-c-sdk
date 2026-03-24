@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <limits.h>
 
 static int http_ok_do(ve_tls_http_client * client, const ve_tls_http_request * req, ve_tls_http_response * resp) {
     (void)client;
@@ -41,9 +42,18 @@ static int parse_i32(const char * s, int32_t * out) {
     return 0;
 }
 
+static int parse_i64(const char * s, int64_t * out) {
+    if (!s || !out) return -1;
+    char * end = NULL;
+    long long v = strtoll(s, &end, 10);
+    if (end == s || *end != 0) return -1;
+    *out = (int64_t)v;
+    return 0;
+}
+
 static void usage(const char * argv0) {
     fprintf(stderr, "usage: %s [--duration-s S] [--rate-lps N] [--message-bytes N] [--writer-threads N] [--flush-every-n N] [--close-timeout-ms N] [--use-global-env 0|1] [--global-senders N]\n", argv0 ? argv0 : "ve_tls_bench");
-    fprintf(stderr, "optional: [--max-buffer-bytes N] [--send-queue-size N] [--flush-interval-ms N] [--log-count-per-package N]\n");
+    fprintf(stderr, "optional: [--send-thread-count N] [--compress-type none|lz4|zlib] [--max-buffer-bytes N] [--send-queue-size N] [--flush-interval-ms N] [--log-count-per-package N]\n");
 }
 
 static uint64_t g_sent = 0;
@@ -78,10 +88,14 @@ static void * writer_main(void * arg) {
         uint64_t seq = __atomic_fetch_add(&g_seq, 1, __ATOMIC_RELAXED);
         int flush = (c->flush_every_n > 0 && (seq % (uint64_t)c->flush_every_n) == 0) ? 1 : 0;
         ve_tls_result rc = ve_tls_producer_add_log_kv(c->producer, 0, c->kvs, 1, flush);
-        if (rc != VE_TLS_OK) {
-            break;
+        if (rc == VE_TLS_OK) {
+            __atomic_fetch_add(&g_sent, 1, __ATOMIC_RELAXED);
+            continue;
         }
-        __atomic_fetch_add(&g_sent, 1, __ATOMIC_RELAXED);
+        if (rc == VE_TLS_DROP_ERROR) {
+            continue;
+        }
+        break;
     }
     return NULL;
 }
@@ -99,6 +113,8 @@ int main(int argc, char ** argv) {
     int32_t send_queue_size = 0;
     int32_t flush_interval_ms = 0;
     int32_t log_count_per_package = 0;
+    int32_t send_thread_count = 0;
+    const char * compress_type = NULL;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--help") == 0) {
@@ -127,8 +143,21 @@ int main(int argc, char ** argv) {
             if (parse_i32(v, &flush_every_n) != 0 || flush_every_n < 0) return 2;
         } else if (strcmp(k, "--close-timeout-ms") == 0) {
             if (parse_i32(v, &close_timeout_ms) != 0) return 2;
+        } else if (strcmp(k, "--send-thread-count") == 0) {
+            if (parse_i32(v, &send_thread_count) != 0 || send_thread_count < 1) return 2;
+        } else if (strcmp(k, "--compress-type") == 0) {
+            compress_type = v;
         } else if (strcmp(k, "--max-buffer-bytes") == 0) {
-            if (parse_i32(v, &max_buffer_bytes) != 0 || max_buffer_bytes < 0) return 2;
+            int64_t x = 0;
+            if (parse_i64(v, &x) != 0 || x < 0) {
+                usage(argv[0]);
+                return 2;
+            }
+            if (x > (int64_t)INT32_MAX) {
+                fprintf(stderr, "max-buffer-bytes capped to %d (int32 max)\n", (int)INT32_MAX);
+                x = (int64_t)INT32_MAX;
+            }
+            max_buffer_bytes = (int32_t)x;
         } else if (strcmp(k, "--send-queue-size") == 0) {
             if (parse_i32(v, &send_queue_size) != 0 || send_queue_size < 0) return 2;
         } else if (strcmp(k, "--flush-interval-ms") == 0) {
@@ -161,6 +190,8 @@ int main(int argc, char ** argv) {
     cfg.flush_interval_ms = 100;
     cfg.log_count_per_package = 512;
     cfg.max_buffer_bytes = 16 * 1024 * 1024;
+    if (send_thread_count > 0) cfg.send_thread_count = send_thread_count;
+    if (compress_type && compress_type[0] != 0) cfg.compress_type = compress_type;
     cfg.http_client.do_request = http_ok_do;
     cfg.http_client.free_response = http_ok_free;
     if (max_buffer_bytes > 0) cfg.max_buffer_bytes = max_buffer_bytes;

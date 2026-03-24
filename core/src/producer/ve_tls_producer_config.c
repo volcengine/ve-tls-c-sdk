@@ -54,6 +54,8 @@ void ve_tls_producer_config_init(ve_tls_config * config) {
     config->breaker_open_ms = 30000;
     config->breaker_half_open_max_inflight = 1;
     config->max_buffer_bytes = 64 * 1024 * 1024;
+    config->buffer_full_policy = VE_TLS_BUFFER_FULL_DROP;
+    config->buffer_full_block_timeout_ms = 0;
     config->log_bytes_per_package = 10 * 1024 * 1024;
     config->log_count_per_package = 2048;
     config->flush_interval_ms = 1000;
