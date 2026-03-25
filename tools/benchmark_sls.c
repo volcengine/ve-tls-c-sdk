@@ -144,6 +144,7 @@ int main(int argc, char ** argv) {
         profile = env_str("SLS_BENCH_PROFILE", "both");
     }
     const char * mode = env_str("SLS_BENCH_MODE", "mock");
+    fprintf(stderr, "ve_tls_benchmark_sls build=%s %s profile=%s mode=%s\n", __DATE__, __TIME__, profile ? profile : "(null)", mode ? mode : "(null)");
 
     ve_tls_config cfg;
     ve_tls_config_init(&cfg);
@@ -178,10 +179,11 @@ int main(int argc, char ** argv) {
     cfg.flush_interval_ms = env_i32("SLS_PACKET_TIMEOUT_MS", 3000);
     cfg.send_thread_count = env_i32("SLS_SEND_THREADS", 16);
     cfg.buffer_full_policy = VE_TLS_BUFFER_FULL_DROP;
-    cfg.enable_tls_batching = env_i32("SLS_ENABLE_TLS_BATCHING", 1) ? 1 : 0;
 
     int use_lz4 = env_i32("SLS_COMPRESS_LZ4", 1);
     cfg.compress_type = use_lz4 ? "lz4" : "none";
+    fprintf(stderr, "ve_tls_benchmark_sls cfg: lps=%d send_s=%d send_threads=%d compress=%s ordered_send=%d\n",
+            logs_per_sec, send_sec, (int)cfg.send_thread_count, cfg.compress_type ? cfg.compress_type : "(null)", (int)cfg.ordered_send);
 
     int32_t est_q = 0;
     if (cfg.max_buffer_bytes > 0 && cfg.log_bytes_per_package > 0) {

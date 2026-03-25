@@ -26,8 +26,10 @@ static size_t ve_tls_cstr_len_cached(const char * s) {
         return g_cstr_len_cache[idx].n;
     }
     size_t n = strlen(s);
-    g_cstr_len_cache[idx].p = s;
-    g_cstr_len_cache[idx].n = n;
+    if (n >= 32) {
+        g_cstr_len_cache[idx].p = s;
+        g_cstr_len_cache[idx].n = n;
+    }
     return n;
 }
 
@@ -331,7 +333,7 @@ static int ve_tls_try_add_log_tls_batching(
     if (!(!hash_key || hash_key[0] == 0)) {
         return 0;
     }
-    if (!(producer->config.enable_tls_batching && producer->config.ordered_send == 0)) {
+    if (!(producer->config.ordered_send == 0)) {
         return 0;
     }
 

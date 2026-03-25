@@ -852,6 +852,7 @@ static int test_sender_build_url_calloc_fail_drops_without_http(void) {
     cfg.access_key_secret = "sk";
     cfg.flush_interval_ms = 100000;
     cfg.retry_policy.max_attempts = 1;
+    cfg.ordered_send = 1;
     cfg.http_client.do_request = test_http_should_not_call_do;
     cfg.http_client.free_response = test_http_free;
     ve_tls_producer * p = ve_tls_producer_create(&cfg);
@@ -905,6 +906,7 @@ static int test_sender_build_headers_realloc_fail_drops_without_http(void) {
     cfg.access_key_secret = "sk";
     cfg.flush_interval_ms = 100000;
     cfg.retry_policy.max_attempts = 1;
+    cfg.ordered_send = 1;
     cfg.http_client.do_request = test_http_should_not_call_do;
     cfg.http_client.free_response = test_http_free;
     ve_tls_producer * p = ve_tls_producer_create(&cfg);
@@ -959,6 +961,7 @@ static int test_sender_sign_realloc_fail_drops_without_http(void) {
     cfg.access_key_secret = "sk";
     cfg.flush_interval_ms = 100000;
     cfg.retry_policy.max_attempts = 1;
+    cfg.ordered_send = 1;
     cfg.http_client.do_request = test_http_should_not_call_do;
     cfg.http_client.free_response = test_http_free;
     ve_tls_producer * p = ve_tls_producer_create(&cfg);
@@ -4289,7 +4292,6 @@ static int test_add_log_with_len_exports_one_record(void) {
     cfg.flush_interval_ms = 100000;
     cfg.log_count_per_package = 1000000;
     cfg.log_bytes_per_package = 100000000;
-    cfg.enable_tls_batching = 0;
 
     ve_tls_producer * p = ve_tls_producer_create(&cfg);
     if (!p) return -1;
@@ -4363,7 +4365,6 @@ static int test_export_raw_buffer_includes_tls_batch_with_len(void) {
     cfg.flush_interval_ms = 100000;
     cfg.log_count_per_package = 1000000;
     cfg.log_bytes_per_package = 100000000;
-    cfg.enable_tls_batching = 1;
     cfg.ordered_send = 0;
 
     ve_tls_producer * p = ve_tls_producer_create(&cfg);

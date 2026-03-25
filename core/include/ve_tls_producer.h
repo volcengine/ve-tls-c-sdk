@@ -74,7 +74,6 @@ typedef struct {
     int32_t send_thread_count;
     int32_t use_global_env;
     int32_t ordered_send;
-    int32_t enable_tls_batching;
     int32_t rate_limit_rps;
     int32_t rate_limit_bps;
     int32_t breaker_fail_threshold;
