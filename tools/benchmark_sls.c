@@ -178,6 +178,7 @@ int main(int argc, char ** argv) {
     cfg.flush_interval_ms = env_i32("SLS_PACKET_TIMEOUT_MS", 3000);
     cfg.send_thread_count = env_i32("SLS_SEND_THREADS", 16);
     cfg.buffer_full_policy = VE_TLS_BUFFER_FULL_DROP;
+    cfg.enable_tls_batching = env_i32("SLS_ENABLE_TLS_BATCHING", 1) ? 1 : 0;
 
     int use_lz4 = env_i32("SLS_COMPRESS_LZ4", 1);
     cfg.compress_type = use_lz4 ? "lz4" : "none";

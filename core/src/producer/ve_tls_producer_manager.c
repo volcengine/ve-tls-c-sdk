@@ -150,7 +150,7 @@ static void * ve_tls_worker_main_builder(void * arg) {
     ve_tls_producer * producer = (ve_tls_producer *)arg;
     for (;;) {
         producer->config.platform.mutex_lock(producer->mutex);
-        int have_any_builder = 0;
+        int have_any_builder = (producer->default_builder && producer->default_builder->log_count > 0) ? 1 : 0;
         for (size_t i = 0; i < producer->key_bucket_count && !have_any_builder; i++) {
             for (ve_tls_key_queue * q = producer->key_buckets[i]; q; q = q->hnext) {
                 if (q->builder && q->builder->log_count > 0) {
@@ -161,7 +161,7 @@ static void * ve_tls_worker_main_builder(void * arg) {
         }
         while (!producer->stop && producer->queue_count == 0 && !producer->flush_requested && !producer->sealed_head && !have_any_builder) {
             producer->config.platform.cond_wait(producer->cond, producer->mutex);
-            have_any_builder = 0;
+            have_any_builder = (producer->default_builder && producer->default_builder->log_count > 0) ? 1 : 0;
             for (size_t i = 0; i < producer->key_bucket_count && !have_any_builder; i++) {
                 for (ve_tls_key_queue * q = producer->key_buckets[i]; q; q = q->hnext) {
                     if (q->builder && q->builder->log_count > 0) {
@@ -185,6 +185,26 @@ static void * ve_tls_worker_main_builder(void * arg) {
         int64_t pkg_timeout = producer->config.flush_interval_ms;
         if (pkg_timeout < 0) {
             pkg_timeout = 0;
+        }
+        if (producer->default_builder && producer->default_builder->log_count > 0) {
+            int should_seal = 0;
+            if (flush_all) {
+                should_seal = 1;
+            } else if (pkg_timeout > 0 && now > 0 && producer->default_builder->first_append_ms > 0 &&
+                       now - producer->default_builder->first_append_ms >= pkg_timeout) {
+                should_seal = 1;
+            }
+            if (should_seal) {
+                ve_tls_log_group_builder * b = producer->default_builder;
+                producer->default_builder = NULL;
+                b->next = NULL;
+                if (producer->sealed_tail) {
+                    producer->sealed_tail->next = b;
+                } else {
+                    producer->sealed_head = b;
+                }
+                producer->sealed_tail = b;
+            }
         }
         for (size_t i = 0; i < producer->key_bucket_count; i++) {
             for (ve_tls_key_queue * q = producer->key_buckets[i]; q; q = q->hnext) {

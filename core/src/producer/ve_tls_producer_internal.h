@@ -107,6 +107,9 @@ struct ve_tls_producer {
     void * send_done_v2_param;
     int32_t fast_send;
     int32_t fast_inflight;
+    int32_t fast_builder;
+    const char * default_norm_key;
+    ve_tls_log_group_builder * default_builder;
     ve_tls_mutex * mutex;
     ve_tls_cond * cond;
     ve_tls_cond * send_cond;
@@ -136,6 +139,7 @@ struct ve_tls_producer {
     size_t queue_tail;
     size_t queue_count;
     size_t queue_bytes;
+    size_t tls_bytes;
     ve_tls_log_group_builder * sealed_head;
     ve_tls_log_group_builder * sealed_tail;
     unsigned char * cfg_group_suffix;
@@ -207,8 +211,8 @@ void ve_tls_send_task_free(ve_tls_send_task * t);
 
 ve_tls_log_group_builder * ve_tls_log_builder_create(const char * norm_key);
 void ve_tls_log_builder_free(ve_tls_log_group_builder * b);
-size_t ve_tls_log_builder_log_entry_size(int64_t time_ms, uint32_t time_ns, int32_t has_time_ns, const ve_tls_kv * kvs, size_t kv_count);
-int ve_tls_log_builder_add_kv(ve_tls_log_group_builder * b, int64_t id, int64_t time_ms, uint32_t time_ns, int32_t has_time_ns, const ve_tls_kv * kvs, size_t kv_count);
+int ve_tls_log_builder_add_kv_lens(ve_tls_log_group_builder * b, int64_t id, int64_t time_ms, uint32_t time_ns, int32_t has_time_ns, const ve_tls_kv * kvs, const size_t * key_lens, const size_t * val_lens, size_t kv_count);
+int ve_tls_log_builder_append(ve_tls_log_group_builder * b, const unsigned char * logs, size_t logs_len, int32_t log_count, int64_t earliest, int64_t latest, int64_t start_id, int64_t end_id, int64_t last_time_ms, uint32_t last_time_ns, int32_t last_has_time_ns);
 int ve_tls_producer_build_group_suffix(ve_tls_producer * producer);
 int ve_tls_builder_to_send_task(ve_tls_producer * producer, ve_tls_log_group_builder * b, ve_tls_send_task * out);
 

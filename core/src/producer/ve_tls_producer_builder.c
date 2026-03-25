@@ -18,6 +18,65 @@ static size_t ve_tls_varint_u64_size(uint64_t v) {
     return n;
 }
 
+static size_t ve_tls_varint_u32_size(uint32_t v) {
+    if (v < (1u << 7)) return 1;
+    if (v < (1u << 14)) return 2;
+    if (v < (1u << 21)) return 3;
+    if (v < (1u << 28)) return 4;
+    return 5;
+}
+
+static unsigned char * ve_tls_varint_u32_pack(uint32_t v, unsigned char * out) {
+    if (v >= 0x80) {
+        *out++ = (unsigned char)(v | 0x80);
+        v >>= 7;
+        if (v >= 0x80) {
+            *out++ = (unsigned char)(v | 0x80);
+            v >>= 7;
+            if (v >= 0x80) {
+                *out++ = (unsigned char)(v | 0x80);
+                v >>= 7;
+                if (v >= 0x80) {
+                    *out++ = (unsigned char)(v | 0x80);
+                    v >>= 7;
+                }
+            }
+        }
+    }
+    *out++ = (unsigned char)v;
+    return out;
+}
+
+static unsigned char * ve_tls_varint_u64_pack(uint64_t v, unsigned char * out) {
+    while (v >= 0x80) {
+        *out++ = (unsigned char)((v & 0x7F) | 0x80);
+        v >>= 7;
+    }
+    *out++ = (unsigned char)v;
+    return out;
+}
+
+static int ve_tls_bytes_reserve(unsigned char ** p, size_t * cap, size_t need) {
+    if (*cap >= need) {
+        return 0;
+    }
+    size_t next = *cap ? *cap : 256;
+    while (next < need) {
+        if (next > (size_t)-1 / 2) {
+            next = need;
+            break;
+        }
+        next *= 2;
+    }
+    unsigned char * np = (unsigned char *)ve_tls_realloc(*p, next);
+    if (!np) {
+        return -1;
+    }
+    *p = np;
+    *cap = next;
+    return 0;
+}
+
 static size_t ve_tls_key_u32_size(uint32_t field_number, uint32_t wire_type) {
     uint64_t key = ((uint64_t)field_number << 3) | (uint64_t)wire_type;
     return ve_tls_varint_u64_size(key);
@@ -115,76 +174,23 @@ static size_t ve_tls_log_content_field_size(size_t klen, size_t vlen) {
     return ve_tls_key_u32_size(2, 2) + ve_tls_varint_u64_size((uint64_t)msg) + msg;
 }
 
-static size_t ve_tls_log_msg_size(int64_t time_ms, uint32_t time_ns, int32_t has_time_ns, const ve_tls_kv * kvs, size_t kv_count) {
-    uint64_t t = time_ms > 0 ? (uint64_t)time_ms : 0;
+static size_t ve_tls_log_msg_size_lens(int64_t time_ms, uint32_t time_ns, int32_t has_time_ns, const size_t * key_lens, const size_t * val_lens, size_t kv_count) {
+    if (time_ms <= 0) {
+        time_ms = 0;
+        has_time_ns = 0;
+        time_ns = 0;
+    }
+    uint64_t t = (uint64_t)time_ms;
     size_t n = ve_tls_key_u32_size(1, 0) + ve_tls_varint_u64_size(t);
     for (size_t i = 0; i < kv_count; i++) {
-        const char * k = kvs[i].key ? kvs[i].key : "";
-        const char * v = kvs[i].value ? kvs[i].value : "";
-        n += ve_tls_log_content_field_size(strlen(k), strlen(v));
+        size_t klen = key_lens ? key_lens[i] : 0;
+        size_t vlen = val_lens ? val_lens[i] : 0;
+        n += ve_tls_log_content_field_size(klen, vlen);
     }
     if (has_time_ns) {
-        (void)time_ns;
         n += ve_tls_key_u32_size(3, 5) + 4;
     }
     return n;
-}
-
-static int ve_tls_encode_log_to_group_logs(ve_tls_wire_buf * out, int64_t time_ms, uint32_t time_ns, int32_t has_time_ns, const ve_tls_kv * kvs, size_t kv_count) {
-    size_t msg_size = ve_tls_log_msg_size(time_ms, time_ns, has_time_ns, kvs, kv_count);
-    if (ve_tls_wire_put_key(out, 1, 2) != 0) {
-        return -1;
-    }
-    if (ve_tls_wire_put_varint_u64(out, (uint64_t)msg_size) != 0) {
-        return -1;
-    }
-    uint64_t t = time_ms > 0 ? (uint64_t)time_ms : 0;
-    if (ve_tls_wire_put_key(out, 1, 0) != 0) {
-        return -1;
-    }
-    if (ve_tls_wire_put_varint_u64(out, t) != 0) {
-        return -1;
-    }
-    for (size_t i = 0; i < kv_count; i++) {
-        const char * k = kvs[i].key ? kvs[i].key : "";
-        const char * v = kvs[i].value ? kvs[i].value : "";
-        size_t klen = strlen(k);
-        size_t vlen = strlen(v);
-        size_t cont_msg = ve_tls_log_content_msg_size(klen, vlen);
-        if (ve_tls_wire_put_key(out, 2, 2) != 0) {
-            return -1;
-        }
-        if (ve_tls_wire_put_varint_u64(out, (uint64_t)cont_msg) != 0) {
-            return -1;
-        }
-        if (ve_tls_wire_put_key(out, 1, 2) != 0) {
-            return -1;
-        }
-        if (ve_tls_wire_put_len_delimited(out, k, klen) != 0) {
-            return -1;
-        }
-        if (ve_tls_wire_put_key(out, 2, 2) != 0) {
-            return -1;
-        }
-        if (ve_tls_wire_put_len_delimited(out, v, vlen) != 0) {
-            return -1;
-        }
-    }
-    if (has_time_ns) {
-        if (ve_tls_wire_put_key(out, 3, 5) != 0) {
-            return -1;
-        }
-        if (ve_tls_wire_put_fixed32(out, time_ns) != 0) {
-            return -1;
-        }
-    }
-    return 0;
-}
-
-size_t ve_tls_log_builder_log_entry_size(int64_t time_ms, uint32_t time_ns, int32_t has_time_ns, const ve_tls_kv * kvs, size_t kv_count) {
-    size_t msg_size = ve_tls_log_msg_size(time_ms, time_ns, has_time_ns, kvs, kv_count);
-    (void)time_ns;
-    return ve_tls_key_u32_size(1, 2) + ve_tls_varint_u64_size((uint64_t)msg_size) + msg_size;
 }
 
 ve_tls_log_group_builder * ve_tls_log_builder_create(const char * norm_key) {
@@ -211,20 +217,126 @@ void ve_tls_log_builder_free(ve_tls_log_group_builder * b) {
     ve_tls_free(b);
 }
 
-int ve_tls_log_builder_add_kv(ve_tls_log_group_builder * b, int64_t id, int64_t time_ms, uint32_t time_ns, int32_t has_time_ns, const ve_tls_kv * kvs, size_t kv_count) {
+int ve_tls_log_builder_append(ve_tls_log_group_builder * b, const unsigned char * logs, size_t logs_len, int32_t log_count, int64_t earliest, int64_t latest, int64_t start_id, int64_t end_id, int64_t last_time_ms, uint32_t last_time_ns, int32_t last_has_time_ns) {
+    if (!b || !logs || logs_len == 0 || log_count <= 0) {
+        return -1;
+    }
+    size_t need = b->logs_len + logs_len;
+    unsigned char * p = b->logs;
+    size_t cap = b->logs_cap;
+    if (ve_tls_bytes_reserve(&p, &cap, need) != 0) {
+        return -1;
+    }
+    memcpy(p + b->logs_len, logs, logs_len);
+    b->logs = p;
+    b->logs_cap = cap;
+    b->logs_len += logs_len;
+    b->log_count += log_count;
+    if (earliest > 0) {
+        if (b->earliest == 0 || earliest < b->earliest) {
+            b->earliest = earliest;
+        }
+    }
+    if (latest > 0) {
+        if (latest > b->latest) {
+            b->latest = latest;
+        }
+    }
+    if (b->start_id == 0 || start_id < b->start_id) {
+        b->start_id = start_id;
+    }
+    if (end_id > b->end_id) {
+        b->end_id = end_id;
+    }
+    b->last_time_ms = last_time_ms;
+    b->last_time_ns = last_time_ns;
+    b->last_has_time_ns = last_has_time_ns ? 1 : 0;
+    return 0;
+}
+
+int ve_tls_log_builder_add_kv_lens(ve_tls_log_group_builder * b, int64_t id, int64_t time_ms, uint32_t time_ns, int32_t has_time_ns, const ve_tls_kv * kvs, const size_t * key_lens, const size_t * val_lens, size_t kv_count) {
     if (!b) {
         return -1;
     }
-    ve_tls_wire_buf out;
-    out.data = b->logs;
-    out.len = b->logs_len;
-    out.cap = b->logs_cap;
-    if (ve_tls_encode_log_to_group_logs(&out, time_ms, time_ns, has_time_ns, kvs, kv_count) != 0) {
+    if (time_ms <= 0) {
+        time_ms = 0;
+        has_time_ns = 0;
+        time_ns = 0;
+    }
+
+    size_t msg_size = ve_tls_log_msg_size_lens(time_ms, time_ns, has_time_ns, key_lens, val_lens, kv_count);
+    size_t entry_size = 1;
+    if (msg_size <= UINT32_MAX) {
+        entry_size += ve_tls_varint_u32_size((uint32_t)msg_size);
+    } else {
+        entry_size += ve_tls_varint_u64_size((uint64_t)msg_size);
+    }
+    entry_size += msg_size;
+    size_t need = b->logs_len + entry_size;
+    if (ve_tls_bytes_reserve(&b->logs, &b->logs_cap, need) != 0) {
         return -1;
     }
-    b->logs = out.data;
-    b->logs_len = out.len;
-    b->logs_cap = out.cap;
+
+    unsigned char * buf = b->logs + b->logs_len;
+    *buf++ = 0x0A;
+    if (msg_size <= UINT32_MAX) {
+        buf = ve_tls_varint_u32_pack((uint32_t)msg_size, buf);
+    } else {
+        buf = ve_tls_varint_u64_pack((uint64_t)msg_size, buf);
+    }
+
+    *buf++ = 0x08;
+    if (time_ms >= 0 && (uint64_t)time_ms <= UINT32_MAX) {
+        buf = ve_tls_varint_u32_pack((uint32_t)time_ms, buf);
+    } else {
+        buf = ve_tls_varint_u64_pack((uint64_t)time_ms, buf);
+    }
+
+    for (size_t i = 0; i < kv_count; i++) {
+        const char * k = kvs[i].key ? kvs[i].key : "";
+        const char * v = kvs[i].value ? kvs[i].value : "";
+        size_t klen = key_lens ? key_lens[i] : 0;
+        size_t vlen = val_lens ? val_lens[i] : 0;
+        size_t cont_msg = ve_tls_log_content_msg_size(klen, vlen);
+
+        *buf++ = 0x12;
+        if (cont_msg <= UINT32_MAX) {
+            buf = ve_tls_varint_u32_pack((uint32_t)cont_msg, buf);
+        } else {
+            buf = ve_tls_varint_u64_pack((uint64_t)cont_msg, buf);
+        }
+        *buf++ = 0x0A;
+        if (klen <= UINT32_MAX) {
+            buf = ve_tls_varint_u32_pack((uint32_t)klen, buf);
+        } else {
+            buf = ve_tls_varint_u64_pack((uint64_t)klen, buf);
+        }
+        if (klen > 0) {
+            memcpy(buf, k, klen);
+            buf += klen;
+        }
+        *buf++ = 0x12;
+        if (vlen <= UINT32_MAX) {
+            buf = ve_tls_varint_u32_pack((uint32_t)vlen, buf);
+        } else {
+            buf = ve_tls_varint_u64_pack((uint64_t)vlen, buf);
+        }
+        if (vlen > 0) {
+            memcpy(buf, v, vlen);
+            buf += vlen;
+        }
+    }
+
+    if (has_time_ns) {
+        *buf++ = 0x1D;
+        buf[0] = (unsigned char)(time_ns & 0xFF);
+        buf[1] = (unsigned char)((time_ns >> 8) & 0xFF);
+        buf[2] = (unsigned char)((time_ns >> 16) & 0xFF);
+        buf[3] = (unsigned char)((time_ns >> 24) & 0xFF);
+        buf += 4;
+    }
+
+    b->logs_len = (size_t)(buf - b->logs);
     b->log_count += 1;
     if (time_ms > 0) {
         if (b->earliest == 0 || time_ms < b->earliest) {

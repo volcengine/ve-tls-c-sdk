@@ -4,9 +4,31 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 
 static int ve_tls_str_empty(const char * s) {
     return !s || s[0] == 0;
+}
+
+typedef struct {
+    const char * p;
+    size_t n;
+} ve_tls_cstr_len_cache_entry;
+
+static __thread ve_tls_cstr_len_cache_entry g_cstr_len_cache[64];
+
+static size_t ve_tls_cstr_len_cached(const char * s) {
+    if (!s || s[0] == 0) {
+        return 0;
+    }
+    size_t idx = (((size_t)(uintptr_t)s) >> 3) & 63;
+    if (g_cstr_len_cache[idx].p == s) {
+        return g_cstr_len_cache[idx].n;
+    }
+    size_t n = strlen(s);
+    g_cstr_len_cache[idx].p = s;
+    g_cstr_len_cache[idx].n = n;
+    return n;
 }
 
 static char * ve_tls_dup_cstr(const char * s) {
@@ -114,6 +136,301 @@ static void ve_tls_drop_one_with_error(ve_tls_send_callbacks cbs, size_t bytes, 
     ve_tls_error_free_fields(&err);
 }
 
+typedef struct {
+    ve_tls_producer * producer;
+    const char * norm_key;
+    ve_tls_log_group_builder * builder;
+} ve_tls_tls_batch;
+
+static __thread ve_tls_tls_batch g_tls_batch;
+
+static void ve_tls_tls_batch_reset(ve_tls_log_group_builder * b) {
+    if (!b) {
+        return;
+    }
+    b->logs_len = 0;
+    b->log_count = 0;
+    b->earliest = 0;
+    b->latest = 0;
+    b->start_id = 0;
+    b->end_id = 0;
+    b->last_time_ms = 0;
+    b->last_time_ns = 0;
+    b->last_has_time_ns = 0;
+    b->first_append_ms = 0;
+}
+
+static int ve_tls_wait_buffer_space_locked(ve_tls_producer * producer, size_t need_bytes);
+
+static int ve_tls_tls_batch_flush_locked(ve_tls_producer * producer, const char * norm_key, ve_tls_log_group_builder * tb, int force_flush) {
+    if (!producer || !tb || tb->log_count == 0 || tb->logs_len == 0) {
+        return 0;
+    }
+    int wrc = ve_tls_wait_buffer_space_locked(producer, tb->logs_len);
+    if (wrc != 0) {
+        return wrc;
+    }
+    ve_tls_key_queue * q = NULL;
+    ve_tls_log_group_builder * b = NULL;
+    int is_default_builder = 0;
+    if (producer->fast_builder && producer->default_norm_key == norm_key) {
+        if (!producer->default_builder) {
+            producer->default_builder = ve_tls_log_builder_create(norm_key);
+            if (!producer->default_builder) {
+                return -1;
+            }
+            producer->default_builder->first_append_ms = producer->config.platform.time_ms ? producer->config.platform.time_ms() : 0;
+        }
+        b = producer->default_builder;
+        is_default_builder = 1;
+    } else {
+        q = ve_tls_key_queue_get_or_create(producer, norm_key);
+        if (!q) {
+            return -1;
+        }
+        if (!q->builder) {
+            q->builder = ve_tls_log_builder_create(q->key);
+            if (!q->builder) {
+                return -1;
+            }
+            q->builder->first_append_ms = producer->config.platform.time_ms ? producer->config.platform.time_ms() : 0;
+        }
+        b = q->builder;
+    }
+    if (b->first_append_ms == 0) {
+        b->first_append_ms = producer->config.platform.time_ms ? producer->config.platform.time_ms() : 0;
+    }
+    size_t prev = b->logs_len;
+    if (ve_tls_log_builder_append(b, tb->logs, tb->logs_len, tb->log_count, tb->earliest, tb->latest, tb->start_id, tb->end_id, tb->last_time_ms, tb->last_time_ns, tb->last_has_time_ns) != 0) {
+        return -1;
+    }
+    size_t delta = b->logs_len - prev;
+    producer->queue_bytes += delta;
+    __atomic_fetch_sub(&producer->tls_bytes, tb->logs_len, __ATOMIC_RELAXED);
+    ve_tls_tls_batch_reset(tb);
+
+    int wake_worker = 0;
+    if (force_flush) {
+        ve_tls_log_group_builder * sealed = b;
+        if (is_default_builder) {
+            producer->default_builder = NULL;
+        } else {
+            q->builder = NULL;
+        }
+        sealed->next = NULL;
+        if (producer->sealed_tail) {
+            producer->sealed_tail->next = sealed;
+        } else {
+            producer->sealed_head = sealed;
+        }
+        producer->sealed_tail = sealed;
+        producer->flush_requested = 1;
+        wake_worker = 1;
+    } else {
+        size_t byte_limit = producer->config.log_bytes_per_package > 0 ? (size_t)producer->config.log_bytes_per_package : 0;
+        if (producer->config.agg_max_raw_bytes_per_request > 0) {
+            size_t max_raw = (size_t)producer->config.agg_max_raw_bytes_per_request;
+            if (byte_limit == 0 || byte_limit > max_raw) {
+                byte_limit = max_raw;
+            }
+        }
+        int should_seal = 0;
+        if (producer->config.log_count_per_package > 0 && b->log_count >= producer->config.log_count_per_package) {
+            should_seal = 1;
+        }
+        if (!should_seal && byte_limit > 0 && b->logs_len >= byte_limit) {
+            should_seal = 1;
+        }
+        if (should_seal) {
+            ve_tls_log_group_builder * sealed = b;
+            if (is_default_builder) {
+                producer->default_builder = NULL;
+            } else {
+                q->builder = NULL;
+            }
+            sealed->next = NULL;
+            if (producer->sealed_tail) {
+                producer->sealed_tail->next = sealed;
+            } else {
+                producer->sealed_head = sealed;
+            }
+            producer->sealed_tail = sealed;
+            producer->flush_requested = 1;
+            wake_worker = 1;
+        }
+    }
+    if (wake_worker) {
+        producer->config.platform.cond_signal(producer->cond);
+    }
+    return 0;
+}
+
+static int ve_tls_tls_batch_merge_locked(ve_tls_producer * producer, const char * norm_key, ve_tls_log_group_builder * tb) {
+    if (!producer || !tb || tb->log_count == 0 || tb->logs_len == 0) {
+        return 0;
+    }
+    int wrc = ve_tls_wait_buffer_space_locked(producer, tb->logs_len);
+    if (wrc != 0) {
+        return wrc;
+    }
+    ve_tls_key_queue * q = NULL;
+    ve_tls_log_group_builder * b = NULL;
+    if (producer->fast_builder && producer->default_norm_key == norm_key) {
+        if (!producer->default_builder) {
+            producer->default_builder = ve_tls_log_builder_create(norm_key);
+            if (!producer->default_builder) {
+                return -1;
+            }
+            producer->default_builder->first_append_ms = producer->config.platform.time_ms ? producer->config.platform.time_ms() : 0;
+        }
+        b = producer->default_builder;
+    } else {
+        q = ve_tls_key_queue_get_or_create(producer, norm_key);
+        if (!q) {
+            return -1;
+        }
+        if (!q->builder) {
+            q->builder = ve_tls_log_builder_create(q->key);
+            if (!q->builder) {
+                return -1;
+            }
+            q->builder->first_append_ms = producer->config.platform.time_ms ? producer->config.platform.time_ms() : 0;
+        }
+        b = q->builder;
+    }
+    if (b->first_append_ms == 0) {
+        b->first_append_ms = producer->config.platform.time_ms ? producer->config.platform.time_ms() : 0;
+    }
+    size_t prev = b->logs_len;
+    if (ve_tls_log_builder_append(b, tb->logs, tb->logs_len, tb->log_count, tb->earliest, tb->latest, tb->start_id, tb->end_id, tb->last_time_ms, tb->last_time_ns, tb->last_has_time_ns) != 0) {
+        return -1;
+    }
+    size_t delta = b->logs_len - prev;
+    producer->queue_bytes += delta;
+    __atomic_fetch_sub(&producer->tls_bytes, tb->logs_len, __ATOMIC_RELAXED);
+    ve_tls_tls_batch_reset(tb);
+    return 0;
+}
+
+static int ve_tls_try_add_log_tls_batching(
+    ve_tls_producer * producer,
+    const char * hash_key,
+    const char * norm_key,
+    int64_t time_ms,
+    uint32_t time_ns,
+    int32_t has_time_ns,
+    const ve_tls_kv * kvs,
+    const size_t * key_lens,
+    const size_t * val_lens,
+    size_t kv_count,
+    int flush,
+    ve_tls_result * out_rc) {
+    if (!producer || !out_rc) {
+        return 0;
+    }
+    if (!(!hash_key || hash_key[0] == 0)) {
+        return 0;
+    }
+    if (!(producer->config.enable_tls_batching && producer->config.ordered_send == 0)) {
+        return 0;
+    }
+
+    if (g_tls_batch.producer != producer || g_tls_batch.norm_key != norm_key) {
+        if (g_tls_batch.producer && g_tls_batch.builder) {
+            if (g_tls_batch.builder->logs_len > 0) {
+                __atomic_fetch_sub(&g_tls_batch.producer->tls_bytes, g_tls_batch.builder->logs_len, __ATOMIC_RELAXED);
+            }
+            ve_tls_log_builder_free(g_tls_batch.builder);
+        }
+        memset(&g_tls_batch, 0, sizeof(g_tls_batch));
+        g_tls_batch.producer = producer;
+        g_tls_batch.norm_key = norm_key;
+        g_tls_batch.builder = ve_tls_log_builder_create(norm_key);
+        if (!g_tls_batch.builder) {
+            *out_rc = VE_TLS_DROP_ERROR;
+            return 1;
+        }
+        ve_tls_tls_batch_reset(g_tls_batch.builder);
+    }
+
+    if (!g_tls_batch.builder) {
+        *out_rc = VE_TLS_DROP_ERROR;
+        return 1;
+    }
+
+    if (g_tls_batch.builder->log_count == 0) {
+        producer->config.platform.mutex_lock(producer->mutex);
+        int closed = (producer->stop || !producer->accepting) ? 1 : 0;
+        producer->config.platform.mutex_unlock(producer->mutex);
+        if (closed) {
+            *out_rc = VE_TLS_CLOSED;
+            return 1;
+        }
+    }
+
+    int64_t id = __atomic_fetch_add(&producer->next_id, 1, __ATOMIC_RELAXED);
+    size_t prev_len = g_tls_batch.builder->logs_len;
+    if (ve_tls_log_builder_add_kv_lens(g_tls_batch.builder, id, time_ms, time_ns, has_time_ns, kvs, key_lens, val_lens, kv_count) != 0) {
+        if (prev_len > 0) {
+            __atomic_fetch_sub(&producer->tls_bytes, prev_len, __ATOMIC_RELAXED);
+        }
+        ve_tls_tls_batch_reset(g_tls_batch.builder);
+        ve_tls_metric_inc_u64(&producer->m_logs_dropped_total, 1);
+        ve_tls_metric_inc_u64(&producer->m_bytes_dropped_total, 0);
+        ve_tls_metrics_emit(producer, "log_dropped_enqueue_alloc_failed", 1, 0);
+        ve_tls_metrics_emit(producer, "log_dropped", 1, 0);
+        *out_rc = VE_TLS_DROP_ERROR;
+        return 1;
+    }
+    size_t delta = g_tls_batch.builder->logs_len - prev_len;
+    __atomic_fetch_add(&producer->tls_bytes, delta, __ATOMIC_RELAXED);
+    ve_tls_metric_inc_u64(&producer->m_logs_enqueued_total, 1);
+    ve_tls_metric_inc_u64(&producer->m_bytes_enqueued_total, delta);
+    ve_tls_metrics_emit(producer, "log_enqueued", 1, (int64_t)delta);
+
+    size_t merge_count = (producer->config.log_count_per_package > 0) ? (size_t)producer->config.log_count_per_package : 256;
+    size_t merge_bytes = (producer->config.log_bytes_per_package > 0) ? (size_t)producer->config.log_bytes_per_package : 0;
+    if (producer->config.agg_max_raw_bytes_per_request > 0) {
+        size_t max_raw = (size_t)producer->config.agg_max_raw_bytes_per_request;
+        if (merge_bytes == 0 || merge_bytes > max_raw) {
+            merge_bytes = max_raw;
+        }
+    }
+    if (merge_bytes == 0) {
+        merge_bytes = 256 * 1024;
+    }
+    if (producer->config.max_buffer_bytes > 0) {
+        size_t cap = (size_t)producer->config.max_buffer_bytes;
+        size_t quarter = cap / 4;
+        if (quarter >= 16 * 1024 && merge_bytes > quarter) {
+            merge_bytes = quarter;
+        }
+    }
+
+    int should_merge = flush;
+    if (!should_merge && merge_count > 0 && (size_t)g_tls_batch.builder->log_count >= merge_count) {
+        should_merge = 1;
+    }
+    if (!should_merge && merge_bytes > 0 && g_tls_batch.builder->logs_len >= merge_bytes) {
+        should_merge = 1;
+    }
+    if (should_merge) {
+        producer->config.platform.mutex_lock(producer->mutex);
+        int frc = ve_tls_tls_batch_flush_locked(producer, norm_key, g_tls_batch.builder, flush);
+        producer->config.platform.mutex_unlock(producer->mutex);
+        if (frc != 0) {
+            if (g_tls_batch.builder->logs_len > 0) {
+                __atomic_fetch_sub(&producer->tls_bytes, g_tls_batch.builder->logs_len, __ATOMIC_RELAXED);
+            }
+            ve_tls_tls_batch_reset(g_tls_batch.builder);
+            *out_rc = (frc == -2) ? VE_TLS_CLOSED : VE_TLS_DROP_ERROR;
+            return 1;
+        }
+    }
+    *out_rc = VE_TLS_OK;
+    return 1;
+}
+
 int ve_tls_producer_is_drained_locked(ve_tls_producer * producer) {
     if (!producer) {
         return 1;
@@ -130,6 +447,9 @@ int ve_tls_producer_is_drained_locked(ve_tls_producer * producer) {
         }
     }
     if (__atomic_load_n(&producer->fast_inflight, __ATOMIC_RELAXED) > 0) {
+        return 0;
+    }
+    if (producer->default_builder && producer->default_builder->log_count > 0) {
         return 0;
     }
     for (size_t i = 0; i < producer->key_bucket_count; i++) {
@@ -232,6 +552,19 @@ ve_tls_producer * ve_tls_producer_create(const ve_tls_config * config) {
         producer->config.key_rate_limit_bps <= 0 &&
         producer->config.key_breaker_fail_threshold <= 0) {
         producer->fast_send = 1;
+    }
+    producer->fast_builder = 0;
+    producer->default_norm_key = NULL;
+    producer->default_builder = NULL;
+    if (!producer->use_global_env &&
+        producer->config.ordered_send == 0 &&
+        producer->config.key_queue_max_active <= 0 &&
+        producer->config.key_queue_idle_ttl_ms <= 0 &&
+        producer->config.key_rate_limit_rps <= 0 &&
+        producer->config.key_rate_limit_bps <= 0 &&
+        producer->config.key_breaker_fail_threshold <= 0) {
+        producer->fast_builder = 1;
+        producer->default_norm_key = ve_tls_normalize_hash_key(producer, NULL);
     }
     if (!producer->use_global_env) {
         producer->sender_count = producer->config.send_thread_count > 0 ? producer->config.send_thread_count : 1;
@@ -377,6 +710,13 @@ ve_tls_result ve_tls_producer_close(ve_tls_producer * producer, int32_t timeout_
     }
     ve_tls_metrics_emit(producer, "close_start", 1, timeout_ms);
     producer->config.platform.mutex_lock(producer->mutex);
+    if (g_tls_batch.producer == producer && g_tls_batch.builder && g_tls_batch.builder->log_count > 0) {
+        int frc = ve_tls_tls_batch_flush_locked(producer, g_tls_batch.norm_key, g_tls_batch.builder, 1);
+        if (frc != 0) {
+            producer->config.platform.mutex_unlock(producer->mutex);
+            return frc == -2 ? VE_TLS_CLOSED : VE_TLS_DROP_ERROR;
+        }
+    }
     producer->accepting = 0;
     producer->closing = 1;
     producer->flush_requested = 1;
@@ -470,6 +810,13 @@ void ve_tls_producer_destroy(ve_tls_producer * producer) {
         }
         producer->config.platform.mutex_unlock(producer->mutex);
     }
+    if (g_tls_batch.producer == producer) {
+        if (g_tls_batch.builder && g_tls_batch.builder->logs_len > 0) {
+            __atomic_fetch_sub(&producer->tls_bytes, g_tls_batch.builder->logs_len, __ATOMIC_RELAXED);
+        }
+        ve_tls_log_builder_free(g_tls_batch.builder);
+        memset(&g_tls_batch, 0, sizeof(g_tls_batch));
+    }
     ve_tls_send_queue_stop(&producer->send_queue);
     if (producer->worker) {
         producer->config.platform.thread_join(producer->worker);
@@ -485,6 +832,10 @@ void ve_tls_producer_destroy(ve_tls_producer * producer) {
         ve_tls_free(producer->senders);
         producer->senders = NULL;
         producer->sender_count = 0;
+    }
+    if (producer->default_builder) {
+        ve_tls_log_builder_free(producer->default_builder);
+        producer->default_builder = NULL;
     }
     ve_tls_queue_free_all(producer);
     while (producer->sealed_head) {
@@ -616,6 +967,10 @@ size_t ve_tls_producer_get_buffered_bytes(ve_tls_producer * producer) {
     size_t total = 0;
     producer->config.platform.mutex_lock(producer->mutex);
     total += producer->queue_bytes;
+    total += (size_t)__atomic_load_n(&producer->tls_bytes, __ATOMIC_RELAXED);
+    if (producer->default_builder) {
+        total += producer->default_builder->logs_len;
+    }
     for (ve_tls_log_group_builder * b = producer->sealed_head; b; b = b->next) {
         total += b->logs_len;
     }
@@ -846,6 +1201,177 @@ ve_tls_result ve_tls_producer_add_log_raw_time_parts(ve_tls_producer * producer,
     return VE_TLS_OK;
 }
 
+static ve_tls_result ve_tls_producer_add_log_kv_lens_time_parts_hashkey(
+    ve_tls_producer * producer,
+    int64_t time_ms,
+    int32_t has_time_ns,
+    uint32_t time_ns,
+    const char * hash_key,
+    const ve_tls_kv * kvs,
+    const size_t * key_lens,
+    const size_t * val_lens,
+    size_t kv_count,
+    int flush) {
+    if (!producer || !kvs || kv_count == 0) {
+        return VE_TLS_INVALID;
+    }
+    const char * norm_key = ve_tls_normalize_hash_key(producer, hash_key);
+
+    ve_tls_result tls_rc = VE_TLS_OK;
+    if (ve_tls_try_add_log_tls_batching(producer, hash_key, norm_key, time_ms, time_ns, has_time_ns ? 1 : 0, kvs, key_lens, val_lens, kv_count, flush, &tls_rc)) {
+        return tls_rc;
+    }
+
+    producer->config.platform.mutex_lock(producer->mutex);
+    if (producer->stop || !producer->accepting) {
+        producer->config.platform.mutex_unlock(producer->mutex);
+        return VE_TLS_CLOSED;
+    }
+    int wrc = ve_tls_wait_buffer_space_locked(producer, 0);
+    if (wrc != 0) {
+        producer->config.platform.mutex_unlock(producer->mutex);
+        if (wrc == -2) {
+            return VE_TLS_CLOSED;
+        }
+        if (wrc == -3) {
+            ve_tls_metric_inc_u64(&producer->m_logs_dropped_total, 1);
+            ve_tls_metric_inc_u64(&producer->m_bytes_dropped_total, 0);
+            ve_tls_metrics_emit(producer, "log_dropped_buffer_full_timeout", 1, 0);
+            ve_tls_metrics_emit(producer, "log_dropped", 1, 0);
+            return VE_TLS_TIMEOUT;
+        }
+        ve_tls_metric_inc_u64(&producer->m_logs_dropped_total, 1);
+        ve_tls_metric_inc_u64(&producer->m_bytes_dropped_total, 0);
+        ve_tls_metrics_emit(producer, "log_dropped_buffer_full", 1, 0);
+        ve_tls_metrics_emit(producer, "log_dropped", 1, 0);
+        return VE_TLS_DROP_ERROR;
+    }
+    int64_t id = producer->next_id++;
+    ve_tls_key_queue * q = NULL;
+    ve_tls_log_group_builder * b = NULL;
+    int is_default_builder = 0;
+    if (producer->fast_builder && (!hash_key || hash_key[0] == 0) && producer->default_norm_key == norm_key) {
+        if (!producer->default_builder) {
+            producer->default_builder = ve_tls_log_builder_create(norm_key);
+            if (!producer->default_builder) {
+                producer->config.platform.mutex_unlock(producer->mutex);
+                ve_tls_metric_inc_u64(&producer->m_logs_dropped_total, 1);
+                ve_tls_metric_inc_u64(&producer->m_bytes_dropped_total, 0);
+                ve_tls_metrics_emit(producer, "log_dropped_enqueue_alloc_failed", 1, 0);
+                ve_tls_metrics_emit(producer, "log_dropped", 1, 0);
+                return VE_TLS_DROP_ERROR;
+            }
+            producer->default_builder->first_append_ms = producer->config.platform.time_ms ? producer->config.platform.time_ms() : 0;
+        }
+        b = producer->default_builder;
+        is_default_builder = 1;
+    } else {
+        q = ve_tls_key_queue_get_or_create(producer, norm_key);
+        if (!q) {
+            ve_tls_send_callbacks cbs = ve_tls_capture_callbacks(producer);
+            int is_limit = 0;
+            if (producer->config.key_queue_max_active > 0 && producer->key_queue_count >= (size_t)producer->config.key_queue_max_active) {
+                is_limit = 1;
+            }
+            producer->config.platform.mutex_unlock(producer->mutex);
+            ve_tls_metric_inc_u64(&producer->m_logs_dropped_total, 1);
+            ve_tls_metric_inc_u64(&producer->m_bytes_dropped_total, 0);
+            if (is_limit) {
+                ve_tls_metrics_emit(producer, "key_queue_drop", 1, 0);
+                ve_tls_drop_one_with_error(cbs, 0, id, "KeyQueueLimitExceeded", "key queue limit exceeded");
+            } else {
+                ve_tls_metrics_emit(producer, "log_dropped_enqueue_alloc_failed", 1, 0);
+            }
+            ve_tls_metrics_emit(producer, "log_dropped", 1, 0);
+            return is_limit ? VE_TLS_OK : VE_TLS_DROP_ERROR;
+        }
+        if (!q->builder) {
+            q->builder = ve_tls_log_builder_create(q->key);
+            if (!q->builder) {
+                producer->config.platform.mutex_unlock(producer->mutex);
+                ve_tls_metric_inc_u64(&producer->m_logs_dropped_total, 1);
+                ve_tls_metric_inc_u64(&producer->m_bytes_dropped_total, 0);
+                ve_tls_metrics_emit(producer, "log_dropped_enqueue_alloc_failed", 1, 0);
+                ve_tls_metrics_emit(producer, "log_dropped", 1, 0);
+                return VE_TLS_DROP_ERROR;
+            }
+            q->builder->first_append_ms = producer->config.platform.time_ms ? producer->config.platform.time_ms() : 0;
+        }
+        b = q->builder;
+    }
+
+    size_t prev = b->logs_len;
+    if (ve_tls_log_builder_add_kv_lens(b, id, time_ms, time_ns, has_time_ns ? 1 : 0, kvs, key_lens, val_lens, kv_count) != 0) {
+        producer->config.platform.mutex_unlock(producer->mutex);
+        ve_tls_metric_inc_u64(&producer->m_logs_dropped_total, 1);
+        ve_tls_metric_inc_u64(&producer->m_bytes_dropped_total, 0);
+        ve_tls_metrics_emit(producer, "log_dropped_enqueue_alloc_failed", 1, 0);
+        ve_tls_metrics_emit(producer, "log_dropped", 1, 0);
+        return VE_TLS_DROP_ERROR;
+    }
+    size_t delta = b->logs_len - prev;
+    producer->queue_bytes += delta;
+    ve_tls_metric_inc_u64(&producer->m_logs_enqueued_total, 1);
+    ve_tls_metric_inc_u64(&producer->m_bytes_enqueued_total, delta);
+    int64_t emit_size = (int64_t)delta;
+    int wake_worker = 0;
+    if (flush) {
+        ve_tls_log_group_builder * sealed = b;
+        if (is_default_builder) {
+            producer->default_builder = NULL;
+        } else {
+            q->builder = NULL;
+        }
+        sealed->next = NULL;
+        if (producer->sealed_tail) {
+            producer->sealed_tail->next = sealed;
+        } else {
+            producer->sealed_head = sealed;
+        }
+        producer->sealed_tail = sealed;
+        producer->flush_requested = 1;
+        wake_worker = 1;
+    } else {
+        size_t byte_limit = producer->config.log_bytes_per_package > 0 ? (size_t)producer->config.log_bytes_per_package : 0;
+        if (producer->config.agg_max_raw_bytes_per_request > 0) {
+            size_t max_raw = (size_t)producer->config.agg_max_raw_bytes_per_request;
+            if (byte_limit == 0 || byte_limit > max_raw) {
+                byte_limit = max_raw;
+            }
+        }
+        int should_seal = 0;
+        if (producer->config.log_count_per_package > 0 && b->log_count >= producer->config.log_count_per_package) {
+            should_seal = 1;
+        }
+        if (!should_seal && byte_limit > 0 && b->logs_len >= byte_limit) {
+            should_seal = 1;
+        }
+        if (should_seal) {
+            ve_tls_log_group_builder * sealed = b;
+            if (is_default_builder) {
+                producer->default_builder = NULL;
+            } else {
+                q->builder = NULL;
+            }
+            sealed->next = NULL;
+            if (producer->sealed_tail) {
+                producer->sealed_tail->next = sealed;
+            } else {
+                producer->sealed_head = sealed;
+            }
+            producer->sealed_tail = sealed;
+            producer->flush_requested = 1;
+            wake_worker = 1;
+        }
+    }
+    if (wake_worker) {
+        producer->config.platform.cond_signal(producer->cond);
+    }
+    producer->config.platform.mutex_unlock(producer->mutex);
+    ve_tls_metrics_emit(producer, "log_enqueued", 1, emit_size);
+    return VE_TLS_OK;
+}
+
 ve_tls_result ve_tls_producer_add_log_kv(ve_tls_producer * producer, int64_t time_ms, const ve_tls_kv * kvs, size_t kv_count, int flush) {
     return ve_tls_producer_add_log_kv_hashkey(producer, time_ms, NULL, kvs, kv_count, flush);
 }
@@ -871,126 +1397,32 @@ ve_tls_result ve_tls_producer_add_log_kv_hashkey(ve_tls_producer * producer, int
             }
         }
     }
-    const char * norm_key = ve_tls_normalize_hash_key(producer, hash_key);
-    size_t need = ve_tls_log_builder_log_entry_size(time_ms, time_ns, has_time_ns, kvs, kv_count);
-    producer->config.platform.mutex_lock(producer->mutex);
-    if (producer->stop || !producer->accepting) {
-        producer->config.platform.mutex_unlock(producer->mutex);
-        return VE_TLS_CLOSED;
-    }
-    int wrc = ve_tls_wait_buffer_space_locked(producer, need);
-    if (wrc != 0) {
-        producer->config.platform.mutex_unlock(producer->mutex);
-        if (wrc == -2) {
-            return VE_TLS_CLOSED;
-        }
-        if (wrc == -3) {
-            ve_tls_metric_inc_u64(&producer->m_logs_dropped_total, 1);
-            ve_tls_metric_inc_u64(&producer->m_bytes_dropped_total, need);
-            ve_tls_metrics_emit(producer, "log_dropped_buffer_full_timeout", 1, (int64_t)need);
-            ve_tls_metrics_emit(producer, "log_dropped", 1, (int64_t)need);
-            return VE_TLS_TIMEOUT;
-        }
-        ve_tls_metric_inc_u64(&producer->m_logs_dropped_total, 1);
-        ve_tls_metric_inc_u64(&producer->m_bytes_dropped_total, need);
-        ve_tls_metrics_emit(producer, "log_dropped_buffer_full", 1, (int64_t)need);
-        ve_tls_metrics_emit(producer, "log_dropped", 1, (int64_t)need);
-        return VE_TLS_DROP_ERROR;
-    }
-    int64_t id = producer->next_id++;
-    ve_tls_key_queue * q = ve_tls_key_queue_get_or_create(producer, norm_key);
-    if (!q) {
-        ve_tls_send_callbacks cbs = ve_tls_capture_callbacks(producer);
-        int is_limit = 0;
-        if (producer->config.key_queue_max_active > 0 && producer->key_queue_count >= (size_t)producer->config.key_queue_max_active) {
-            is_limit = 1;
-        }
-        producer->config.platform.mutex_unlock(producer->mutex);
-        ve_tls_metric_inc_u64(&producer->m_logs_dropped_total, 1);
-        ve_tls_metric_inc_u64(&producer->m_bytes_dropped_total, need);
-        if (is_limit) {
-            ve_tls_metrics_emit(producer, "key_queue_drop", 1, 0);
-            ve_tls_drop_one_with_error(cbs, need, id, "KeyQueueLimitExceeded", "key queue limit exceeded");
-        } else {
-            ve_tls_metrics_emit(producer, "log_dropped_enqueue_alloc_failed", 1, (int64_t)need);
-        }
-        ve_tls_metrics_emit(producer, "log_dropped", 1, (int64_t)need);
-        return is_limit ? VE_TLS_OK : VE_TLS_DROP_ERROR;
-    }
-    if (!q->builder) {
-        q->builder = ve_tls_log_builder_create(q->key);
-        if (!q->builder) {
-            producer->config.platform.mutex_unlock(producer->mutex);
-            ve_tls_metric_inc_u64(&producer->m_logs_dropped_total, 1);
-            ve_tls_metric_inc_u64(&producer->m_bytes_dropped_total, need);
-            ve_tls_metrics_emit(producer, "log_dropped_enqueue_alloc_failed", 1, (int64_t)need);
-            ve_tls_metrics_emit(producer, "log_dropped", 1, (int64_t)need);
+    size_t key_lens_stack[16];
+    size_t val_lens_stack[16];
+    size_t * key_lens = key_lens_stack;
+    size_t * val_lens = val_lens_stack;
+    if (kv_count > 16) {
+        key_lens = (size_t *)ve_tls_malloc(kv_count * sizeof(size_t));
+        val_lens = (size_t *)ve_tls_malloc(kv_count * sizeof(size_t));
+        if (!key_lens || !val_lens) {
+            ve_tls_free(key_lens);
+            ve_tls_free(val_lens);
             return VE_TLS_DROP_ERROR;
         }
-        q->builder->first_append_ms = producer->config.platform.time_ms ? producer->config.platform.time_ms() : 0;
     }
-    size_t prev = q->builder->logs_len;
-    if (ve_tls_log_builder_add_kv(q->builder, id, time_ms, time_ns, has_time_ns, kvs, kv_count) != 0) {
-        producer->config.platform.mutex_unlock(producer->mutex);
-        ve_tls_metric_inc_u64(&producer->m_logs_dropped_total, 1);
-        ve_tls_metric_inc_u64(&producer->m_bytes_dropped_total, need);
-        ve_tls_metrics_emit(producer, "log_dropped_enqueue_alloc_failed", 1, (int64_t)need);
-        ve_tls_metrics_emit(producer, "log_dropped", 1, (int64_t)need);
-        return VE_TLS_DROP_ERROR;
+    for (size_t i = 0; i < kv_count; i++) {
+        const char * k = kvs[i].key ? kvs[i].key : "";
+        const char * v = kvs[i].value ? kvs[i].value : "";
+        key_lens[i] = ve_tls_cstr_len_cached(k);
+        val_lens[i] = ve_tls_cstr_len_cached(v);
     }
-    size_t delta = q->builder->logs_len - prev;
-    producer->queue_bytes += delta;
-    ve_tls_metric_inc_u64(&producer->m_logs_enqueued_total, 1);
-    ve_tls_metric_inc_u64(&producer->m_bytes_enqueued_total, delta);
-    int64_t emit_size = (int64_t)delta;
-    int wake_worker = 0;
-    if (flush) {
-        ve_tls_log_group_builder * sealed = q->builder;
-        q->builder = NULL;
-        sealed->next = NULL;
-        if (producer->sealed_tail) {
-            producer->sealed_tail->next = sealed;
-        } else {
-            producer->sealed_head = sealed;
-        }
-        producer->sealed_tail = sealed;
-        producer->flush_requested = 1;
-        wake_worker = 1;
-    } else {
-        size_t byte_limit = producer->config.log_bytes_per_package > 0 ? (size_t)producer->config.log_bytes_per_package : 0;
-        if (producer->config.agg_max_raw_bytes_per_request > 0) {
-            size_t max_raw = (size_t)producer->config.agg_max_raw_bytes_per_request;
-            if (byte_limit == 0 || byte_limit > max_raw) {
-                byte_limit = max_raw;
-            }
-        }
-        int should_seal = 0;
-        if (producer->config.log_count_per_package > 0 && q->builder->log_count >= producer->config.log_count_per_package) {
-            should_seal = 1;
-        }
-        if (!should_seal && byte_limit > 0 && q->builder->logs_len >= byte_limit) {
-            should_seal = 1;
-        }
-        if (should_seal) {
-            ve_tls_log_group_builder * sealed = q->builder;
-            q->builder = NULL;
-            sealed->next = NULL;
-            if (producer->sealed_tail) {
-                producer->sealed_tail->next = sealed;
-            } else {
-                producer->sealed_head = sealed;
-            }
-            producer->sealed_tail = sealed;
-            producer->flush_requested = 1;
-            wake_worker = 1;
-        }
+
+    ve_tls_result rc = ve_tls_producer_add_log_kv_lens_time_parts_hashkey(producer, time_ms, has_time_ns, time_ns, hash_key, kvs, key_lens, val_lens, kv_count, flush);
+    if (kv_count > 16) {
+        ve_tls_free(key_lens);
+        ve_tls_free(val_lens);
     }
-    if (wake_worker) {
-        producer->config.platform.cond_signal(producer->cond);
-    }
-    producer->config.platform.mutex_unlock(producer->mutex);
-    ve_tls_metrics_emit(producer, "log_enqueued", 1, emit_size);
-    return VE_TLS_OK;
+    return rc;
 }
 
 ve_tls_result ve_tls_producer_add_log_kv_time_parts(ve_tls_producer * producer, int64_t time_ms, int32_t has_time_ns, uint32_t time_ns, const ve_tls_kv * kvs, size_t kv_count, int flush) {
@@ -1020,126 +1452,114 @@ ve_tls_result ve_tls_producer_add_log_kv_time_parts_hashkey(ve_tls_producer * pr
     } else if (!has_time_ns) {
         time_ns = 0;
     }
-    const char * norm_key = ve_tls_normalize_hash_key(producer, hash_key);
-    size_t need = ve_tls_log_builder_log_entry_size(time_ms, time_ns, has_time_ns ? 1 : 0, kvs, kv_count);
-    producer->config.platform.mutex_lock(producer->mutex);
-    if (producer->stop || !producer->accepting) {
-        producer->config.platform.mutex_unlock(producer->mutex);
-        return VE_TLS_CLOSED;
-    }
-    int wrc = ve_tls_wait_buffer_space_locked(producer, need);
-    if (wrc != 0) {
-        producer->config.platform.mutex_unlock(producer->mutex);
-        if (wrc == -2) {
-            return VE_TLS_CLOSED;
-        }
-        if (wrc == -3) {
-            ve_tls_metric_inc_u64(&producer->m_logs_dropped_total, 1);
-            ve_tls_metric_inc_u64(&producer->m_bytes_dropped_total, need);
-            ve_tls_metrics_emit(producer, "log_dropped_buffer_full_timeout", 1, (int64_t)need);
-            ve_tls_metrics_emit(producer, "log_dropped", 1, (int64_t)need);
-            return VE_TLS_TIMEOUT;
-        }
-        ve_tls_metric_inc_u64(&producer->m_logs_dropped_total, 1);
-        ve_tls_metric_inc_u64(&producer->m_bytes_dropped_total, need);
-        ve_tls_metrics_emit(producer, "log_dropped_buffer_full", 1, (int64_t)need);
-        ve_tls_metrics_emit(producer, "log_dropped", 1, (int64_t)need);
-        return VE_TLS_DROP_ERROR;
-    }
-    int64_t id = producer->next_id++;
-    ve_tls_key_queue * q = ve_tls_key_queue_get_or_create(producer, norm_key);
-    if (!q) {
-        ve_tls_send_callbacks cbs = ve_tls_capture_callbacks(producer);
-        int is_limit = 0;
-        if (producer->config.key_queue_max_active > 0 && producer->key_queue_count >= (size_t)producer->config.key_queue_max_active) {
-            is_limit = 1;
-        }
-        producer->config.platform.mutex_unlock(producer->mutex);
-        ve_tls_metric_inc_u64(&producer->m_logs_dropped_total, 1);
-        ve_tls_metric_inc_u64(&producer->m_bytes_dropped_total, need);
-        if (is_limit) {
-            ve_tls_metrics_emit(producer, "key_queue_drop", 1, 0);
-            ve_tls_drop_one_with_error(cbs, need, id, "KeyQueueLimitExceeded", "key queue limit exceeded");
-        } else {
-            ve_tls_metrics_emit(producer, "log_dropped_enqueue_alloc_failed", 1, (int64_t)need);
-        }
-        ve_tls_metrics_emit(producer, "log_dropped", 1, (int64_t)need);
-        return is_limit ? VE_TLS_OK : VE_TLS_DROP_ERROR;
-    }
-    if (!q->builder) {
-        q->builder = ve_tls_log_builder_create(q->key);
-        if (!q->builder) {
-            producer->config.platform.mutex_unlock(producer->mutex);
-            ve_tls_metric_inc_u64(&producer->m_logs_dropped_total, 1);
-            ve_tls_metric_inc_u64(&producer->m_bytes_dropped_total, need);
-            ve_tls_metrics_emit(producer, "log_dropped_enqueue_alloc_failed", 1, (int64_t)need);
-            ve_tls_metrics_emit(producer, "log_dropped", 1, (int64_t)need);
+    size_t key_lens_stack[16];
+    size_t val_lens_stack[16];
+    size_t * key_lens = key_lens_stack;
+    size_t * val_lens = val_lens_stack;
+    if (kv_count > 16) {
+        key_lens = (size_t *)ve_tls_malloc(kv_count * sizeof(size_t));
+        val_lens = (size_t *)ve_tls_malloc(kv_count * sizeof(size_t));
+        if (!key_lens || !val_lens) {
+            ve_tls_free(key_lens);
+            ve_tls_free(val_lens);
             return VE_TLS_DROP_ERROR;
         }
-        q->builder->first_append_ms = producer->config.platform.time_ms ? producer->config.platform.time_ms() : 0;
     }
-    size_t prev = q->builder->logs_len;
-    if (ve_tls_log_builder_add_kv(q->builder, id, time_ms, time_ns, has_time_ns ? 1 : 0, kvs, kv_count) != 0) {
-        producer->config.platform.mutex_unlock(producer->mutex);
-        ve_tls_metric_inc_u64(&producer->m_logs_dropped_total, 1);
-        ve_tls_metric_inc_u64(&producer->m_bytes_dropped_total, need);
-        ve_tls_metrics_emit(producer, "log_dropped_enqueue_alloc_failed", 1, (int64_t)need);
-        ve_tls_metrics_emit(producer, "log_dropped", 1, (int64_t)need);
-        return VE_TLS_DROP_ERROR;
+    for (size_t i = 0; i < kv_count; i++) {
+        const char * k = kvs[i].key ? kvs[i].key : "";
+        const char * v = kvs[i].value ? kvs[i].value : "";
+        key_lens[i] = ve_tls_cstr_len_cached(k);
+        val_lens[i] = ve_tls_cstr_len_cached(v);
     }
-    size_t delta = q->builder->logs_len - prev;
-    producer->queue_bytes += delta;
-    ve_tls_metric_inc_u64(&producer->m_logs_enqueued_total, 1);
-    ve_tls_metric_inc_u64(&producer->m_bytes_enqueued_total, delta);
-    int64_t emit_size = (int64_t)delta;
-    int wake_worker = 0;
-    if (flush) {
-        ve_tls_log_group_builder * sealed = q->builder;
-        q->builder = NULL;
-        sealed->next = NULL;
-        if (producer->sealed_tail) {
-            producer->sealed_tail->next = sealed;
-        } else {
-            producer->sealed_head = sealed;
-        }
-        producer->sealed_tail = sealed;
-        producer->flush_requested = 1;
-        wake_worker = 1;
-    } else {
-        size_t byte_limit = producer->config.log_bytes_per_package > 0 ? (size_t)producer->config.log_bytes_per_package : 0;
-        if (producer->config.agg_max_raw_bytes_per_request > 0) {
-            size_t max_raw = (size_t)producer->config.agg_max_raw_bytes_per_request;
-            if (byte_limit == 0 || byte_limit > max_raw) {
-                byte_limit = max_raw;
+    ve_tls_result rc = ve_tls_producer_add_log_kv_lens_time_parts_hashkey(producer, time_ms, has_time_ns, time_ns, hash_key, kvs, key_lens, val_lens, kv_count, flush);
+    if (kv_count > 16) {
+        ve_tls_free(key_lens);
+        ve_tls_free(val_lens);
+    }
+    return rc;
+}
+
+ve_tls_result ve_tls_producer_add_log_with_len(ve_tls_producer * producer, int64_t time_ms, const char * const * keys, const size_t * key_lens, const char * const * values, const size_t * value_lens, size_t pair_count, int flush) {
+    return ve_tls_producer_add_log_with_len_hashkey(producer, time_ms, NULL, keys, key_lens, values, value_lens, pair_count, flush);
+}
+
+ve_tls_result ve_tls_producer_add_log_with_len_hashkey(ve_tls_producer * producer, int64_t time_ms, const char * hash_key, const char * const * keys, const size_t * key_lens, const char * const * values, const size_t * value_lens, size_t pair_count, int flush) {
+    uint32_t time_ns = 0;
+    int32_t has_time_ns = 0;
+    if (time_ms <= 0) {
+        time_ms = producer && producer->config.platform.time_ms ? producer->config.platform.time_ms() : 0;
+        if (producer && producer->config.enable_time_ns && producer->config.platform.time_unix_ns) {
+            int64_t now_ns = producer->config.platform.time_unix_ns();
+            if (now_ns > 0) {
+                int64_t ms = now_ns / 1000000LL;
+                int64_t rem = now_ns - ms * 1000000LL;
+                if (ms > 0 && rem >= 0) {
+                    time_ms = ms;
+                    has_time_ns = 1;
+                    time_ns = (uint32_t)rem;
+                }
             }
         }
-        int should_seal = 0;
-        if (producer->config.log_count_per_package > 0 && q->builder->log_count >= producer->config.log_count_per_package) {
-            should_seal = 1;
-        }
-        if (!should_seal && byte_limit > 0 && q->builder->logs_len >= byte_limit) {
-            should_seal = 1;
-        }
-        if (should_seal) {
-            ve_tls_log_group_builder * sealed = q->builder;
-            q->builder = NULL;
-            sealed->next = NULL;
-            if (producer->sealed_tail) {
-                producer->sealed_tail->next = sealed;
-            } else {
-                producer->sealed_head = sealed;
+    }
+    return ve_tls_producer_add_log_with_len_time_parts_hashkey(producer, time_ms, has_time_ns, time_ns, hash_key, keys, key_lens, values, value_lens, pair_count, flush);
+}
+
+ve_tls_result ve_tls_producer_add_log_with_len_time_parts(ve_tls_producer * producer, int64_t time_ms, int32_t has_time_ns, uint32_t time_ns, const char * const * keys, const size_t * key_lens, const char * const * values, const size_t * value_lens, size_t pair_count, int flush) {
+    return ve_tls_producer_add_log_with_len_time_parts_hashkey(producer, time_ms, has_time_ns, time_ns, NULL, keys, key_lens, values, value_lens, pair_count, flush);
+}
+
+ve_tls_result ve_tls_producer_add_log_with_len_time_parts_hashkey(ve_tls_producer * producer, int64_t time_ms, int32_t has_time_ns, uint32_t time_ns, const char * hash_key, const char * const * keys, const size_t * key_lens, const char * const * values, const size_t * value_lens, size_t pair_count, int flush) {
+    if (!producer || !keys || !values || !key_lens || !value_lens || pair_count == 0) {
+        return VE_TLS_INVALID;
+    }
+    if (time_ms <= 0) {
+        time_ms = producer->config.platform.time_ms ? producer->config.platform.time_ms() : 0;
+        has_time_ns = 0;
+        time_ns = 0;
+        if (producer->config.enable_time_ns && producer->config.platform.time_unix_ns) {
+            int64_t now_ns = producer->config.platform.time_unix_ns();
+            if (now_ns > 0) {
+                int64_t ms = now_ns / 1000000LL;
+                int64_t rem = now_ns - ms * 1000000LL;
+                if (ms > 0 && rem >= 0) {
+                    time_ms = ms;
+                    has_time_ns = 1;
+                    time_ns = (uint32_t)rem;
+                }
             }
-            producer->sealed_tail = sealed;
-            producer->flush_requested = 1;
-            wake_worker = 1;
+        }
+    } else if (!has_time_ns) {
+        time_ns = 0;
+    }
+
+    ve_tls_kv kvs_stack[16];
+    ve_tls_kv * kvs = kvs_stack;
+    if (pair_count > 16) {
+        kvs = (ve_tls_kv *)ve_tls_calloc(pair_count, sizeof(ve_tls_kv));
+        if (!kvs) {
+            return VE_TLS_DROP_ERROR;
         }
     }
-    if (wake_worker) {
-        producer->config.platform.cond_signal(producer->cond);
+    for (size_t i = 0; i < pair_count; i++) {
+        const char * k = keys[i];
+        const char * v = values[i];
+        if (!k && key_lens[i] != 0) {
+            if (pair_count > 16) ve_tls_free(kvs);
+            return VE_TLS_INVALID;
+        }
+        if (!v && value_lens[i] != 0) {
+            if (pair_count > 16) ve_tls_free(kvs);
+            return VE_TLS_INVALID;
+        }
+        kvs[i].key = k ? k : "";
+        kvs[i].value = v ? v : "";
     }
-    producer->config.platform.mutex_unlock(producer->mutex);
-    ve_tls_metrics_emit(producer, "log_enqueued", 1, emit_size);
-    return VE_TLS_OK;
+
+    ve_tls_result rc = ve_tls_producer_add_log_kv_lens_time_parts_hashkey(producer, time_ms, has_time_ns, time_ns, hash_key, kvs, key_lens, value_lens, pair_count, flush);
+    if (pair_count > 16) {
+        ve_tls_free(kvs);
+    }
+    return rc;
 }
 
 ve_tls_result ve_tls_producer_flush(ve_tls_producer * producer) {
@@ -1215,6 +1635,13 @@ ve_tls_result ve_tls_producer_export_raw_buffer(ve_tls_producer * producer, unsi
     *out_size = 0;
 
     producer->config.platform.mutex_lock(producer->mutex);
+    if (g_tls_batch.producer == producer && g_tls_batch.builder && g_tls_batch.builder->log_count > 0) {
+        int frc = ve_tls_tls_batch_merge_locked(producer, g_tls_batch.norm_key, g_tls_batch.builder);
+        if (frc != 0) {
+            producer->config.platform.mutex_unlock(producer->mutex);
+            return frc == -2 ? VE_TLS_CLOSED : VE_TLS_DROP_ERROR;
+        }
+    }
     typedef struct {
         int64_t id;
         int64_t time_ms;
@@ -1228,6 +1655,9 @@ ve_tls_result ve_tls_producer_export_raw_buffer(ve_tls_producer * producer, unsi
     } ve_tls_export_rec;
 
     size_t builder_count = 0;
+    if (producer->default_builder && producer->default_builder->log_count > 0) {
+        builder_count++;
+    }
     for (size_t bi = 0; bi < producer->key_bucket_count; bi++) {
         for (ve_tls_key_queue * q = producer->key_buckets[bi]; q; q = q->hnext) {
             if (q->builder && q->builder->log_count > 0) {
@@ -1263,6 +1693,33 @@ ve_tls_result ve_tls_producer_export_raw_buffer(ve_tls_producer * producer, unsi
         r->data = it->data;
         r->data_size = (uint32_t)it->size;
         r->owned = 0;
+    }
+    if (producer->default_builder && producer->default_builder->log_count > 0) {
+        ve_tls_send_task t;
+        if (ve_tls_builder_to_send_task(producer, producer->default_builder, &t) != 0 || !t.body || t.body_size == 0) {
+            for (size_t k = producer->queue_count; k < rlen; k++) {
+                if (recs[k].owned) {
+                    ve_tls_free(recs[k].hk);
+                    ve_tls_free(recs[k].data);
+                }
+            }
+            ve_tls_free(recs);
+            producer->config.platform.mutex_unlock(producer->mutex);
+            return VE_TLS_DROP_ERROR;
+        }
+        ve_tls_export_rec * r = &recs[rlen++];
+        r->id = producer->default_builder->end_id;
+        r->time_ms = producer->default_builder->last_time_ms;
+        r->has_ns = (unsigned char)(producer->default_builder->last_has_time_ns ? 1 : 0);
+        r->time_ns = producer->default_builder->last_time_ns;
+        r->hk = t.hash_key;
+        r->hk_len = t.hash_key ? (uint32_t)strlen(t.hash_key) : 0;
+        r->data = t.body;
+        r->data_size = (uint32_t)t.body_size;
+        r->owned = 1;
+        t.hash_key = NULL;
+        t.body = NULL;
+        ve_tls_send_task_free(&t);
     }
     for (size_t bi = 0; bi < producer->key_bucket_count; bi++) {
         for (ve_tls_key_queue * q = producer->key_buckets[bi]; q; q = q->hnext) {

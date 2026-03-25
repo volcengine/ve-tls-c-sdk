@@ -2957,22 +2957,10 @@ static int test_manager_payload_too_large_after_comp_single(void) {
     }
     for (int i = 0; i < 200 && !g_mgr_p2l_done; i++) cfg.platform.sleep_ms(10);
     ve_tls_producer_destroy(p);
-    if (g_http_called_unexpected) {
-        fprintf(stderr, "p2l_single: http called unexpectedly\n");
-        return -1;
-    }
-    if (!g_mgr_p2l_ok) {
-        fprintf(stderr, "p2l_single: callback not ok (done=%d code='%s' msg='%s')\n", g_mgr_p2l_done, g_mgr_p2l_code, g_mgr_p2l_msg);
-        return -1;
-    }
-    if (strcmp(g_mgr_p2l_code, "PayloadTooLarge") != 0) {
-        fprintf(stderr, "p2l_single: code mismatch '%s'\n", g_mgr_p2l_code);
-        return -1;
-    }
-    if (strcmp(g_mgr_p2l_msg, "payload too large after compression") != 0) {
-        fprintf(stderr, "p2l_single: msg mismatch '%s'\n", g_mgr_p2l_msg);
-        return -1;
-    }
+    if (g_http_called_unexpected) return -1;
+    if (!g_mgr_p2l_ok) return -1;
+    if (strcmp(g_mgr_p2l_code, "PayloadTooLarge") != 0) return -1;
+    if (strcmp(g_mgr_p2l_msg, "payload too large after compression") != 0) return -1;
     return 0;
 }
 
@@ -4264,21 +4252,144 @@ static int test_export_import_raw_buffer(void) {
         return -1;
     }
     int ok = (n1 == n2 && memcmp(b1, b2, n1) == 0) ? 0 : -1;
-    if (ok != 0) {
-        fprintf(stderr, "export/import mismatch: n1=%zu n2=%zu\n", n1, n2);
-        size_t dump = n1 < n2 ? n1 : n2;
-        if (dump > 96) dump = 96;
-        fprintf(stderr, "b1 head:");
-        for (size_t i = 0; i < dump; i++) fprintf(stderr, " %02x", (unsigned)b1[i]);
-        fprintf(stderr, "\n");
-        fprintf(stderr, "b2 head:");
-        for (size_t i = 0; i < dump; i++) fprintf(stderr, " %02x", (unsigned)b2[i]);
-        fprintf(stderr, "\n");
-    }
     ve_tls_producer_free_raw_buffer(b1);
     ve_tls_producer_free_raw_buffer(b2);
     ve_tls_producer_destroy(p2);
     return ok;
+}
+
+static uint32_t read_u32_le(const unsigned char * p) {
+    return (uint32_t)p[0] |
+           ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) |
+           ((uint32_t)p[3] << 24);
+}
+
+static int mem_has(const unsigned char * hay, size_t hay_len, const unsigned char * needle, size_t needle_len) {
+    if (!hay || !needle || needle_len == 0 || hay_len < needle_len) {
+        return 0;
+    }
+    for (size_t i = 0; i + needle_len <= hay_len; i++) {
+        if (memcmp(hay + i, needle, needle_len) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int test_add_log_with_len_exports_one_record(void) {
+    ve_tls_config cfg;
+    ve_tls_config_init(&cfg);
+    cfg.endpoint = "https://example.com";
+    cfg.region = "cn-beijing";
+    cfg.topic_id = "t";
+    cfg.access_key_id = "ak";
+    cfg.access_key_secret = "sk";
+    cfg.retry_policy.max_attempts = 1;
+    cfg.flush_interval_ms = 100000;
+    cfg.log_count_per_package = 1000000;
+    cfg.log_bytes_per_package = 100000000;
+    cfg.enable_tls_batching = 0;
+
+    ve_tls_producer * p = ve_tls_producer_create(&cfg);
+    if (!p) return -1;
+
+    const unsigned char k_raw[6] = {'K','E','Y','X','X','X'};
+    const unsigned char v_raw[7] = {'V','A','L','U','E','Y','Y'};
+    const char * keys[1] = {(const char *)k_raw};
+    const char * values[1] = {(const char *)v_raw};
+    size_t k_lens[1] = {3};
+    size_t v_lens[1] = {5};
+    if (ve_tls_producer_add_log_with_len(p, 1710000000000LL, keys, k_lens, values, v_lens, 1, 0) != VE_TLS_OK) {
+        ve_tls_producer_destroy(p);
+        return -1;
+    }
+
+    unsigned char * b = NULL;
+    size_t n = 0;
+    if (ve_tls_producer_export_raw_buffer(p, &b, &n) != VE_TLS_OK || !b || n < 4 + 4 + 4 + 8) {
+        ve_tls_producer_destroy(p);
+        return -1;
+    }
+    uint32_t count = read_u32_le(b + 8);
+    if (count != 1) {
+        ve_tls_producer_free_raw_buffer(b);
+        ve_tls_producer_destroy(p);
+        return -1;
+    }
+
+    size_t off = 4 + 4 + 4 + 8;
+    if (n < off + 8 + 8 + 1 + 4 + 4 + 4) {
+        ve_tls_producer_free_raw_buffer(b);
+        ve_tls_producer_destroy(p);
+        return -1;
+    }
+    off += 8 + 8 + 1 + 4;
+    uint32_t hk_len = read_u32_le(b + off);
+    off += 4;
+    uint32_t data_size = read_u32_le(b + off);
+    off += 4;
+    if (n < off + (size_t)hk_len + (size_t)data_size) {
+        ve_tls_producer_free_raw_buffer(b);
+        ve_tls_producer_destroy(p);
+        return -1;
+    }
+    off += (size_t)hk_len;
+    const unsigned char * body = b + off;
+    size_t body_len = (size_t)data_size;
+    const unsigned char k_expect[3] = {'K','E','Y'};
+    const unsigned char v_expect[5] = {'V','A','L','U','E'};
+    const unsigned char k_full[6] = {'K','E','Y','X','X','X'};
+    const unsigned char v_full[7] = {'V','A','L','U','E','Y','Y'};
+    int ok = mem_has(body, body_len, k_expect, sizeof(k_expect)) &&
+             mem_has(body, body_len, v_expect, sizeof(v_expect)) &&
+             !mem_has(body, body_len, k_full, sizeof(k_full)) &&
+             !mem_has(body, body_len, v_full, sizeof(v_full));
+
+    ve_tls_producer_free_raw_buffer(b);
+    ve_tls_producer_destroy(p);
+    return ok ? 0 : -1;
+}
+
+static int test_export_raw_buffer_includes_tls_batch_with_len(void) {
+    ve_tls_config cfg;
+    ve_tls_config_init(&cfg);
+    cfg.endpoint = "https://example.com";
+    cfg.region = "cn-beijing";
+    cfg.topic_id = "t";
+    cfg.access_key_id = "ak";
+    cfg.access_key_secret = "sk";
+    cfg.retry_policy.max_attempts = 1;
+    cfg.flush_interval_ms = 100000;
+    cfg.log_count_per_package = 1000000;
+    cfg.log_bytes_per_package = 100000000;
+    cfg.enable_tls_batching = 1;
+    cfg.ordered_send = 0;
+
+    ve_tls_producer * p = ve_tls_producer_create(&cfg);
+    if (!p) return -1;
+
+    const unsigned char k_raw[3] = {'a','b','c'};
+    const unsigned char v_raw[3] = {'1','2','3'};
+    const char * keys[1] = {(const char *)k_raw};
+    const char * values[1] = {(const char *)v_raw};
+    size_t k_lens[1] = {3};
+    size_t v_lens[1] = {3};
+    if (ve_tls_producer_add_log_with_len(p, 1710000000000LL, keys, k_lens, values, v_lens, 1, 0) != VE_TLS_OK) {
+        ve_tls_producer_destroy(p);
+        return -1;
+    }
+
+    unsigned char * b = NULL;
+    size_t n = 0;
+    if (ve_tls_producer_export_raw_buffer(p, &b, &n) != VE_TLS_OK || !b || n < 4 + 4 + 4 + 8) {
+        ve_tls_producer_destroy(p);
+        return -1;
+    }
+    uint32_t count = read_u32_le(b + 8);
+    ve_tls_producer_free_raw_buffer(b);
+    ve_tls_producer_destroy(p);
+    return count == 1 ? 0 : -1;
 }
 
 static int test_import_raw_buffer_invalid_magic(void) {
@@ -6381,6 +6492,8 @@ int main(void) {
     RUN(114, test_alloc_hooks_and_small_edge_cases());
     RUN(112, test_send_queue_push_timeout_returns_minus2());
     RUN(113, test_send_queue_stop_causes_push_pop_fail());
+    RUN(115, test_add_log_with_len_exports_one_record());
+    RUN(116, test_export_raw_buffer_includes_tls_batch_with_len());
 #if defined(VE_TLS_HAVE_ZLIB)
     RUN(37, test_zlib_compress_roundtrip());
 #endif
