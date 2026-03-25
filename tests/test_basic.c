@@ -3741,6 +3741,43 @@ static int test_alloc_tracking_sign_success_no_leak(void) {
     return (ok && live == 0) ? 0 : -1;
 }
 
+static int test_sign_allocation_budget(void) {
+    ve_tls_alloc_hooks saved;
+    memset(&saved, 0, sizeof(saved));
+    ve_tls_alloc_get_hooks(&saved);
+
+    alloc_select_fail_state st;
+    memset(&st, 0, sizeof(st));
+    set_alloc_select_fail(&st, 0, 0, 0, 0);
+
+    char * out = NULL;
+    int rc = ve_tls_sign_v4_append(
+        "ak",
+        "sk",
+        "tok",
+        "cn-beijing",
+        "TLS",
+        "POST",
+        "example.com",
+        "/PutLogs",
+        "TopicId=t&aa=1&bb=2",
+        (const unsigned char *)"abc",
+        3,
+        "Content-Type: application/x-protobuf\nx-tls-apiversion: " VE_TLS_C_SDK_API_VERSION "\n",
+        &out
+    );
+
+    ve_tls_alloc_set_hooks(&saved);
+    int ok = 0;
+    if (rc == 0 && out && strstr(out, "Authorization: ") && strstr(out, "X-Date: ")) {
+        ok = 1;
+    }
+    ve_tls_free(out);
+
+    int total_calls = st.malloc_calls + st.calloc_calls + st.realloc_calls + st.strdup_calls;
+    return (ok && total_calls <= 22) ? 0 : -1;
+}
+
 static int test_alloc_tracking_producer_lifecycle_no_leak(void) {
     ve_tls_alloc_hooks saved;
     memset(&saved, 0, sizeof(saved));
@@ -6484,6 +6521,7 @@ int main(void) {
     RUN(74, test_alloc_failtrack_producer_create_no_leak());
     RUN(63, test_alloc_tracking_env_lifecycle_no_leak());
     RUN(64, test_alloc_tracking_sign_success_no_leak());
+    RUN(117, test_sign_allocation_budget());
     RUN(65, test_alloc_tracking_producer_lifecycle_no_leak());
     RUN(69, test_alloc_fail_fuzz_sign_does_not_crash());
     RUN(70, test_alloc_fail_fuzz_proto_does_not_crash());

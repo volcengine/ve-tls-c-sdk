@@ -175,6 +175,8 @@ struct ve_tls_producer {
     char * cfg_proxy;
     char * cfg_user_agent;
     char * cfg_persistent_file_path;
+    int64_t send_cfg_version;
+    int64_t static_cred_version;
     uint64_t m_logs_enqueued_total;
     uint64_t m_logs_dropped_total;
     uint64_t m_bytes_enqueued_total;

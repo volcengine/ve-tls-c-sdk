@@ -17,12 +17,10 @@ static ve_tls_send_callbacks ve_tls_capture_callbacks(ve_tls_producer * producer
     if (!producer) {
         return out;
     }
-    producer->config.platform.mutex_lock(producer->mutex);
-    out.cb = producer->send_done;
-    out.cb_param = producer->send_done_param;
-    out.cb2 = producer->send_done_v2;
-    out.cb2_param = producer->send_done_v2_param;
-    producer->config.platform.mutex_unlock(producer->mutex);
+    out.cb = __atomic_load_n(&producer->send_done, __ATOMIC_ACQUIRE);
+    out.cb_param = __atomic_load_n(&producer->send_done_param, __ATOMIC_ACQUIRE);
+    out.cb2 = __atomic_load_n(&producer->send_done_v2, __ATOMIC_ACQUIRE);
+    out.cb2_param = __atomic_load_n(&producer->send_done_v2_param, __ATOMIC_ACQUIRE);
     return out;
 }
 

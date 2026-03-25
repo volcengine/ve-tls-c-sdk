@@ -113,10 +113,10 @@ static ve_tls_send_callbacks ve_tls_capture_callbacks(ve_tls_producer * producer
     if (!producer) {
         return cbs;
     }
-    cbs.cb = producer->send_done;
-    cbs.cb_param = producer->send_done_param;
-    cbs.cb2 = producer->send_done_v2;
-    cbs.cb2_param = producer->send_done_v2_param;
+    cbs.cb = __atomic_load_n(&producer->send_done, __ATOMIC_ACQUIRE);
+    cbs.cb_param = __atomic_load_n(&producer->send_done_param, __ATOMIC_ACQUIRE);
+    cbs.cb2 = __atomic_load_n(&producer->send_done_v2, __ATOMIC_ACQUIRE);
+    cbs.cb2_param = __atomic_load_n(&producer->send_done_v2_param, __ATOMIC_ACQUIRE);
     return cbs;
 }
 
@@ -145,6 +145,8 @@ typedef struct {
 } ve_tls_tls_batch;
 
 static __thread ve_tls_tls_batch g_tls_batch;
+static int64_t g_send_cfg_version_seed = 1;
+static int64_t g_static_cred_version_seed = 1;
 
 static void ve_tls_tls_batch_reset(ve_tls_log_group_builder * b) {
     if (!b) {
@@ -530,6 +532,8 @@ ve_tls_producer * ve_tls_producer_create(const ve_tls_config * config) {
     producer->config.proxy = producer->cfg_proxy;
     producer->config.user_agent = producer->cfg_user_agent;
     producer->config.persistent_file_path = producer->cfg_persistent_file_path;
+    producer->send_cfg_version = __atomic_add_fetch(&g_send_cfg_version_seed, 1, __ATOMIC_RELAXED);
+    producer->static_cred_version = __atomic_add_fetch(&g_static_cred_version_seed, 1, __ATOMIC_RELAXED);
     if (ve_tls_producer_build_group_suffix(producer) != 0) {
         ve_tls_producer_destroy(producer);
         return NULL;
@@ -640,16 +644,19 @@ ve_tls_result ve_tls_producer_update_endpoint(ve_tls_producer * producer, const 
         ve_tls_free(producer->cfg_endpoint);
         producer->cfg_endpoint = new_endpoint;
         producer->config.endpoint = producer->cfg_endpoint;
+        (void)__atomic_fetch_add(&producer->send_cfg_version, 1, __ATOMIC_RELEASE);
     }
     if (new_region) {
         ve_tls_free(producer->cfg_region);
         producer->cfg_region = new_region;
         producer->config.region = producer->cfg_region;
+        (void)__atomic_fetch_add(&producer->send_cfg_version, 1, __ATOMIC_RELEASE);
     }
     if (new_topic_id) {
         ve_tls_free(producer->cfg_topic_id);
         producer->cfg_topic_id = new_topic_id;
         producer->config.topic_id = producer->cfg_topic_id;
+        (void)__atomic_fetch_add(&producer->send_cfg_version, 1, __ATOMIC_RELEASE);
     }
     producer->config.platform.mutex_unlock(producer->mutex);
     ve_tls_metrics_emit(producer, "config_update_endpoint", 1, 0);
@@ -690,6 +697,7 @@ ve_tls_result ve_tls_producer_update_static_credentials(ve_tls_producer * produc
         producer->cfg_access_key_secret = new_sk;
         producer->config.access_key_id = producer->cfg_access_key_id;
         producer->config.access_key_secret = producer->cfg_access_key_secret;
+        (void)__atomic_fetch_add(&producer->static_cred_version, 1, __ATOMIC_RELEASE);
     } else {
         ve_tls_free(new_ak);
         ve_tls_free(new_sk);
@@ -698,6 +706,7 @@ ve_tls_result ve_tls_producer_update_static_credentials(ve_tls_producer * produc
         ve_tls_secure_free_str(&producer->cfg_security_token);
         producer->cfg_security_token = new_tok;
         producer->config.security_token = producer->cfg_security_token;
+        (void)__atomic_fetch_add(&producer->static_cred_version, 1, __ATOMIC_RELEASE);
     } else {
         ve_tls_free(new_tok);
     }
@@ -919,28 +928,16 @@ void ve_tls_producer_set_send_done(ve_tls_producer * producer, ve_tls_send_done_
     if (!producer) {
         return;
     }
-    if (producer->mutex) {
-        producer->config.platform.mutex_lock(producer->mutex);
-    }
-    producer->send_done = callback;
-    producer->send_done_param = user_param;
-    if (producer->mutex) {
-        producer->config.platform.mutex_unlock(producer->mutex);
-    }
+    __atomic_store_n(&producer->send_done, callback, __ATOMIC_RELEASE);
+    __atomic_store_n(&producer->send_done_param, user_param, __ATOMIC_RELEASE);
 }
 
 void ve_tls_producer_set_send_done_v2(ve_tls_producer * producer, ve_tls_send_done_v2_fn callback, void * user_param) {
     if (!producer) {
         return;
     }
-    if (producer->mutex) {
-        producer->config.platform.mutex_lock(producer->mutex);
-    }
-    producer->send_done_v2 = callback;
-    producer->send_done_v2_param = user_param;
-    if (producer->mutex) {
-        producer->config.platform.mutex_unlock(producer->mutex);
-    }
+    __atomic_store_n(&producer->send_done_v2, callback, __ATOMIC_RELEASE);
+    __atomic_store_n(&producer->send_done_v2_param, user_param, __ATOMIC_RELEASE);
 }
 
 void ve_tls_producer_get_metrics(ve_tls_producer * producer, ve_tls_metrics * out) {
