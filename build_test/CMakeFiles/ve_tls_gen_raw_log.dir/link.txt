@@ -1,0 +1,1 @@
+/usr/bin/cc  -arch arm64 -Wl,-search_paths_first -Wl,-headerpad_max_install_names CMakeFiles/ve_tls_gen_raw_log.dir/tools/gen_raw_log.c.o -o ve_tls_gen_raw_log  libve_tls_core.a

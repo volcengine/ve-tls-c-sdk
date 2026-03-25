@@ -69,15 +69,17 @@ static int ve_tls_manager_push_send_task(ve_tls_producer * producer, ve_tls_send
         return -1;
     }
     ve_tls_metric_inc_u64(&producer->m_batches_built_total, 1);
-    producer->config.platform.mutex_lock(producer->mutex);
-    const char * nk = ve_tls_normalize_hash_key(producer, t->hash_key);
-    int reserve_ok = (ve_tls_key_queue_reserve(producer, nk) == 0);
-    producer->config.platform.mutex_unlock(producer->mutex);
-    if (!reserve_ok) {
-        ve_tls_metrics_emit(producer, "key_queue_drop", 1, 0);
-        ve_tls_manager_drop_range(producer, t->batch_bytes, t->start_id, t->end_id, "KeyQueueLimitExceeded", "key queue limit exceeded");
-        ve_tls_send_task_free(t);
-        return -1;
+    if (!producer->fast_send) {
+        producer->config.platform.mutex_lock(producer->mutex);
+        const char * nk = ve_tls_normalize_hash_key(producer, t->hash_key);
+        int reserve_ok = (ve_tls_key_queue_reserve(producer, nk) == 0);
+        producer->config.platform.mutex_unlock(producer->mutex);
+        if (!reserve_ok) {
+            ve_tls_metrics_emit(producer, "key_queue_drop", 1, 0);
+            ve_tls_manager_drop_range(producer, t->batch_bytes, t->start_id, t->end_id, "KeyQueueLimitExceeded", "key queue limit exceeded");
+            ve_tls_send_task_free(t);
+            return -1;
+        }
     }
     int wait_ms = 0;
     if (producer->config.send_queue_full_policy == VE_TLS_SEND_QUEUE_FULL_BLOCK) {
@@ -122,9 +124,11 @@ static int ve_tls_manager_push_send_task(ve_tls_producer * producer, ve_tls_send
         ve_tls_send_task_free(t);
         return -1;
     }
-    producer->config.platform.mutex_lock(producer->mutex);
-    producer->config.platform.cond_broadcast(producer->send_cond);
-    producer->config.platform.mutex_unlock(producer->mutex);
+    if (!producer->fast_send) {
+        producer->config.platform.mutex_lock(producer->mutex);
+        producer->config.platform.cond_broadcast(producer->send_cond);
+        producer->config.platform.mutex_unlock(producer->mutex);
+    }
     return 0;
 }
 
@@ -144,75 +148,67 @@ static int ve_tls_manager_requeue_item(ve_tls_producer * producer, const ve_tls_
 
 static void * ve_tls_worker_main_builder(void * arg) {
     ve_tls_producer * producer = (ve_tls_producer *)arg;
-    int64_t last_flush = producer->config.platform.time_ms ? producer->config.platform.time_ms() : 0;
     for (;;) {
         producer->config.platform.mutex_lock(producer->mutex);
-        int64_t now = producer->config.platform.time_ms ? producer->config.platform.time_ms() : 0;
-        int interval_due = 0;
-        if (producer->config.flush_interval_ms > 0 && now > 0 && now - last_flush >= producer->config.flush_interval_ms) {
-            interval_due = 1;
+        int have_any_builder = 0;
+        for (size_t i = 0; i < producer->key_bucket_count && !have_any_builder; i++) {
+            for (ve_tls_key_queue * q = producer->key_buckets[i]; q; q = q->hnext) {
+                if (q->builder && q->builder->log_count > 0) {
+                    have_any_builder = 1;
+                    break;
+                }
+            }
         }
-        int have_builders = 0;
-        if (interval_due || producer->stop) {
-            for (size_t i = 0; i < producer->key_bucket_count && !have_builders; i++) {
+        while (!producer->stop && producer->queue_count == 0 && !producer->flush_requested && !producer->sealed_head && !have_any_builder) {
+            producer->config.platform.cond_wait(producer->cond, producer->mutex);
+            have_any_builder = 0;
+            for (size_t i = 0; i < producer->key_bucket_count && !have_any_builder; i++) {
                 for (ve_tls_key_queue * q = producer->key_buckets[i]; q; q = q->hnext) {
                     if (q->builder && q->builder->log_count > 0) {
-                        have_builders = 1;
+                        have_any_builder = 1;
                         break;
                     }
                 }
             }
         }
-        while (!producer->stop && producer->queue_count == 0 && !producer->flush_requested && !producer->sealed_head && !(interval_due && have_builders)) {
-            if (producer->config.flush_interval_ms > 0 && producer->config.platform.cond_timedwait_ms && have_builders) {
-                now = producer->config.platform.time_ms ? producer->config.platform.time_ms() : 0;
-                int64_t remain = last_flush > 0 ? (last_flush + producer->config.flush_interval_ms - now) : producer->config.flush_interval_ms;
-                if (remain < 1) {
-                    break;
-                }
-                (void)producer->config.platform.cond_timedwait_ms(producer->cond, producer->mutex, remain);
-            } else {
-                producer->config.platform.cond_wait(producer->cond, producer->mutex);
-            }
-            now = producer->config.platform.time_ms ? producer->config.platform.time_ms() : 0;
-            interval_due = 0;
-            if (producer->config.flush_interval_ms > 0 && now > 0 && now - last_flush >= producer->config.flush_interval_ms) {
-                interval_due = 1;
-            }
-            have_builders = 0;
-            if (interval_due || producer->stop) {
-                for (size_t i = 0; i < producer->key_bucket_count && !have_builders; i++) {
-                    for (ve_tls_key_queue * q = producer->key_buckets[i]; q; q = q->hnext) {
-                        if (q->builder && q->builder->log_count > 0) {
-                            have_builders = 1;
-                            break;
-                        }
-                    }
-                }
-            }
+        if (!producer->stop && producer->queue_count == 0 && !producer->flush_requested && !producer->sealed_head && have_any_builder && producer->config.platform.cond_timedwait_ms) {
+            (void)producer->config.platform.cond_timedwait_ms(producer->cond, producer->mutex, 100);
         }
-        if (producer->stop && producer->queue_count == 0 && !producer->sealed_head && !have_builders) {
+        if (producer->stop && producer->queue_count == 0 && !producer->sealed_head && !have_any_builder) {
             producer->config.platform.mutex_unlock(producer->mutex);
             break;
         }
-        int force_flush = producer->flush_requested || interval_due || producer->stop;
+        int64_t now = producer->config.platform.time_ms ? producer->config.platform.time_ms() : 0;
+        int flush_all = producer->flush_requested || producer->stop;
         producer->flush_requested = 0;
         producer->worker_flushing = 1;
-        if (force_flush) {
-            for (size_t i = 0; i < producer->key_bucket_count; i++) {
-                for (ve_tls_key_queue * q = producer->key_buckets[i]; q; q = q->hnext) {
-                    if (q->builder && q->builder->log_count > 0) {
-                        ve_tls_log_group_builder * b = q->builder;
-                        q->builder = NULL;
-                        b->next = NULL;
-                        if (producer->sealed_tail) {
-                            producer->sealed_tail->next = b;
-                        } else {
-                            producer->sealed_head = b;
-                        }
-                        producer->sealed_tail = b;
-                    }
+        int64_t pkg_timeout = producer->config.flush_interval_ms;
+        if (pkg_timeout < 0) {
+            pkg_timeout = 0;
+        }
+        for (size_t i = 0; i < producer->key_bucket_count; i++) {
+            for (ve_tls_key_queue * q = producer->key_buckets[i]; q; q = q->hnext) {
+                if (!q->builder || q->builder->log_count == 0) {
+                    continue;
                 }
+                int should_seal = 0;
+                if (flush_all) {
+                    should_seal = 1;
+                } else if (pkg_timeout > 0 && now > 0 && q->builder->first_append_ms > 0 && now - q->builder->first_append_ms >= pkg_timeout) {
+                    should_seal = 1;
+                }
+                if (!should_seal) {
+                    continue;
+                }
+                ve_tls_log_group_builder * b = q->builder;
+                q->builder = NULL;
+                b->next = NULL;
+                if (producer->sealed_tail) {
+                    producer->sealed_tail->next = b;
+                } else {
+                    producer->sealed_head = b;
+                }
+                producer->sealed_tail = b;
             }
         }
         ve_tls_log_group_builder * sealed = producer->sealed_head;
@@ -273,7 +269,6 @@ static void * ve_tls_worker_main_builder(void * arg) {
         producer->worker_flushing = 0;
         producer->config.platform.cond_broadcast(producer->send_cond);
         producer->config.platform.mutex_unlock(producer->mutex);
-        last_flush = producer->config.platform.time_ms ? producer->config.platform.time_ms() : last_flush;
     }
     return NULL;
 }

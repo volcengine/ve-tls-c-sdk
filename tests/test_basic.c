@@ -4264,6 +4264,17 @@ static int test_export_import_raw_buffer(void) {
         return -1;
     }
     int ok = (n1 == n2 && memcmp(b1, b2, n1) == 0) ? 0 : -1;
+    if (ok != 0) {
+        fprintf(stderr, "export/import mismatch: n1=%zu n2=%zu\n", n1, n2);
+        size_t dump = n1 < n2 ? n1 : n2;
+        if (dump > 96) dump = 96;
+        fprintf(stderr, "b1 head:");
+        for (size_t i = 0; i < dump; i++) fprintf(stderr, " %02x", (unsigned)b1[i]);
+        fprintf(stderr, "\n");
+        fprintf(stderr, "b2 head:");
+        for (size_t i = 0; i < dump; i++) fprintf(stderr, " %02x", (unsigned)b2[i]);
+        fprintf(stderr, "\n");
+    }
     ve_tls_producer_free_raw_buffer(b1);
     ve_tls_producer_free_raw_buffer(b2);
     ve_tls_producer_destroy(p2);

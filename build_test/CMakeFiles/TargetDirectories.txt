@@ -1,0 +1,11 @@
+/Users/bytedance/workspace/src/sdk/volcengine-sdk/ve-tls-android-sdk/ve-tls-c-sdk/build_test/CMakeFiles/ve_tls_core.dir
+/Users/bytedance/workspace/src/sdk/volcengine-sdk/ve-tls-android-sdk/ve-tls-c-sdk/build_test/CMakeFiles/ve_tls_demo.dir
+/Users/bytedance/workspace/src/sdk/volcengine-sdk/ve-tls-android-sdk/ve-tls-c-sdk/build_test/CMakeFiles/ve_tls_demo_real.dir
+/Users/bytedance/workspace/src/sdk/volcengine-sdk/ve-tls-android-sdk/ve-tls-c-sdk/build_test/CMakeFiles/ve_tls_bench.dir
+/Users/bytedance/workspace/src/sdk/volcengine-sdk/ve-tls-android-sdk/ve-tls-c-sdk/build_test/CMakeFiles/ve_tls_gen_raw_log.dir
+/Users/bytedance/workspace/src/sdk/volcengine-sdk/ve-tls-android-sdk/ve-tls-c-sdk/build_test/CMakeFiles/ve_tls_perf_sls.dir
+/Users/bytedance/workspace/src/sdk/volcengine-sdk/ve-tls-android-sdk/ve-tls-c-sdk/build_test/CMakeFiles/ve_tls_benchmark_sls.dir
+/Users/bytedance/workspace/src/sdk/volcengine-sdk/ve-tls-android-sdk/ve-tls-c-sdk/build_test/CMakeFiles/ve_tls_test_basic.dir
+/Users/bytedance/workspace/src/sdk/volcengine-sdk/ve-tls-android-sdk/ve-tls-c-sdk/build_test/CMakeFiles/test.dir
+/Users/bytedance/workspace/src/sdk/volcengine-sdk/ve-tls-android-sdk/ve-tls-c-sdk/build_test/CMakeFiles/edit_cache.dir
+/Users/bytedance/workspace/src/sdk/volcengine-sdk/ve-tls-android-sdk/ve-tls-c-sdk/build_test/CMakeFiles/rebuild_cache.dir

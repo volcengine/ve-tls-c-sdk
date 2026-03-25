@@ -88,6 +88,9 @@ target_link_libraries(ve_tls_gen_raw_log PRIVATE ve_tls_core)
 add_executable(ve_tls_perf_sls tools/perf_sls.c)
 target_link_libraries(ve_tls_perf_sls PRIVATE ve_tls_core)
 
+add_executable(ve_tls_benchmark_sls tools/benchmark_sls.c)
+target_link_libraries(ve_tls_benchmark_sls PRIVATE ve_tls_core)
+
 if(VE_TLS_BUILD_TESTS)
     enable_testing()
     add_executable(ve_tls_test_basic tests/test_basic.c)

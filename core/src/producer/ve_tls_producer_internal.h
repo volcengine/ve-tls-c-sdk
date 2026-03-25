@@ -105,6 +105,8 @@ struct ve_tls_producer {
     void * send_done_param;
     ve_tls_send_done_v2_fn send_done_v2;
     void * send_done_v2_param;
+    int32_t fast_send;
+    int32_t fast_inflight;
     ve_tls_mutex * mutex;
     ve_tls_cond * cond;
     ve_tls_cond * send_cond;

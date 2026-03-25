@@ -1126,8 +1126,187 @@ have_task: {
 }
 }
 
+static void * ve_tls_sender_main_fast(void * arg) {
+    ve_tls_producer * producer = (ve_tls_producer *)arg;
+    for (;;) {
+        ve_tls_send_task task;
+        memset(&task, 0, sizeof(task));
+        if (ve_tls_send_queue_pop(&producer->send_queue, &task, -1) != 0) {
+            return NULL;
+        }
+        (void)__atomic_fetch_add(&producer->fast_inflight, 1, __ATOMIC_RELAXED);
+
+        ve_tls_bytes compressed;
+        memset(&compressed, 0, sizeof(compressed));
+        int compressed_owned = 0;
+        const unsigned char * send_body_data = task.body;
+        size_t send_body_size = task.body_size;
+        size_t raw_body_size = task.raw_body_size;
+
+        if (task.precompressed && task.precompressed_size > 0) {
+            send_body_data = task.precompressed;
+            send_body_size = task.precompressed_size;
+        } else {
+            int c_rc = ve_tls_compress_apply(producer->config.compress_type, task.body, task.body_size, &compressed);
+            if (c_rc == 0 && compressed.data && compressed.size > 0) {
+                compressed_owned = 1;
+                send_body_data = compressed.data;
+                send_body_size = compressed.size;
+            } else if (c_rc == -1 || c_rc == -3) {
+                ve_tls_error err;
+                memset(&err, 0, sizeof(err));
+                err.http_code = -1;
+                err.transport_kind = VE_TLS_TRANSPORT_GENERIC;
+                err.transport_code = 0;
+                err.retryable = 0;
+                err.error_code = ve_tls_strdup("ClientError");
+                err.error_message = ve_tls_strdup(c_rc == -1 ? "compress failed" : "unsupported compress_type");
+                ve_tls_send_callbacks cbs = ve_tls_capture_callbacks(producer);
+                if (cbs.cb) {
+                    cbs.cb(VE_TLS_DROP_ERROR, task.batch_bytes, 0, NULL, err.error_message, NULL, cbs.cb_param, task.start_id, task.end_id);
+                }
+                if (cbs.cb2) {
+                    cbs.cb2(VE_TLS_DROP_ERROR, task.batch_bytes, 0, &err, NULL, cbs.cb2_param, task.start_id, task.end_id);
+                }
+                ve_tls_error_free_fields(&err);
+                if (compressed_owned) {
+                    ve_tls_bytes_free(&compressed);
+                }
+                ve_tls_send_task_free(&task);
+                (void)__atomic_fetch_sub(&producer->fast_inflight, 1, __ATOMIC_RELAXED);
+                continue;
+            }
+        }
+
+        if (producer->config.agg_strategy == 1 && producer->config.agg_max_compressed_bytes_per_request > 0) {
+            size_t maxc = (size_t)producer->config.agg_max_compressed_bytes_per_request;
+            if (maxc > 0 && send_body_size > maxc) {
+                ve_tls_error err;
+                memset(&err, 0, sizeof(err));
+                err.http_code = -1;
+                err.transport_kind = VE_TLS_TRANSPORT_GENERIC;
+                err.transport_code = 0;
+                err.retryable = 0;
+                err.error_code = ve_tls_strdup("PayloadTooLarge");
+                err.error_message = ve_tls_strdup("payload too large after compression");
+                ve_tls_send_callbacks cbs = ve_tls_capture_callbacks(producer);
+                if (cbs.cb) {
+                    cbs.cb(VE_TLS_DROP_ERROR, task.batch_bytes, 0, NULL, err.error_message, NULL, cbs.cb_param, task.start_id, task.end_id);
+                }
+                if (cbs.cb2) {
+                    cbs.cb2(VE_TLS_DROP_ERROR, task.batch_bytes, 0, &err, NULL, cbs.cb2_param, task.start_id, task.end_id);
+                }
+                ve_tls_error_free_fields(&err);
+                if (compressed_owned) {
+                    ve_tls_bytes_free(&compressed);
+                }
+                ve_tls_send_task_free(&task);
+                (void)__atomic_fetch_sub(&producer->fast_inflight, 1, __ATOMIC_RELAXED);
+                continue;
+            }
+        }
+
+        int32_t attempt = 0;
+        int64_t start_time = producer->config.platform.time_ms ? producer->config.platform.time_ms() : 0;
+        ve_tls_error err;
+        memset(&err, 0, sizeof(err));
+        int sent_ok = 0;
+        for (;;) {
+            attempt++;
+            ve_tls_error_free_fields(&err);
+            ve_tls_metric_inc_u64(&producer->m_requests_total, 1);
+            ve_tls_metrics_emit(producer, "request_attempt", 1, 0);
+            int64_t attempt_start = producer->config.platform.time_ms ? producer->config.platform.time_ms() : 0;
+            char * ak = NULL;
+            char * sk = NULL;
+            char * token = NULL;
+            if (ve_tls_get_signing_credentials(producer, attempt_start, &ak, &sk, &token) != 0) {
+                ve_tls_error_free_fields(&err);
+                err.http_code = -1;
+                err.transport_kind = VE_TLS_TRANSPORT_GENERIC;
+                err.transport_code = 0;
+                err.retryable = 0;
+                err.error_code = ve_tls_strdup("CredentialsRefreshFailed");
+                err.error_message = ve_tls_strdup("credentials refresh failed");
+                break;
+            }
+            int rc = ve_tls_send_put_logs(producer, ak, sk, token, send_body_data, send_body_size, raw_body_size, task.log_count, task.earliest, task.latest, task.hash_key, &err);
+            ve_tls_free(ak);
+            ve_tls_free(sk);
+            ve_tls_free(token);
+            int64_t attempt_end = producer->config.platform.time_ms ? producer->config.platform.time_ms() : 0;
+            int64_t attempt_ms = attempt_end - attempt_start;
+            if (attempt_ms < 0) {
+                attempt_ms = 0;
+            }
+            int bi = ve_tls_latency_bucket_index(attempt_ms);
+            ve_tls_metric_inc_u64(&producer->m_latency_buckets[bi], 1);
+            ve_tls_metrics_emit(producer, "request_latency_ms", attempt_ms, err.http_code);
+            if (rc == 0) {
+                sent_ok = 1;
+                break;
+            }
+            int64_t now2 = producer->config.platform.time_ms ? producer->config.platform.time_ms() : 0;
+            int64_t elapsed = now2 - start_time;
+            if (!err.retryable) {
+                break;
+            }
+            if (producer->config.retry_policy.max_attempts > 0 && attempt >= producer->config.retry_policy.max_attempts) {
+                break;
+            }
+            if (producer->config.retry_policy.total_timeout_ms > 0 && elapsed >= producer->config.retry_policy.total_timeout_ms) {
+                break;
+            }
+            ve_tls_metric_inc_u64(&producer->m_retries_total, 1);
+            ve_tls_metrics_emit(producer, "retry", attempt, err.http_code);
+            int64_t delay = ve_tls_retry_next_interval_ms(&producer->config.retry_policy, attempt);
+            if (producer->config.retry_policy.total_timeout_ms > 0 && elapsed + delay > producer->config.retry_policy.total_timeout_ms) {
+                delay = producer->config.retry_policy.total_timeout_ms - elapsed;
+            }
+            producer->config.platform.sleep_ms(delay);
+        }
+        int64_t total_end = producer->config.platform.time_ms ? producer->config.platform.time_ms() : 0;
+        int64_t total_ms = total_end - start_time;
+        if (total_ms < 0) {
+            total_ms = 0;
+        }
+        if (sent_ok) {
+            ve_tls_metric_inc_u64(&producer->m_bytes_sent_total, send_body_size);
+            ve_tls_metrics_emit(producer, "send_ok", total_ms, send_body_size);
+            ve_tls_send_callbacks cbs = ve_tls_capture_callbacks(producer);
+            if (cbs.cb) {
+                cbs.cb(VE_TLS_OK, task.batch_bytes, send_body_size, err.request_id, NULL, NULL, cbs.cb_param, task.start_id, task.end_id);
+            }
+            if (cbs.cb2) {
+                cbs.cb2(VE_TLS_OK, task.batch_bytes, send_body_size, &err, NULL, cbs.cb2_param, task.start_id, task.end_id);
+            }
+        } else {
+            ve_tls_metric_inc_u64(&producer->m_requests_failed_total, 1);
+            ve_tls_metrics_emit(producer, "send_failed", total_ms, err.http_code);
+            char * msg = ve_tls_error_build_message(&err);
+            ve_tls_send_callbacks cbs = ve_tls_capture_callbacks(producer);
+            if (cbs.cb) {
+                cbs.cb(VE_TLS_DROP_ERROR, task.batch_bytes, send_body_size, err.request_id, msg, NULL, cbs.cb_param, task.start_id, task.end_id);
+            }
+            if (cbs.cb2) {
+                cbs.cb2(VE_TLS_DROP_ERROR, task.batch_bytes, send_body_size, &err, NULL, cbs.cb2_param, task.start_id, task.end_id);
+            }
+            ve_tls_free(msg);
+        }
+        ve_tls_error_free_fields(&err);
+        if (compressed_owned) {
+            ve_tls_bytes_free(&compressed);
+        }
+        ve_tls_send_task_free(&task);
+        (void)__atomic_fetch_sub(&producer->fast_inflight, 1, __ATOMIC_RELAXED);
+    }
+}
+
 void * ve_tls_sender_main(void * arg) {
     ve_tls_producer * producer = (ve_tls_producer *)arg;
+    if (producer && producer->fast_send) {
+        return ve_tls_sender_main_fast(arg);
+    }
     for (;;) {
         ve_tls_send_task task;
         ve_tls_key_queue * kq = NULL;
