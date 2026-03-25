@@ -3111,6 +3111,10 @@ static int test_manager_key_queue_limit_exceeded_drops(void) {
 
 static int g_hdr_done = 0;
 static int g_hdr_ok = 0;
+static int g_hdr_small_done = 0;
+static int g_hdr_small_ok = 0;
+static int g_hdr_order_done = 0;
+static int g_hdr_order_ok = 0;
 
 static int test_http_assert_headers_do(ve_tls_http_client * client, const ve_tls_http_request * req, ve_tls_http_response * resp) {
     (void)client;
@@ -3208,6 +3212,159 @@ static int test_sender_builds_headers_and_http_options(void) {
     }
     ve_tls_producer_destroy(p);
     return g_hdr_ok ? 0 : -1;
+}
+
+static int test_http_assert_small_comp_none_do(ve_tls_http_client * client, const ve_tls_http_request * req, ve_tls_http_response * resp) {
+    (void)client;
+    if (!req || !req->headers || !resp) {
+        g_hdr_small_done = 1;
+        g_hdr_small_ok = 0;
+        return -1;
+    }
+    g_hdr_small_done = 1;
+    if (strstr(req->headers, "x-tls-compresstype: none\n")) {
+        g_hdr_small_ok = 1;
+    } else {
+        g_hdr_small_ok = 0;
+    }
+    resp->status_code = 200;
+    resp->request_id = strdup("rid-small");
+    resp->body = NULL;
+    resp->body_size = 0;
+    return 0;
+}
+
+static int test_sender_small_payload_uses_none_compresstype(void) {
+    g_hdr_small_done = 0;
+    g_hdr_small_ok = 0;
+
+    ve_tls_config cfg;
+    ve_tls_config_init(&cfg);
+    cfg.endpoint = "https://example.com";
+    cfg.region = "cn-beijing";
+    cfg.topic_id = "t";
+    cfg.access_key_id = "ak";
+    cfg.access_key_secret = "sk";
+    cfg.retry_policy.max_attempts = 1;
+    cfg.flush_interval_ms = 0;
+    cfg.log_count_per_package = 1;
+    cfg.compress_type = "lz4";
+    cfg.http_client.do_request = test_http_assert_small_comp_none_do;
+    cfg.http_client.free_response = test_http_free;
+
+    ve_tls_producer * p = ve_tls_producer_create(&cfg);
+    if (!p) return -1;
+
+    ve_tls_kv kvs[1];
+    kvs[0].key = "k";
+    kvs[0].value = "v";
+    if (ve_tls_producer_add_log_kv(p, 0, kvs, 1, 1) != VE_TLS_OK) {
+        ve_tls_producer_destroy(p);
+        return -1;
+    }
+
+    for (int i = 0; i < 200 && !g_hdr_small_done; i++) {
+        cfg.platform.sleep_ms(10);
+    }
+    ve_tls_producer_destroy(p);
+    return g_hdr_small_ok ? 0 : -1;
+}
+
+static int test_sender_small_payload_with_agg_strategy_uses_none_compresstype(void) {
+    g_hdr_small_done = 0;
+    g_hdr_small_ok = 0;
+
+    ve_tls_config cfg;
+    ve_tls_config_init(&cfg);
+    cfg.endpoint = "https://example.com";
+    cfg.region = "cn-beijing";
+    cfg.topic_id = "t";
+    cfg.access_key_id = "ak";
+    cfg.access_key_secret = "sk";
+    cfg.retry_policy.max_attempts = 1;
+    cfg.flush_interval_ms = 0;
+    cfg.log_count_per_package = 1;
+    cfg.compress_type = "lz4";
+    cfg.agg_strategy = 1;
+    cfg.agg_max_compressed_bytes_per_request = 1024;
+    cfg.http_client.do_request = test_http_assert_small_comp_none_do;
+    cfg.http_client.free_response = test_http_free;
+
+    ve_tls_producer * p = ve_tls_producer_create(&cfg);
+    if (!p) return -1;
+
+    ve_tls_kv kvs[1];
+    kvs[0].key = "k";
+    kvs[0].value = "v";
+    if (ve_tls_producer_add_log_kv(p, 0, kvs, 1, 1) != VE_TLS_OK) {
+        ve_tls_producer_destroy(p);
+        return -1;
+    }
+
+    for (int i = 0; i < 200 && !g_hdr_small_done; i++) {
+        cfg.platform.sleep_ms(10);
+    }
+    ve_tls_producer_destroy(p);
+    return g_hdr_small_ok ? 0 : -1;
+}
+
+static int test_http_assert_unsigned_headers_after_auth_do(ve_tls_http_client * client, const ve_tls_http_request * req, ve_tls_http_response * resp) {
+    (void)client;
+    g_hdr_order_done = 1;
+    g_hdr_order_ok = 0;
+    if (!req || !req->headers || !resp) {
+        return -1;
+    }
+    const char * h = req->headers;
+    const char * p_auth = strstr(h, "\nAuthorization: ");
+    if (!p_auth && strstr(h, "Authorization: ") == h) {
+        p_auth = h;
+    }
+    const char * p_count = strstr(h, "\nlog-count:");
+    const char * p_earliest = strstr(h, "\nearliest-log-time:");
+    const char * p_latest = strstr(h, "\nlatest-log-time:");
+    if (p_auth && p_count && p_earliest && p_latest && p_auth < p_count && p_count < p_earliest && p_earliest < p_latest) {
+        g_hdr_order_ok = 1;
+    }
+    resp->status_code = 200;
+    resp->request_id = strdup("rid-order");
+    resp->body = NULL;
+    resp->body_size = 0;
+    return 0;
+}
+
+static int test_sender_unsigned_headers_appended_after_authorization(void) {
+    g_hdr_order_done = 0;
+    g_hdr_order_ok = 0;
+
+    ve_tls_config cfg;
+    ve_tls_config_init(&cfg);
+    cfg.endpoint = "https://example.com";
+    cfg.region = "cn-beijing";
+    cfg.topic_id = "t";
+    cfg.access_key_id = "ak";
+    cfg.access_key_secret = "sk";
+    cfg.retry_policy.max_attempts = 1;
+    cfg.flush_interval_ms = 0;
+    cfg.log_count_per_package = 1;
+    cfg.compress_type = "none";
+    cfg.http_client.do_request = test_http_assert_unsigned_headers_after_auth_do;
+    cfg.http_client.free_response = test_http_free;
+
+    ve_tls_producer * p = ve_tls_producer_create(&cfg);
+    if (!p) return -1;
+    ve_tls_kv kvs[1];
+    kvs[0].key = "k";
+    kvs[0].value = "v";
+    if (ve_tls_producer_add_log_kv(p, 0, kvs, 1, 1) != VE_TLS_OK) {
+        ve_tls_producer_destroy(p);
+        return -1;
+    }
+    for (int i = 0; i < 200 && !g_hdr_order_done; i++) {
+        cfg.platform.sleep_ms(10);
+    }
+    ve_tls_producer_destroy(p);
+    return g_hdr_order_ok ? 0 : -1;
 }
 
 static int g_raw_done = 0;
@@ -6361,6 +6518,183 @@ static int test_sign(void) {
     return ok ? 0 : -1;
 }
 
+static int test_sign_cache_secret_change_same_pointer_effective(void) {
+    const char * headers = "Content-Type: application/x-protobuf\nx-tls-apiversion: " VE_TLS_C_SDK_API_VERSION "\n";
+    unsigned char body[3] = {1,2,3};
+    char sk_buf[32];
+    char * out1 = NULL;
+    char * out2 = NULL;
+    int saw_same_xdate = 0;
+    for (int i = 0; i < 5; i++) {
+        snprintf(sk_buf, sizeof(sk_buf), "sk-one");
+        if (ve_tls_sign_v4_append("ak", sk_buf, "", "cn-beijing", "TLS", "POST", "tls-cn-beijing.volces.com", "/PutLogs", "TopicId=t", body, sizeof(body), headers, &out1) != 0 || !out1) {
+            free(out1);
+            free(out2);
+            return -1;
+        }
+        snprintf(sk_buf, sizeof(sk_buf), "sk-two");
+        if (ve_tls_sign_v4_append("ak", sk_buf, "", "cn-beijing", "TLS", "POST", "tls-cn-beijing.volces.com", "/PutLogs", "TopicId=t", body, sizeof(body), headers, &out2) != 0 || !out2) {
+            free(out1);
+            free(out2);
+            return -1;
+        }
+        const char * d1 = strstr(out1, "X-Date: ");
+        const char * d2 = strstr(out2, "X-Date: ");
+        if (d1 && d2 && strncmp(d1, d2, strlen("X-Date: YYYYMMDDThhmmssZ")) == 0) {
+            saw_same_xdate = 1;
+            break;
+        }
+        free(out1);
+        free(out2);
+        out1 = NULL;
+        out2 = NULL;
+    }
+    if (!saw_same_xdate) {
+        free(out1);
+        free(out2);
+        return -1;
+    }
+    const char * a1 = strstr(out1, "Authorization: ");
+    const char * a2 = strstr(out2, "Authorization: ");
+    int ok = (a1 && a2 && strcmp(a1, a2) != 0);
+    free(out1);
+    free(out2);
+    return ok ? 0 : -1;
+}
+
+static int test_sign_repeated_call_allocation_reduced(void) {
+    ve_tls_alloc_hooks saved;
+    memset(&saved, 0, sizeof(saved));
+    ve_tls_alloc_get_hooks(&saved);
+
+    alloc_select_fail_state st;
+    memset(&st, 0, sizeof(st));
+    set_alloc_select_fail(&st, 0, 0, 0, 0);
+
+    const char * headers = "Content-Type: application/x-protobuf\nx-tls-apiversion: " VE_TLS_C_SDK_API_VERSION "\n";
+    const unsigned char body[3] = {1, 2, 3};
+    char * out1 = NULL;
+    char * out2 = NULL;
+    int rc1 = ve_tls_sign_v4_append("ak", "sk", "tok", "cn-beijing", "TLS", "POST", "example.com", "/PutLogs", "TopicId=t&aa=1&bb=2", body, sizeof(body), headers, &out1);
+    int calls_after_first = st.malloc_calls + st.calloc_calls + st.realloc_calls + st.strdup_calls;
+    int rc2 = ve_tls_sign_v4_append("ak", "sk", "tok", "cn-beijing", "TLS", "POST", "example.com", "/PutLogs", "TopicId=t&aa=1&bb=2", body, sizeof(body), headers, &out2);
+    int calls_after_second = st.malloc_calls + st.calloc_calls + st.realloc_calls + st.strdup_calls;
+
+    ve_tls_alloc_set_hooks(&saved);
+    int ok = (rc1 == 0 && rc2 == 0 &&
+              out1 && out2 &&
+              strstr(out1, "Authorization: ") &&
+              strstr(out2, "Authorization: "));
+    int first_calls = calls_after_first;
+    int second_calls = calls_after_second - calls_after_first;
+    ve_tls_free(out1);
+    ve_tls_free(out2);
+    return (ok && first_calls > 0 && second_calls <= first_calls - 2) ? 0 : -1;
+}
+
+static int test_sign_allocation_budget_tight(void) {
+    ve_tls_alloc_hooks saved;
+    memset(&saved, 0, sizeof(saved));
+    ve_tls_alloc_get_hooks(&saved);
+
+    alloc_select_fail_state st;
+    memset(&st, 0, sizeof(st));
+    set_alloc_select_fail(&st, 0, 0, 0, 0);
+
+    char * out = NULL;
+    int rc = ve_tls_sign_v4_append(
+        "ak",
+        "sk",
+        "tok",
+        "cn-beijing",
+        "TLS",
+        "POST",
+        "example.com",
+        "/PutLogs",
+        "TopicId=tight_budget_probe_key_1",
+        (const unsigned char *)"abc",
+        3,
+        "Content-Type: application/x-protobuf\nx-tls-apiversion: " VE_TLS_C_SDK_API_VERSION "\n",
+        &out
+    );
+
+    ve_tls_alloc_set_hooks(&saved);
+    int ok = 0;
+    if (rc == 0 && out && strstr(out, "Authorization: ") && strstr(out, "X-Date: ")) {
+        ok = 1;
+    }
+    ve_tls_free(out);
+
+    int total_calls = st.malloc_calls + st.calloc_calls + st.realloc_calls + st.strdup_calls;
+    return (ok && total_calls <= 14) ? 0 : -1;
+}
+
+static int test_sign_allocation_budget_multi_query_tight(void) {
+    ve_tls_alloc_hooks saved;
+    memset(&saved, 0, sizeof(saved));
+    ve_tls_alloc_get_hooks(&saved);
+
+    alloc_select_fail_state st;
+    memset(&st, 0, sizeof(st));
+    set_alloc_select_fail(&st, 0, 0, 0, 0);
+
+    char * out = NULL;
+    int rc = ve_tls_sign_v4_append(
+        "ak",
+        "sk",
+        "tok",
+        "cn-beijing",
+        "TLS",
+        "POST",
+        "example.com",
+        "/PutLogs",
+        "TopicId=t&aa=1&bb=2",
+        (const unsigned char *)"abc",
+        3,
+        "Content-Type: application/x-protobuf\nx-tls-apiversion: " VE_TLS_C_SDK_API_VERSION "\n",
+        &out
+    );
+
+    ve_tls_alloc_set_hooks(&saved);
+    int ok = 0;
+    if (rc == 0 && out && strstr(out, "Authorization: ") && strstr(out, "X-Date: ")) {
+        ok = 1;
+    }
+    ve_tls_free(out);
+
+    int total_calls = st.malloc_calls + st.calloc_calls + st.realloc_calls + st.strdup_calls;
+    return (ok && total_calls <= 14) ? 0 : -1;
+}
+
+static int test_sign_repeated_call_allocation_reduced_tight(void) {
+    ve_tls_alloc_hooks saved;
+    memset(&saved, 0, sizeof(saved));
+    ve_tls_alloc_get_hooks(&saved);
+
+    alloc_select_fail_state st;
+    memset(&st, 0, sizeof(st));
+    set_alloc_select_fail(&st, 0, 0, 0, 0);
+
+    const char * headers = "Content-Type: application/x-protobuf\nx-tls-apiversion: " VE_TLS_C_SDK_API_VERSION "\n";
+    const unsigned char body[3] = {1, 2, 3};
+    char * out1 = NULL;
+    char * out2 = NULL;
+    int rc1 = ve_tls_sign_v4_append("ak", "sk", "tok", "cn-beijing", "TLS", "POST", "example.com", "/PutLogs", "TopicId=t&aa=1&bb=2", body, sizeof(body), headers, &out1);
+    int calls_after_first = st.malloc_calls + st.calloc_calls + st.realloc_calls + st.strdup_calls;
+    int rc2 = ve_tls_sign_v4_append("ak", "sk", "tok", "cn-beijing", "TLS", "POST", "example.com", "/PutLogs", "TopicId=t&aa=1&bb=2", body, sizeof(body), headers, &out2);
+    int calls_after_second = st.malloc_calls + st.calloc_calls + st.realloc_calls + st.strdup_calls;
+
+    ve_tls_alloc_set_hooks(&saved);
+    int ok = (rc1 == 0 && rc2 == 0 &&
+              out1 && out2 &&
+              strstr(out1, "Authorization: ") &&
+              strstr(out2, "Authorization: "));
+    int second_calls = calls_after_second - calls_after_first;
+    ve_tls_free(out1);
+    ve_tls_free(out2);
+    return (ok && second_calls <= 4) ? 0 : -1;
+}
+
 #if defined(VE_TLS_HAVE_ZLIB)
 static int test_zlib_compress_roundtrip(void) {
     unsigned char in[8] = {0,1,2,3,4,5,6,7};
@@ -6431,6 +6765,13 @@ int main(void) {
     RUN(66, test_sender_http_rc_minus1_defaults_error());
     RUN(67, test_sender_http_500_sets_badresponse());
     RUN(68, test_sender_unsupported_compress_type_drops_before_http());
+    RUN(39, test_sender_small_payload_uses_none_compresstype());
+    RUN(40, test_sender_small_payload_with_agg_strategy_uses_none_compresstype());
+    RUN(41, test_sender_unsigned_headers_appended_after_authorization());
+    RUN(42, test_sign_repeated_call_allocation_reduced());
+    RUN(43, test_sign_allocation_budget_tight());
+    RUN(44, test_sign_allocation_budget_multi_query_tight());
+    RUN(45, test_sign_repeated_call_allocation_reduced_tight());
     RUN(71, test_sender_build_url_calloc_fail_drops_without_http());
     RUN(72, test_sender_build_headers_realloc_fail_drops_without_http());
     RUN(73, test_sender_sign_realloc_fail_drops_without_http());
@@ -6482,6 +6823,7 @@ int main(void) {
     RUN(14, test_rate_limit_rps_throttles());
     RUN(15, test_circuit_breaker_delays_second_send());
     RUN(16, test_sign());
+    RUN(118, test_sign_cache_secret_change_same_pointer_effective());
     RUN(17, test_send_queue_blocking_push());
     {
         int x = test_dynamic_credentials_refreshes_token();

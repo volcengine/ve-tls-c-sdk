@@ -757,7 +757,30 @@ static ve_tls_send_callbacks ve_tls_capture_callbacks(ve_tls_producer * producer
     return out;
 }
 
-static int ve_tls_send_put_logs(ve_tls_producer * producer, const char * access_key_id, const char * access_key_secret, const char * security_token, const unsigned char * body, size_t body_size, size_t raw_body_size, int32_t log_count, int64_t earliest, int64_t latest, const char * hash_key, ve_tls_error * out_error) {
+#define VE_TLS_SMALL_PAYLOAD_NO_COMPRESS_THRESHOLD 256
+
+static int ve_tls_is_none_compress_type(const char * compress_type) {
+    return (!compress_type || compress_type[0] == 0 || strcasecmp(compress_type, "none") == 0);
+}
+
+static int ve_tls_is_supported_codec(const char * compress_type) {
+    if (!compress_type) {
+        return 0;
+    }
+    return (strcasecmp(compress_type, "lz4") == 0 || strcasecmp(compress_type, "zlib") == 0);
+}
+
+static int ve_tls_should_skip_compress(const char * compress_type, size_t body_size) {
+    if (ve_tls_is_none_compress_type(compress_type)) {
+        return 1;
+    }
+    if (ve_tls_is_supported_codec(compress_type) && body_size <= VE_TLS_SMALL_PAYLOAD_NO_COMPRESS_THRESHOLD) {
+        return 1;
+    }
+    return 0;
+}
+
+static int ve_tls_send_put_logs(ve_tls_producer * producer, const char * access_key_id, const char * access_key_secret, const char * security_token, const char * actual_compress_type, const unsigned char * body, size_t body_size, size_t raw_body_size, int32_t log_count, int64_t earliest, int64_t latest, const char * hash_key, ve_tls_error * out_error) {
     if (out_error) {
         ve_tls_error_free_fields(out_error);
     }
@@ -789,15 +812,12 @@ static int ve_tls_send_put_logs(ve_tls_producer * producer, const char * access_
     snprintf(earliest_s, sizeof(earliest_s), "%lld", (long long)earliest);
     char latest_s[32];
     snprintf(latest_s, sizeof(latest_s), "%lld", (long long)latest);
-    const char * compress_type = cfg->compress_type ? cfg->compress_type : "none";
+    const char * compress_type = actual_compress_type ? actual_compress_type : (cfg->compress_type ? cfg->compress_type : "none");
 
     if (ve_tls_headers_append(&headers, &hlen, &hcap, "Content-Type", "application/x-protobuf") != 0 ||
         ve_tls_headers_append(&headers, &hlen, &hcap, "x-tls-apiversion", cfg->api_version ? cfg->api_version : VE_TLS_C_SDK_API_VERSION) != 0 ||
         ve_tls_headers_append(&headers, &hlen, &hcap, "x-tls-bodyrawsize", raw_size) != 0 ||
-        ve_tls_headers_append(&headers, &hlen, &hcap, "x-tls-compresstype", compress_type) != 0 ||
-        ve_tls_headers_append(&headers, &hlen, &hcap, "log-count", count) != 0 ||
-        ve_tls_headers_append(&headers, &hlen, &hcap, "earliest-log-time", earliest_s) != 0 ||
-        ve_tls_headers_append(&headers, &hlen, &hcap, "latest-log-time", latest_s) != 0) {
+        ve_tls_headers_append(&headers, &hlen, &hcap, "x-tls-compresstype", compress_type) != 0) {
         ve_tls_free(headers);
         ve_tls_error_set_client(out_error, "build headers failed");
         return -1;
@@ -833,6 +853,31 @@ static int ve_tls_send_put_logs(ve_tls_producer * producer, const char * access_
     if (sign_ok != 0) {
         ve_tls_free(headers);
         ve_tls_error_set_client(out_error, "sign request failed");
+        return -1;
+    }
+    size_t signed_len = signed_headers ? strlen(signed_headers) : 0;
+    size_t signed_cap = signed_len + 1;
+    size_t append_need = (strlen("log-count") + 2 + strlen(count) + 1) +
+                         (strlen("earliest-log-time") + 2 + strlen(earliest_s) + 1) +
+                         (strlen("latest-log-time") + 2 + strlen(latest_s) + 1);
+    if (signed_cap <= (size_t)-1 - append_need) {
+        size_t target_cap = signed_cap + append_need;
+        char * grown = (char *)ve_tls_realloc(signed_headers, target_cap);
+        if (!grown) {
+            ve_tls_free(headers);
+            ve_tls_free(signed_headers);
+            ve_tls_error_set_client(out_error, "build headers failed");
+            return -1;
+        }
+        signed_headers = grown;
+        signed_cap = target_cap;
+    }
+    if (ve_tls_headers_append(&signed_headers, &signed_len, &signed_cap, "log-count", count) != 0 ||
+        ve_tls_headers_append(&signed_headers, &signed_len, &signed_cap, "earliest-log-time", earliest_s) != 0 ||
+        ve_tls_headers_append(&signed_headers, &signed_len, &signed_cap, "latest-log-time", latest_s) != 0) {
+        ve_tls_free(headers);
+        ve_tls_free(signed_headers);
+        ve_tls_error_set_client(out_error, "build headers failed");
         return -1;
     }
 
@@ -971,16 +1016,22 @@ have_task: {
     const unsigned char * send_body_data = task.body;
     size_t send_body_size = task.body_size;
     size_t raw_body_size = task.raw_body_size;
+    const char * send_compress_type = producer->config.compress_type ? producer->config.compress_type : "none";
 
     if (task.precompressed && task.precompressed_size > 0) {
         send_body_data = task.precompressed;
         send_body_size = task.precompressed_size;
+    } else if (ve_tls_should_skip_compress(producer->config.compress_type, task.body_size)) {
+        send_compress_type = "none";
     } else {
         int c_rc = ve_tls_compress_apply(producer->config.compress_type, task.body, task.body_size, &compressed);
         if (c_rc == 0 && compressed.data && compressed.size > 0) {
             compressed_owned = 1;
             send_body_data = compressed.data;
             send_body_size = compressed.size;
+            send_compress_type = producer->config.compress_type;
+        } else if (c_rc == -2) {
+            send_compress_type = "none";
         } else if (c_rc == -1 || c_rc == -3) {
             ve_tls_error err;
             memset(&err, 0, sizeof(err));
@@ -1123,7 +1174,7 @@ have_task: {
             err.error_message = ve_tls_strdup("credentials refresh failed");
             break;
         }
-        int rc = ve_tls_send_put_logs(producer, ak, sk, token, send_body_data, send_body_size, raw_body_size, task.log_count, task.earliest, task.latest, task.hash_key, &err);
+        int rc = ve_tls_send_put_logs(producer, ak, sk, token, send_compress_type, send_body_data, send_body_size, raw_body_size, task.log_count, task.earliest, task.latest, task.hash_key, &err);
         ve_tls_owned_credentials_free(&owned_creds);
         int64_t attempt_end = producer->config.platform.time_ms ? producer->config.platform.time_ms() : 0;
         int64_t attempt_ms = attempt_end - attempt_start;
@@ -1223,16 +1274,22 @@ static void * ve_tls_sender_main_fast(void * arg) {
         const unsigned char * send_body_data = task.body;
         size_t send_body_size = task.body_size;
         size_t raw_body_size = task.raw_body_size;
+        const char * send_compress_type = producer->config.compress_type ? producer->config.compress_type : "none";
 
         if (task.precompressed && task.precompressed_size > 0) {
             send_body_data = task.precompressed;
             send_body_size = task.precompressed_size;
+        } else if (ve_tls_should_skip_compress(producer->config.compress_type, task.body_size)) {
+            send_compress_type = "none";
         } else {
             int c_rc = ve_tls_compress_apply(producer->config.compress_type, task.body, task.body_size, &compressed);
             if (c_rc == 0 && compressed.data && compressed.size > 0) {
                 compressed_owned = 1;
                 send_body_data = compressed.data;
                 send_body_size = compressed.size;
+                send_compress_type = producer->config.compress_type;
+            } else if (c_rc == -2) {
+                send_compress_type = "none";
             } else if (c_rc == -1 || c_rc == -3) {
                 ve_tls_error err;
                 memset(&err, 0, sizeof(err));
@@ -1312,7 +1369,7 @@ static void * ve_tls_sender_main_fast(void * arg) {
                 err.error_message = ve_tls_strdup("credentials refresh failed");
                 break;
             }
-            int rc = ve_tls_send_put_logs(producer, ak, sk, token, send_body_data, send_body_size, raw_body_size, task.log_count, task.earliest, task.latest, task.hash_key, &err);
+            int rc = ve_tls_send_put_logs(producer, ak, sk, token, send_compress_type, send_body_data, send_body_size, raw_body_size, task.log_count, task.earliest, task.latest, task.hash_key, &err);
             ve_tls_owned_credentials_free(&owned_creds);
             int64_t attempt_end = producer->config.platform.time_ms ? producer->config.platform.time_ms() : 0;
             int64_t attempt_ms = attempt_end - attempt_start;
@@ -1514,16 +1571,22 @@ next_task:
         const unsigned char * send_body_data = task.body;
         size_t send_body_size = task.body_size;
         size_t raw_body_size = task.raw_body_size;
+        const char * send_compress_type = producer->config.compress_type ? producer->config.compress_type : "none";
 
         if (task.precompressed && task.precompressed_size > 0) {
             send_body_data = task.precompressed;
             send_body_size = task.precompressed_size;
+        } else if (ve_tls_should_skip_compress(producer->config.compress_type, task.body_size)) {
+            send_compress_type = "none";
         } else {
             int c_rc = ve_tls_compress_apply(producer->config.compress_type, task.body, task.body_size, &compressed);
             if (c_rc == 0 && compressed.data && compressed.size > 0) {
                 compressed_owned = 1;
                 send_body_data = compressed.data;
                 send_body_size = compressed.size;
+                send_compress_type = producer->config.compress_type;
+            } else if (c_rc == -2) {
+                send_compress_type = "none";
             } else if (c_rc == -1 || c_rc == -3) {
                 ve_tls_error err;
                 memset(&err, 0, sizeof(err));
@@ -1657,7 +1720,7 @@ next_task:
                 err.error_message = ve_tls_strdup("credentials refresh failed");
                 break;
             }
-            int rc = ve_tls_send_put_logs(producer, ak, sk, token, send_body_data, send_body_size, raw_body_size, task.log_count, task.earliest, task.latest, task.hash_key, &err);
+            int rc = ve_tls_send_put_logs(producer, ak, sk, token, send_compress_type, send_body_data, send_body_size, raw_body_size, task.log_count, task.earliest, task.latest, task.hash_key, &err);
             ve_tls_owned_credentials_free(&owned_creds);
             int64_t attempt_end = producer->config.platform.time_ms ? producer->config.platform.time_ms() : 0;
             int64_t attempt_ms = attempt_end - attempt_start;

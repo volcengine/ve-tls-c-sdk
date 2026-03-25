@@ -8,6 +8,18 @@
 #include <ctype.h>
 #include <time.h>
 #include <stdio.h>
+#include <stdint.h>
+
+#if defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 201112L)
+#define VE_TLS_THREAD_LOCAL _Thread_local
+#define VE_TLS_HAVE_THREAD_LOCAL 1
+#elif defined(__GNUC__) || defined(__clang__)
+#define VE_TLS_THREAD_LOCAL __thread
+#define VE_TLS_HAVE_THREAD_LOCAL 1
+#else
+#define VE_TLS_THREAD_LOCAL
+#define VE_TLS_HAVE_THREAD_LOCAL 0
+#endif
 
 typedef struct {
     char * key;
@@ -85,54 +97,6 @@ static int ve_tls_buf_reserve(char ** buf, size_t * cap, size_t required) {
     *buf = p;
     *cap = next;
     return 0;
-}
-
-static char * ve_tls_dup_trim_span(const char * s, size_t n) {
-    if (!s) {
-        return NULL;
-    }
-    size_t begin = 0;
-    size_t end = n;
-    while (begin < end && isspace((unsigned char)s[begin])) {
-        begin++;
-    }
-    while (end > begin && isspace((unsigned char)s[end - 1])) {
-        end--;
-    }
-    size_t out_len = end - begin;
-    char * out = (char *)ve_tls_malloc(out_len + 1);
-    if (!out) {
-        return NULL;
-    }
-    if (out_len > 0) {
-        memcpy(out, s + begin, out_len);
-    }
-    out[out_len] = 0;
-    return out;
-}
-
-static char * ve_tls_lower_dup_trim_span(const char * s, size_t n) {
-    if (!s) {
-        return NULL;
-    }
-    size_t begin = 0;
-    size_t end = n;
-    while (begin < end && isspace((unsigned char)s[begin])) {
-        begin++;
-    }
-    while (end > begin && isspace((unsigned char)s[end - 1])) {
-        end--;
-    }
-    size_t out_len = end - begin;
-    char * out = (char *)ve_tls_malloc(out_len + 1);
-    if (!out) {
-        return NULL;
-    }
-    for (size_t i = 0; i < out_len; i++) {
-        out[i] = (char)tolower((unsigned char)s[begin + i]);
-    }
-    out[out_len] = 0;
-    return out;
 }
 
 static int ve_tls_should_escape(unsigned char c) {
@@ -219,9 +183,71 @@ static int ve_tls_pair_cmp(const void * a, const void * b) {
     return strcmp(pa->value, pb->value);
 }
 
+static void ve_tls_pair_sort(ve_tls_kv_pair * pairs, size_t len) {
+    if (!pairs || len <= 1) {
+        return;
+    }
+    if (len <= 16) {
+        for (size_t i = 1; i < len; i++) {
+            ve_tls_kv_pair cur = pairs[i];
+            size_t j = i;
+            while (j > 0) {
+                int c = strcmp(pairs[j - 1].key, cur.key);
+                if (c == 0) {
+                    c = strcmp(pairs[j - 1].value, cur.value);
+                }
+                if (c <= 0) {
+                    break;
+                }
+                pairs[j] = pairs[j - 1];
+                j--;
+            }
+            pairs[j] = cur;
+        }
+        return;
+    }
+    qsort(pairs, len, sizeof(ve_tls_kv_pair), ve_tls_pair_cmp);
+}
+
 static char * ve_tls_norm_query(const char * query) {
     if (!query || query[0] == 0) {
         return ve_tls_strdup("");
+    }
+    const char * amp_first = strchr(query, '&');
+    if (!amp_first) {
+        size_t qlen = strlen(query);
+        const char * eq = memchr(query, '=', qlen);
+        size_t k_len = eq ? (size_t)(eq - query) : qlen;
+        size_t v_len = eq ? (size_t)(qlen - k_len - 1) : 0;
+        int needs_escape = 0;
+        for (size_t i = 0; i < k_len; i++) {
+            if (ve_tls_should_escape((unsigned char)query[i])) {
+                needs_escape = 1;
+                break;
+            }
+        }
+        if (!needs_escape) {
+            const char * v = eq ? (eq + 1) : (query + qlen);
+            for (size_t i = 0; i < v_len; i++) {
+                if (ve_tls_should_escape((unsigned char)v[i])) {
+                    needs_escape = 1;
+                    break;
+                }
+            }
+        }
+        if (!needs_escape) {
+            if (eq) {
+                return ve_tls_strdup(query);
+            }
+            char * out = (char *)ve_tls_malloc(qlen + 2);
+            if (!out) {
+                return NULL;
+            }
+            memcpy(out, query, qlen);
+            out[qlen] = '=';
+            out[qlen + 1] = 0;
+            return out;
+        }
     }
     ve_tls_kv_pair * pairs = NULL;
     size_t cap = 0;
@@ -269,7 +295,7 @@ static char * ve_tls_norm_query(const char * query) {
         len++;
         p = amp ? (amp + 1) : end;
     }
-    qsort(pairs, len, sizeof(ve_tls_kv_pair), ve_tls_pair_cmp);
+    ve_tls_pair_sort(pairs, len);
     char * out = NULL;
     size_t out_len = 0;
     size_t out_cap = 0;
@@ -295,59 +321,183 @@ static char * ve_tls_norm_query(const char * query) {
     return out;
 }
 
-static int ve_tls_parse_headers(const char * headers, ve_tls_kv_pair ** out_pairs, size_t * out_len) {
+static int ve_tls_norm_path_query_for_sign(const char * path, const char * query, const char ** out_uri, const char ** out_query, int * out_owned) {
+    if (!out_uri || !out_query || !out_owned) {
+        return -1;
+    }
+    *out_uri = NULL;
+    *out_query = NULL;
+    *out_owned = 0;
+
+    const char * path_in = path ? path : "";
+    const char * query_in = query ? query : "";
+#if VE_TLS_HAVE_THREAD_LOCAL
+    enum {
+        VE_TLS_SIGN_PATH_CACHE_MAX = 128,
+        VE_TLS_SIGN_QUERY_CACHE_MAX = 512,
+        VE_TLS_SIGN_URI_CACHE_MAX = 256,
+        VE_TLS_SIGN_NQUERY_CACHE_MAX = 1024
+    };
+    typedef struct {
+        int valid;
+        char path[VE_TLS_SIGN_PATH_CACHE_MAX];
+        char query[VE_TLS_SIGN_QUERY_CACHE_MAX];
+        char norm_uri[VE_TLS_SIGN_URI_CACHE_MAX];
+        char norm_query[VE_TLS_SIGN_NQUERY_CACHE_MAX];
+    } ve_tls_sign_norm_cache;
+    static VE_TLS_THREAD_LOCAL ve_tls_sign_norm_cache cache;
+
+    if (cache.valid &&
+        strcmp(cache.path, path_in) == 0 &&
+        strcmp(cache.query, query_in) == 0) {
+        *out_uri = cache.norm_uri;
+        *out_query = cache.norm_query;
+        *out_owned = 0;
+        return 0;
+    }
+#endif
+
+    char * norm_uri = ve_tls_norm_uri(path);
+    char * norm_query = ve_tls_norm_query(query);
+    if (!norm_uri || !norm_query) {
+        ve_tls_free(norm_uri);
+        ve_tls_free(norm_query);
+        return -1;
+    }
+
+#if VE_TLS_HAVE_THREAD_LOCAL
+    size_t path_len = strlen(path_in);
+    size_t query_len = strlen(query_in);
+    size_t uri_len = strlen(norm_uri);
+    size_t nquery_len = strlen(norm_query);
+    if (path_len + 1 <= VE_TLS_SIGN_PATH_CACHE_MAX &&
+        query_len + 1 <= VE_TLS_SIGN_QUERY_CACHE_MAX &&
+        uri_len + 1 <= VE_TLS_SIGN_URI_CACHE_MAX &&
+        nquery_len + 1 <= VE_TLS_SIGN_NQUERY_CACHE_MAX) {
+        memcpy(cache.path, path_in, path_len + 1);
+        memcpy(cache.query, query_in, query_len + 1);
+        memcpy(cache.norm_uri, norm_uri, uri_len + 1);
+        memcpy(cache.norm_query, norm_query, nquery_len + 1);
+        cache.valid = 1;
+        ve_tls_free(norm_uri);
+        ve_tls_free(norm_query);
+        *out_uri = cache.norm_uri;
+        *out_query = cache.norm_query;
+        *out_owned = 0;
+        return 0;
+    }
+#endif
+
+    *out_uri = norm_uri;
+    *out_query = norm_query;
+    *out_owned = 1;
+    return 0;
+}
+
+static int ve_tls_parse_headers(const char * headers, ve_tls_kv_pair ** out_pairs, size_t * out_len, char ** out_arena, size_t reserve_pairs) {
+    if (!out_pairs || !out_len || !out_arena) {
+        return -1;
+    }
     *out_pairs = NULL;
     *out_len = 0;
+    *out_arena = NULL;
     if (!headers || headers[0] == 0) {
         return 0;
     }
-    ve_tls_kv_pair * pairs = NULL;
-    size_t cap = 0;
-    size_t len = 0;
+
+    size_t pair_count = 0;
+    size_t arena_need = 0;
     const char * p = headers;
     while (*p) {
         const char * nl = strchr(p, '\n');
         const char * end = nl ? nl : (p + strlen(p));
         const char * colon = memchr(p, ':', (size_t)(end - p));
         if (colon) {
-            size_t k_len = (size_t)(colon - p);
-            size_t v_len = (size_t)(end - (colon + 1));
-            char * k = ve_tls_lower_dup_trim_span(p, k_len);
-            char * v = ve_tls_dup_trim_span(colon + 1, v_len);
-            if (!k || !v) {
-                ve_tls_free(k);
-                ve_tls_free(v);
-                for (size_t i = 0; i < len; i++) {
-                    ve_tls_pair_free(&pairs[i]);
-                }
-                ve_tls_free(pairs);
+            const char * kb = p;
+            const char * ke = colon;
+            const char * vb = colon + 1;
+            const char * ve = end;
+            while (kb < ke && isspace((unsigned char)(*kb))) kb++;
+            while (ke > kb && isspace((unsigned char)(*(ke - 1)))) ke--;
+            while (vb < ve && isspace((unsigned char)(*vb))) vb++;
+            while (ve > vb && isspace((unsigned char)(*(ve - 1)))) ve--;
+            size_t k_len = (size_t)(ke - kb);
+            size_t v_len = (size_t)(ve - vb);
+            if (arena_need > (size_t)-1 - (k_len + 1) || arena_need + k_len + 1 > (size_t)-1 - (v_len + 1)) {
                 return -1;
             }
-            if (len + 1 > cap) {
-                size_t next = cap ? cap * 2 : 16;
-                ve_tls_kv_pair * np = (ve_tls_kv_pair *)ve_tls_realloc(pairs, next * sizeof(ve_tls_kv_pair));
-                if (!np) {
-                    ve_tls_free(k);
-                    ve_tls_free(v);
-                    for (size_t i = 0; i < len; i++) {
-                        ve_tls_pair_free(&pairs[i]);
-                    }
-                    ve_tls_free(pairs);
-                    return -1;
-                }
-                pairs = np;
-                cap = next;
-            }
-            pairs[len].key = k;
-            pairs[len].value = v;
-            pairs[len].own_key = 1;
-            pairs[len].own_value = 1;
-            len++;
+            arena_need += k_len + 1 + v_len + 1;
+            pair_count++;
         }
         p = nl ? (nl + 1) : end;
     }
+    if (pair_count == 0 && reserve_pairs == 0) {
+        return 0;
+    }
+
+    if (pair_count > (size_t)-1 - reserve_pairs) {
+        return -1;
+    }
+    size_t slot_count = pair_count + reserve_pairs;
+    if (slot_count > (size_t)-1 / sizeof(ve_tls_kv_pair)) {
+        return -1;
+    }
+    size_t pair_bytes = slot_count * sizeof(ve_tls_kv_pair);
+    size_t arena_bytes = arena_need > 0 ? arena_need : 1;
+    if (pair_bytes > (size_t)-1 - arena_bytes) {
+        return -1;
+    }
+    unsigned char * block = (unsigned char *)ve_tls_malloc(pair_bytes + arena_bytes);
+    if (!block) {
+        return -1;
+    }
+    ve_tls_kv_pair * pairs = (ve_tls_kv_pair *)block;
+    memset(pairs, 0, pair_bytes);
+    char * arena = (char *)(block + pair_bytes);
+
+    size_t idx = 0;
+    char * dst = arena;
+    p = headers;
+    while (*p) {
+        const char * nl = strchr(p, '\n');
+        const char * end = nl ? nl : (p + strlen(p));
+        const char * colon = memchr(p, ':', (size_t)(end - p));
+        if (colon) {
+            const char * kb = p;
+            const char * ke = colon;
+            const char * vb = colon + 1;
+            const char * ve = end;
+            while (kb < ke && isspace((unsigned char)(*kb))) kb++;
+            while (ke > kb && isspace((unsigned char)(*(ke - 1)))) ke--;
+            while (vb < ve && isspace((unsigned char)(*vb))) vb++;
+            while (ve > vb && isspace((unsigned char)(*(ve - 1)))) ve--;
+            size_t k_len = (size_t)(ke - kb);
+            size_t v_len = (size_t)(ve - vb);
+
+            pairs[idx].key = dst;
+            for (size_t i = 0; i < k_len; i++) {
+                dst[i] = (char)tolower((unsigned char)kb[i]);
+            }
+            dst[k_len] = 0;
+            dst += k_len + 1;
+
+            pairs[idx].value = dst;
+            if (v_len > 0) {
+                memcpy(dst, vb, v_len);
+            }
+            dst[v_len] = 0;
+            dst += v_len + 1;
+
+            pairs[idx].own_key = 0;
+            pairs[idx].own_value = 0;
+            idx++;
+        }
+        p = nl ? (nl + 1) : end;
+    }
+
     *out_pairs = pairs;
-    *out_len = len;
+    *out_len = idx;
+    *out_arena = NULL;
     return 0;
 }
 
@@ -371,10 +521,24 @@ static int ve_tls_header_signable(const char * key_lower) {
 }
 
 static void ve_tls_format_xdate(char out[17]) {
+#if VE_TLS_HAVE_THREAD_LOCAL
+    static VE_TLS_THREAD_LOCAL time_t cached_sec = (time_t)-1;
+    static VE_TLS_THREAD_LOCAL char cached_xdate[17];
+#endif
     time_t t = time(NULL);
+#if VE_TLS_HAVE_THREAD_LOCAL
+    if (cached_sec == t && cached_xdate[0] != 0) {
+        memcpy(out, cached_xdate, 17);
+        return;
+    }
+#endif
     struct tm tmv;
     gmtime_r(&t, &tmv);
     strftime(out, 17, "%Y%m%dT%H%M%SZ", &tmv);
+#if VE_TLS_HAVE_THREAD_LOCAL
+    cached_sec = t;
+    memcpy(cached_xdate, out, 17);
+#endif
 }
 
 static void ve_tls_format_date(char out[9], const char xdate[17]) {
@@ -383,9 +547,7 @@ static void ve_tls_format_date(char out[9], const char xdate[17]) {
 }
 
 static int ve_tls_build_canonical_headers(ve_tls_kv_pair * pairs, size_t pair_len, char ** out_canon, char ** out_signed_headers) {
-    if (pair_len > 1) {
-        qsort(pairs, pair_len, sizeof(ve_tls_kv_pair), ve_tls_pair_cmp);
-    }
+    ve_tls_pair_sort(pairs, pair_len);
     char * canon = NULL;
     size_t canon_len = 0;
     size_t canon_cap = 0;
@@ -473,6 +635,87 @@ static int ve_tls_signing_key(const char * sk, const char * date8, const char * 
     return 0;
 }
 
+static uint64_t ve_tls_fnv1a64(const char * s) {
+    uint64_t h = 1469598103934665603ULL;
+    if (!s) {
+        return h;
+    }
+    for (const unsigned char * p = (const unsigned char *)s; *p; p++) {
+        h ^= (uint64_t)(*p);
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+static void ve_tls_signing_key_cached(const char * sk, const char * date8, const char * region, const char * service, unsigned char out32[32]) {
+#if VE_TLS_HAVE_THREAD_LOCAL
+#define VE_TLS_SK_INLINE_CACHE_MAX 96
+    typedef struct {
+        int valid;
+        char date8[9];
+        uint64_t region_sig;
+        uint64_t service_sig;
+        size_t sk_len;
+        int sk_use_digest;
+        char sk_inline[VE_TLS_SK_INLINE_CACHE_MAX];
+        unsigned char sk_digest[32];
+        unsigned char key[32];
+    } ve_tls_signing_key_cache;
+    static VE_TLS_THREAD_LOCAL ve_tls_signing_key_cache cache;
+
+    size_t sk_len = strlen(sk);
+    unsigned char sk_digest[32];
+    int sk_digest_ready = 0;
+    uint64_t region_sig = ve_tls_fnv1a64(region);
+    uint64_t service_sig = ve_tls_fnv1a64(service);
+    if (cache.valid &&
+        memcmp(cache.date8, date8, 9) == 0 &&
+        cache.region_sig == region_sig &&
+        cache.service_sig == service_sig &&
+        cache.sk_len == sk_len) {
+        int sk_match = 0;
+        if (!cache.sk_use_digest) {
+            if (sk_len <= VE_TLS_SK_INLINE_CACHE_MAX &&
+                memcmp(cache.sk_inline, sk, sk_len) == 0) {
+                sk_match = 1;
+            }
+        } else {
+            ve_tls_sha256((const unsigned char *)sk, sk_len, sk_digest);
+            sk_digest_ready = 1;
+            if (memcmp(cache.sk_digest, sk_digest, 32) == 0) {
+                sk_match = 1;
+            }
+        }
+        if (sk_match) {
+            memcpy(out32, cache.key, 32);
+            return;
+        }
+    }
+    ve_tls_signing_key(sk, date8, region, service, out32);
+    cache.valid = 1;
+    memcpy(cache.date8, date8, 9);
+    cache.region_sig = region_sig;
+    cache.service_sig = service_sig;
+    cache.sk_len = sk_len;
+    if (sk_len <= VE_TLS_SK_INLINE_CACHE_MAX) {
+        cache.sk_use_digest = 0;
+        if (sk_len > 0) {
+            memcpy(cache.sk_inline, sk, sk_len);
+        }
+    } else {
+        if (!sk_digest_ready) {
+            ve_tls_sha256((const unsigned char *)sk, sk_len, sk_digest);
+        }
+        cache.sk_use_digest = 1;
+        memcpy(cache.sk_digest, sk_digest, 32);
+    }
+    memcpy(cache.key, out32, 32);
+#undef VE_TLS_SK_INLINE_CACHE_MAX
+#else
+    ve_tls_signing_key(sk, date8, region, service, out32);
+#endif
+}
+
 int ve_tls_sign_v4_append(
     const char * access_key_id,
     const char * access_key_secret,
@@ -499,19 +742,11 @@ int ve_tls_sign_v4_append(
 
     ve_tls_kv_pair * pairs = NULL;
     size_t pair_len = 0;
-    if (ve_tls_parse_headers(headers_in, &pairs, &pair_len) != 0) {
+    char * parsed_headers_arena = NULL;
+    if (ve_tls_parse_headers(headers_in, &pairs, &pair_len, &parsed_headers_arena, 4) != 0) {
         return -1;
     }
 
-    ve_tls_kv_pair * np = (ve_tls_kv_pair *)ve_tls_realloc(pairs, (pair_len + 4) * sizeof(ve_tls_kv_pair));
-    if (!np) {
-        for (size_t i = 0; i < pair_len; i++) {
-            ve_tls_pair_free(&pairs[i]);
-        }
-        ve_tls_free(pairs);
-        return -1;
-    }
-    pairs = np;
     pairs[pair_len].key = "host";
     pairs[pair_len].value = (char *)host;
     pairs[pair_len].own_key = 0;
@@ -547,45 +782,63 @@ int ve_tls_sign_v4_append(
             ve_tls_pair_free(&pairs[i]);
         }
         ve_tls_free(pairs);
+        ve_tls_free(parsed_headers_arena);
         return -1;
     }
 
-    char * norm_uri = ve_tls_norm_uri(path);
-    char * norm_query = ve_tls_norm_query(query);
-    if (!norm_uri || !norm_query) {
-        ve_tls_free(norm_uri);
-        ve_tls_free(norm_query);
+    const char * norm_uri = NULL;
+    const char * norm_query = NULL;
+    int norm_owned = 0;
+    if (ve_tls_norm_path_query_for_sign(path, query, &norm_uri, &norm_query, &norm_owned) != 0) {
         ve_tls_free(canon_headers);
         ve_tls_free(signed_headers);
         for (size_t i = 0; i < pair_len; i++) {
             ve_tls_pair_free(&pairs[i]);
         }
         ve_tls_free(pairs);
+        ve_tls_free(parsed_headers_arena);
         return -1;
     }
 
-    char * canon_req = NULL;
-    size_t cr_len = 0;
-    size_t cr_cap = 0;
-    size_t canon_req_need = strlen(method) + strlen(norm_uri) + strlen(norm_query) + strlen(canon_headers) + strlen(signed_headers) + strlen(payload_hash_hex) + 6;
-    if (ve_tls_buf_reserve(&canon_req, &cr_cap, canon_req_need + 1) != 0 ||
-        ve_tls_buf_append(&canon_req, &cr_len, &cr_cap, method) != 0 ||
-        ve_tls_buf_append(&canon_req, &cr_len, &cr_cap, "\n") != 0 ||
-        ve_tls_buf_append(&canon_req, &cr_len, &cr_cap, norm_uri) != 0 ||
-        ve_tls_buf_append(&canon_req, &cr_len, &cr_cap, "\n") != 0 ||
-        ve_tls_buf_append(&canon_req, &cr_len, &cr_cap, norm_query) != 0 ||
-        ve_tls_buf_append(&canon_req, &cr_len, &cr_cap, "\n") != 0 ||
-        ve_tls_buf_append(&canon_req, &cr_len, &cr_cap, canon_headers) != 0 ||
-        ve_tls_buf_append(&canon_req, &cr_len, &cr_cap, "\n") != 0 ||
-        ve_tls_buf_append(&canon_req, &cr_len, &cr_cap, signed_headers) != 0 ||
-        ve_tls_buf_append(&canon_req, &cr_len, &cr_cap, "\n") != 0 ||
-        ve_tls_buf_append(&canon_req, &cr_len, &cr_cap, payload_hash_hex) != 0) {
-        ve_tls_free(canon_req);
+    size_t method_n = strlen(method);
+    size_t norm_uri_n = strlen(norm_uri);
+    size_t norm_query_n = strlen(norm_query);
+    size_t canon_headers_n = strlen(canon_headers);
+    size_t signed_headers_n = strlen(signed_headers);
+    size_t payload_hash_n = strlen(payload_hash_hex);
+    size_t canon_req_need = method_n + norm_uri_n + norm_query_n + canon_headers_n + signed_headers_n + payload_hash_n + 6;
+
+    char canon_req_stack[1024];
+    char * canon_req = canon_req_stack;
+    int canon_req_heap = 0;
+    if (canon_req_need > (size_t)-1 - 1) {
         canon_req = NULL;
+    } else if (canon_req_need + 1 > sizeof(canon_req_stack)) {
+        canon_req = (char *)ve_tls_malloc(canon_req_need + 1);
+        if (canon_req) {
+            canon_req_heap = 1;
+        }
+    }
+    if (canon_req) {
+        char * wp = canon_req;
+        memcpy(wp, method, method_n); wp += method_n;
+        *wp++ = '\n';
+        memcpy(wp, norm_uri, norm_uri_n); wp += norm_uri_n;
+        *wp++ = '\n';
+        memcpy(wp, norm_query, norm_query_n); wp += norm_query_n;
+        *wp++ = '\n';
+        memcpy(wp, canon_headers, canon_headers_n); wp += canon_headers_n;
+        *wp++ = '\n';
+        memcpy(wp, signed_headers, signed_headers_n); wp += signed_headers_n;
+        *wp++ = '\n';
+        memcpy(wp, payload_hash_hex, payload_hash_n); wp += payload_hash_n;
+        *wp = 0;
     }
 
-    ve_tls_free(norm_uri);
-    ve_tls_free(norm_query);
+    if (norm_owned) {
+        ve_tls_free((void *)norm_uri);
+        ve_tls_free((void *)norm_query);
+    }
 
     if (!canon_req) {
         ve_tls_free(canon_headers);
@@ -594,12 +847,15 @@ int ve_tls_sign_v4_append(
             ve_tls_pair_free(&pairs[i]);
         }
         ve_tls_free(pairs);
+        ve_tls_free(parsed_headers_arena);
         return -1;
     }
 
     char canon_req_hash_hex[65];
-    ve_tls_sha256_hex_buf((const unsigned char *)canon_req, strlen(canon_req), canon_req_hash_hex);
-    ve_tls_free(canon_req);
+    ve_tls_sha256_hex_buf((const unsigned char *)canon_req, canon_req_need, canon_req_hash_hex);
+    if (canon_req_heap) {
+        ve_tls_free(canon_req);
+    }
 
     char scope[256];
     int scope_n = snprintf(scope, sizeof(scope), "%s/%s/%s/request", date8, region, service);
@@ -610,6 +866,7 @@ int ve_tls_sign_v4_append(
             ve_tls_pair_free(&pairs[i]);
         }
         ve_tls_free(pairs);
+        ve_tls_free(parsed_headers_arena);
         return -1;
     }
 
@@ -622,11 +879,12 @@ int ve_tls_sign_v4_append(
             ve_tls_pair_free(&pairs[i]);
         }
         ve_tls_free(pairs);
+        ve_tls_free(parsed_headers_arena);
         return -1;
     }
 
     unsigned char signing_key[32];
-    ve_tls_signing_key(access_key_secret, date8, region, service, signing_key);
+    ve_tls_signing_key_cached(access_key_secret, date8, region, service, signing_key);
     char signature_hex[65];
     ve_tls_hmac_hex_buf(signing_key, 32, (const unsigned char *)sts, (size_t)sts_n, signature_hex);
     int rc = -1;
@@ -697,5 +955,6 @@ cleanup:
         ve_tls_pair_free(&pairs[i]);
     }
     ve_tls_free(pairs);
+    ve_tls_free(parsed_headers_arena);
     return rc;
 }
