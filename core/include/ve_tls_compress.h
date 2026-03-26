@@ -6,5 +6,6 @@
 #include "ve_tls_proto.h"
 
 int ve_tls_compress_apply(const char * compress_type, const unsigned char * in, size_t in_size, ve_tls_bytes * out);
+int ve_tls_compress_apply_to_buffer(const char * compress_type, const unsigned char * in, size_t in_size, unsigned char * out, size_t out_cap, size_t * out_size);
 
 #endif

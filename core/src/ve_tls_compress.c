@@ -136,3 +136,69 @@ int ve_tls_compress_apply(const char * compress_type, const unsigned char * in, 
 
     return -3;
 }
+
+int ve_tls_compress_apply_to_buffer(const char * compress_type, const unsigned char * in, size_t in_size, unsigned char * out, size_t out_cap, size_t * out_size) {
+    if (!out_size) {
+        return -1;
+    }
+    *out_size = 0;
+    if (!compress_type || ve_tls_str_ieq(compress_type, "none")) {
+        return -2;
+    }
+    if (!in || in_size == 0 || !out || out_cap == 0) {
+        return -1;
+    }
+
+    if (ve_tls_str_ieq(compress_type, "zlib")) {
+#if defined(VE_TLS_HAVE_ZLIB)
+        if (in_size > (size_t)UINT_MAX || out_cap > (size_t)UINT_MAX) {
+            return -1;
+        }
+        z_stream strm;
+        memset(&strm, 0, sizeof(strm));
+        strm.zalloc = ve_tls_zlib_alloc;
+        strm.zfree = ve_tls_zlib_free;
+        strm.opaque = NULL;
+        int rc = deflateInit(&strm, Z_DEFAULT_COMPRESSION);
+        if (rc != Z_OK) {
+            deflateEnd(&strm);
+            return -1;
+        }
+        strm.next_in = (Bytef *)in;
+        strm.avail_in = (uInt)in_size;
+        strm.next_out = (Bytef *)out;
+        strm.avail_out = (uInt)out_cap;
+        rc = deflate(&strm, Z_FINISH);
+        if (rc == Z_STREAM_END) {
+            *out_size = (size_t)strm.total_out;
+            deflateEnd(&strm);
+            return 0;
+        }
+        deflateEnd(&strm);
+        if (rc == Z_OK || rc == Z_BUF_ERROR) {
+            return -4;
+        }
+        return -1;
+#else
+        return -3;
+#endif
+    }
+
+    if (ve_tls_str_ieq(compress_type, "lz4")) {
+#if defined(VE_TLS_HAVE_LZ4)
+        if (in_size > (size_t)INT_MAX || out_cap > (size_t)INT_MAX) {
+            return -1;
+        }
+        int n = LZ4_compress_default((const char *)in, (char *)out, (int)in_size, (int)out_cap);
+        if (n <= 0) {
+            return -4;
+        }
+        *out_size = (size_t)n;
+        return 0;
+#else
+        return -3;
+#endif
+    }
+
+    return -3;
+}

@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <stdint.h>
 #include <limits.h>
 
@@ -51,9 +52,81 @@ static int parse_i64(const char * s, int64_t * out) {
     return 0;
 }
 
+typedef enum {
+    WRITE_MODE_KV = 0,
+    WRITE_MODE_RAW = 1,
+    WRITE_MODE_TEMPLATE = 2
+} write_mode_t;
+
+static int parse_write_mode(const char * s, write_mode_t * out) {
+    if (!s || !out) return -1;
+    if (strcmp(s, "kv") == 0) {
+        *out = WRITE_MODE_KV;
+        return 0;
+    }
+    if (strcmp(s, "raw") == 0) {
+        *out = WRITE_MODE_RAW;
+        return 0;
+    }
+    if (strcmp(s, "template") == 0) {
+        *out = WRITE_MODE_TEMPLATE;
+        return 0;
+    }
+    return -1;
+}
+
+static const char * write_mode_str(write_mode_t mode) {
+    if (mode == WRITE_MODE_RAW) return "raw";
+    if (mode == WRITE_MODE_TEMPLATE) return "template";
+    return "kv";
+}
+
+static int parse_queue_full_policy(const char * s, ve_tls_send_queue_full_policy * out) {
+    if (!s || !out) return -1;
+    if (strcasecmp(s, "block") == 0) {
+        *out = VE_TLS_SEND_QUEUE_FULL_BLOCK;
+        return 0;
+    }
+    if (strcasecmp(s, "drop") == 0) {
+        *out = VE_TLS_SEND_QUEUE_FULL_DROP;
+        return 0;
+    }
+    if (strcasecmp(s, "drop_sampled") == 0 || strcasecmp(s, "drop-sampled") == 0) {
+        *out = VE_TLS_SEND_QUEUE_FULL_DROP_SAMPLED;
+        return 0;
+    }
+    return -1;
+}
+
+static const char * queue_full_policy_str(ve_tls_send_queue_full_policy p) {
+    if (p == VE_TLS_SEND_QUEUE_FULL_DROP) return "drop";
+    if (p == VE_TLS_SEND_QUEUE_FULL_DROP_SAMPLED) return "drop_sampled";
+    return "block";
+}
+
+static int32_t estimate_p99_upper_ms(const ve_tls_metrics * m) {
+    if (!m) return 0;
+    uint64_t total = 0;
+    for (size_t i = 0; i < 8; i++) {
+        total += m->request_latency_buckets[i];
+    }
+    if (total == 0) return 0;
+    uint64_t target = (total * 99 + 99) / 100;
+    uint64_t cum = 0;
+    static const int32_t upper[8] = {5, 10, 50, 100, 300, 1000, 3000, 3001};
+    for (size_t i = 0; i < 8; i++) {
+        cum += m->request_latency_buckets[i];
+        if (cum >= target) {
+            return upper[i];
+        }
+    }
+    return 3001;
+}
+
 static void usage(const char * argv0) {
     fprintf(stderr, "usage: %s [--duration-s S] [--rate-lps N] [--message-bytes N] [--writer-threads N] [--flush-every-n N] [--close-timeout-ms N] [--use-global-env 0|1] [--global-senders N]\n", argv0 ? argv0 : "ve_tls_bench");
-    fprintf(stderr, "optional: [--send-thread-count N] [--compress-type none|lz4|zlib] [--max-buffer-bytes N] [--send-queue-size N] [--flush-interval-ms N] [--log-count-per-package N]\n");
+    fprintf(stderr, "optional: [--write-mode raw|kv|template] [--template-mode on|off] [--send-thread-count N] [--compress-type none|lz4|zlib]\n");
+    fprintf(stderr, "optional: [--queue-full-policy block|drop|drop_sampled] [--send-queue-block-timeout-ms N] [--max-buffer-bytes N] [--send-queue-size N] [--flush-interval-ms N] [--log-count-per-package N]\n");
 }
 
 static uint64_t g_sent = 0;
@@ -61,9 +134,15 @@ static uint64_t g_seq = 0;
 
 typedef struct {
     ve_tls_producer * producer;
+    ve_tls_log_template * tpl;
     ve_tls_platform * platform;
     int32_t rate_lps;
     int32_t flush_every_n;
+    write_mode_t write_mode;
+    const char * value;
+    size_t value_len;
+    const char * raw;
+    size_t raw_len;
     ve_tls_kv * kvs;
     int64_t end_ms;
 } writer_ctx;
@@ -87,7 +166,18 @@ static void * writer_main(void * arg) {
         }
         uint64_t seq = __atomic_fetch_add(&g_seq, 1, __ATOMIC_RELAXED);
         int flush = (c->flush_every_n > 0 && (seq % (uint64_t)c->flush_every_n) == 0) ? 1 : 0;
-        ve_tls_result rc = ve_tls_producer_add_log_kv(c->producer, 0, c->kvs, 1, flush);
+        ve_tls_result rc;
+        if (c->write_mode == WRITE_MODE_TEMPLATE) {
+            const char * values[1];
+            size_t value_lens[1];
+            values[0] = c->value;
+            value_lens[0] = c->value_len;
+            rc = ve_tls_template_add_values(c->tpl, 0, 0, 0, values, value_lens, 1, flush);
+        } else if (c->write_mode == WRITE_MODE_RAW) {
+            rc = ve_tls_producer_add_log_raw(c->producer, c->raw, c->raw_len, flush);
+        } else {
+            rc = ve_tls_producer_add_log_kv(c->producer, 0, c->kvs, 1, flush);
+        }
         if (rc == VE_TLS_OK) {
             __atomic_fetch_add(&g_sent, 1, __ATOMIC_RELAXED);
             continue;
@@ -97,6 +187,7 @@ static void * writer_main(void * arg) {
         }
         break;
     }
+    (void)ve_tls_producer_flush(c->producer);
     return NULL;
 }
 
@@ -114,6 +205,9 @@ int main(int argc, char ** argv) {
     int32_t flush_interval_ms = 0;
     int32_t log_count_per_package = 0;
     int32_t send_thread_count = 0;
+    int32_t send_queue_block_timeout_ms = 5000;
+    write_mode_t write_mode = WRITE_MODE_KV;
+    ve_tls_send_queue_full_policy queue_full_policy = VE_TLS_SEND_QUEUE_FULL_BLOCK;
     const char * compress_type = NULL;
 
     for (int i = 1; i < argc; i++) {
@@ -147,6 +241,12 @@ int main(int argc, char ** argv) {
             if (parse_i32(v, &send_thread_count) != 0 || send_thread_count < 1) return 2;
         } else if (strcmp(k, "--compress-type") == 0) {
             compress_type = v;
+        } else if (strcmp(k, "--write-mode") == 0) {
+            if (parse_write_mode(v, &write_mode) != 0) return 2;
+        } else if (strcmp(k, "--queue-full-policy") == 0) {
+            if (parse_queue_full_policy(v, &queue_full_policy) != 0) return 2;
+        } else if (strcmp(k, "--send-queue-block-timeout-ms") == 0) {
+            if (parse_i32(v, &send_queue_block_timeout_ms) != 0 || send_queue_block_timeout_ms < 0) return 2;
         } else if (strcmp(k, "--max-buffer-bytes") == 0) {
             int64_t x = 0;
             if (parse_i64(v, &x) != 0 || x < 0) {
@@ -164,6 +264,14 @@ int main(int argc, char ** argv) {
             if (parse_i32(v, &flush_interval_ms) != 0 || flush_interval_ms < 0) return 2;
         } else if (strcmp(k, "--log-count-per-package") == 0) {
             if (parse_i32(v, &log_count_per_package) != 0 || log_count_per_package < 0) return 2;
+        } else if (strcmp(k, "--template-mode") == 0) {
+            if (strcmp(v, "on") == 0) {
+                write_mode = WRITE_MODE_TEMPLATE;
+            } else if (strcmp(v, "off") == 0) {
+                write_mode = WRITE_MODE_KV;
+            } else {
+                return 2;
+            }
         } else {
             usage(argv[0]);
             return 2;
@@ -184,8 +292,8 @@ int main(int argc, char ** argv) {
     cfg.access_key_secret = "sk";
     cfg.retry_policy.max_attempts = 1;
     cfg.send_thread_count = 4;
-    cfg.send_queue_full_policy = VE_TLS_SEND_QUEUE_FULL_BLOCK;
-    cfg.send_queue_block_timeout_ms = 5000;
+    cfg.send_queue_full_policy = queue_full_policy;
+    cfg.send_queue_block_timeout_ms = send_queue_block_timeout_ms;
     cfg.send_queue_size = 4096;
     cfg.flush_interval_ms = 100;
     cfg.log_count_per_package = 512;
@@ -219,6 +327,22 @@ int main(int argc, char ** argv) {
     ve_tls_kv kvs[1];
     kvs[0].key = "message";
     kvs[0].value = msg;
+    ve_tls_log_template * tpl = NULL;
+    if (write_mode == WRITE_MODE_TEMPLATE) {
+        const char * tkeys[1];
+        size_t tkey_lens[1];
+        tkeys[0] = "message";
+        tkey_lens[0] = 7;
+        tpl = ve_tls_template_create(p, tkeys, tkey_lens, 1, NULL);
+        if (!tpl) {
+            ve_tls_producer_destroy(p);
+            free(msg);
+            if (use_global_env) {
+                (void)ve_tls_env_destroy(close_timeout_ms);
+            }
+            return 4;
+        }
+    }
 
     int64_t start_ms = cfg.platform.time_ms();
     int64_t end_ms = start_ms + (int64_t)duration_s * 1000;
@@ -238,6 +362,12 @@ int main(int argc, char ** argv) {
         ctxs[i].platform = &cfg.platform;
         ctxs[i].rate_lps = rate_lps;
         ctxs[i].flush_every_n = flush_every_n;
+        ctxs[i].write_mode = write_mode;
+        ctxs[i].tpl = tpl;
+        ctxs[i].value = msg;
+        ctxs[i].value_len = (size_t)message_bytes;
+        ctxs[i].raw = msg;
+        ctxs[i].raw_len = (size_t)message_bytes;
         ctxs[i].kvs = kvs;
         ctxs[i].end_ms = end_ms;
         threads[i] = cfg.platform.thread_create(writer_main, &ctxs[i]);
@@ -256,6 +386,7 @@ int main(int argc, char ** argv) {
     ve_tls_metrics m;
     memset(&m, 0, sizeof(m));
     ve_tls_producer_get_metrics(p, &m);
+    ve_tls_template_destroy(tpl);
     ve_tls_producer_destroy(p);
     free(msg);
     if (use_global_env) {
@@ -264,6 +395,13 @@ int main(int argc, char ** argv) {
 
     int64_t dur_ms = cfg.platform.time_ms() - start_ms;
     double dur_s = dur_ms > 0 ? (double)dur_ms / 1000.0 : 0.001;
+    fprintf(stderr, "bench config write_mode=%s queue_full_policy=%s compress_type=%s writers=%d senders=%d\n",
+        write_mode_str(write_mode),
+        queue_full_policy_str(queue_full_policy),
+        (compress_type && compress_type[0] != 0) ? compress_type : (cfg.compress_type ? cfg.compress_type : "none"),
+        (int)writer_threads,
+        (int)cfg.send_thread_count
+    );
     fprintf(stderr, "bench close_rc=%d duration_ms=%lld\n", (int)close_rc, (long long)dur_ms);
     uint64_t sent = __atomic_load_n(&g_sent, __ATOMIC_RELAXED);
     fprintf(stderr, "bench loops=%llu loops_per_s=%.2f\n", (unsigned long long)sent, dur_s > 0 ? (double)sent / dur_s : 0.0);
@@ -278,6 +416,17 @@ int main(int argc, char ** argv) {
         (unsigned long long)m.requests_failed_total,
         (unsigned long long)m.retries_total,
         (unsigned long long)m.bytes_sent_total
+    );
+    fprintf(stderr, "metrics latency_buckets=%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu p99_ms_upper=%d\n",
+        (unsigned long long)m.request_latency_buckets[0],
+        (unsigned long long)m.request_latency_buckets[1],
+        (unsigned long long)m.request_latency_buckets[2],
+        (unsigned long long)m.request_latency_buckets[3],
+        (unsigned long long)m.request_latency_buckets[4],
+        (unsigned long long)m.request_latency_buckets[5],
+        (unsigned long long)m.request_latency_buckets[6],
+        (unsigned long long)m.request_latency_buckets[7],
+        (int)estimate_p99_upper_ms(&m)
     );
     if (dur_s > 0) {
         fprintf(stderr, "throughput logs_per_s=%.2f bytes_per_s=%.2f\n",

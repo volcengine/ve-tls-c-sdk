@@ -358,6 +358,7 @@ int main(int argc, char ** argv) {
     cfg.log_bytes_per_package = conf_get_i32(&conf, "VE_TLS_LOG_BYTES_PER_PACKAGE", 4 * 1024 * 1024);
     cfg.log_count_per_package = conf_get_i32(&conf, "VE_TLS_LOG_COUNT_PER_PACKAGE", 4096);
     cfg.send_thread_count = conf_get_i32(&conf, "VE_TLS_SEND_THREAD_COUNT", 16);
+    cfg.pack_thread_count = conf_get_i32(&conf, "VE_TLS_PACK_THREAD_COUNT", cfg.send_thread_count);
     cfg.compress_type = conf_get_str(&conf, "VE_TLS_COMPRESS_TYPE", "lz4");
     cfg.retry_policy.max_attempts = 1;
     cfg.log_tags = tags;

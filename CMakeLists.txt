@@ -23,6 +23,8 @@ target_sources(ve_tls_core PRIVATE
     core/src/producer/ve_tls_producer_config.c
     core/src/producer/ve_tls_producer_manager.c
     core/src/producer/ve_tls_producer_sender.c
+    core/src/producer/ve_tls_pool.c
+    core/src/producer/ve_tls_snapshot.c
     core/src/producer/ve_tls_env.c
     core/src/ve_tls_alloc.c
     core/src/ve_tls_retry.c

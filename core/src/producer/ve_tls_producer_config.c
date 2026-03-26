@@ -46,6 +46,7 @@ void ve_tls_producer_config_init(ve_tls_config * config) {
     config->compress_type = "none";
 #endif
     config->send_thread_count = 1;
+    config->pack_thread_count = 1;
     config->use_global_env = 0;
     config->ordered_send = 0;
     config->rate_limit_rps = 0;

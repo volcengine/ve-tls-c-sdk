@@ -134,19 +134,59 @@ void ve_tls_send_task_free(ve_tls_send_task * t) {
         return;
     }
     ve_tls_free(t->hash_key);
-    ve_tls_free(t->precompressed);
-    ve_tls_free(t->body);
+    if (t->precompressed) {
+        if (t->precompressed_pool) {
+            ve_tls_obj_pool_put(t->precompressed_pool, t->precompressed);
+        } else {
+            ve_tls_free(t->precompressed);
+        }
+    }
+    if (t->body) {
+        if (t->body_pool) {
+            ve_tls_obj_pool_put(t->body_pool, t->body);
+        } else {
+            ve_tls_free(t->body);
+        }
+    }
     memset(t, 0, sizeof(*t));
 }
 
-int ve_tls_send_queue_init(ve_tls_send_queue * q, ve_tls_platform * platform, size_t cap) {
+static ve_tls_send_task * ve_tls_send_queue_task_alloc(ve_tls_send_queue * q) {
+    if (!q) {
+        return NULL;
+    }
+    if (q->task_pool) {
+        ve_tls_send_task * t = (ve_tls_send_task *)ve_tls_obj_pool_get(q->task_pool);
+        if (!t) {
+            return NULL;
+        }
+        memset(t, 0, sizeof(*t));
+        return t;
+    }
+    return (ve_tls_send_task *)ve_tls_calloc(1, sizeof(ve_tls_send_task));
+}
+
+static void ve_tls_send_queue_task_recycle(ve_tls_send_queue * q, ve_tls_send_task * t) {
+    if (!q || !t) {
+        return;
+    }
+    memset(t, 0, sizeof(*t));
+    if (q->task_pool) {
+        ve_tls_obj_pool_put(q->task_pool, t);
+    } else {
+        ve_tls_free(t);
+    }
+}
+
+int ve_tls_send_queue_init(ve_tls_send_queue * q, ve_tls_platform * platform, size_t cap, ve_tls_obj_pool * task_pool) {
     if (!q || !platform || cap == 0) {
         return -1;
     }
     memset(q, 0, sizeof(*q));
     q->platform = platform;
+    q->task_pool = task_pool;
     q->cap = cap;
-    q->buf = (ve_tls_send_task *)ve_tls_calloc(q->cap, sizeof(ve_tls_send_task));
+    q->buf = (ve_tls_send_task **)ve_tls_calloc(q->cap, sizeof(ve_tls_send_task *));
     q->mutex = platform->mutex_create();
     q->not_empty = platform->cond_create();
     q->not_full = platform->cond_create();
@@ -196,7 +236,13 @@ int ve_tls_send_queue_push(ve_tls_send_queue * q, const ve_tls_send_task * t, in
         q->platform->mutex_unlock(q->mutex);
         return -1;
     }
-    q->buf[q->tail] = *t;
+    ve_tls_send_task * task = ve_tls_send_queue_task_alloc(q);
+    if (!task) {
+        q->platform->mutex_unlock(q->mutex);
+        return -1;
+    }
+    *task = *t;
+    q->buf[q->tail] = task;
     q->tail = (q->tail + 1) % q->cap;
     q->count++;
     q->platform->cond_signal(q->not_empty);
@@ -232,8 +278,17 @@ int ve_tls_send_queue_pop(ve_tls_send_queue * q, ve_tls_send_task * out, int wai
         q->platform->mutex_unlock(q->mutex);
         return -1;
     }
-    *out = q->buf[q->head];
-    memset(&q->buf[q->head], 0, sizeof(ve_tls_send_task));
+    ve_tls_send_task * task = q->buf[q->head];
+    q->buf[q->head] = NULL;
+    if (!task) {
+        q->head = (q->head + 1) % q->cap;
+        q->count--;
+        q->platform->cond_signal(q->not_full);
+        q->platform->mutex_unlock(q->mutex);
+        return -1;
+    }
+    *out = *task;
+    ve_tls_send_queue_task_recycle(q, task);
     q->head = (q->head + 1) % q->cap;
     q->count--;
     q->platform->cond_signal(q->not_full);
@@ -247,7 +302,11 @@ void ve_tls_send_queue_destroy(ve_tls_send_queue * q) {
     }
     if (q->buf) {
         for (size_t i = 0; i < q->cap; i++) {
-            ve_tls_send_task_free(&q->buf[i]);
+            if (q->buf[i]) {
+                ve_tls_send_task_free(q->buf[i]);
+                ve_tls_send_queue_task_recycle(q, q->buf[i]);
+                q->buf[i] = NULL;
+            }
         }
         ve_tls_free(q->buf);
         q->buf = NULL;
@@ -272,6 +331,106 @@ void ve_tls_send_queue_destroy(ve_tls_send_queue * q) {
     q->tail = 0;
     q->count = 0;
     q->stop = 0;
+    q->task_pool = NULL;
+}
+
+int ve_tls_ingress_queue_init(ve_tls_producer * producer, size_t cap) {
+    if (!producer || cap == 0) {
+        return -1;
+    }
+    producer->ingress_queue = (ve_tls_ingress_task *)ve_tls_calloc(cap, sizeof(ve_tls_ingress_task));
+    if (!producer->ingress_queue) {
+        return -1;
+    }
+    producer->ingress_queue_cap = cap;
+    producer->ingress_queue_head = 0;
+    producer->ingress_queue_tail = 0;
+    producer->ingress_queue_count = 0;
+    producer->ingress_queue_bytes = 0;
+    return 0;
+}
+
+void ve_tls_ingress_queue_destroy(ve_tls_producer * producer) {
+    if (!producer) {
+        return;
+    }
+    if (producer->ingress_queue) {
+        for (size_t i = 0; i < producer->ingress_queue_cap; i++) {
+            if (producer->ingress_queue[i].batch) {
+                ve_tls_log_builder_free(producer->ingress_queue[i].batch);
+                producer->ingress_queue[i].batch = NULL;
+            }
+            producer->ingress_queue[i].norm_key = NULL;
+            producer->ingress_queue[i].force_flush = 0;
+        }
+        ve_tls_free(producer->ingress_queue);
+    }
+    producer->ingress_queue = NULL;
+    producer->ingress_queue_cap = 0;
+    producer->ingress_queue_head = 0;
+    producer->ingress_queue_tail = 0;
+    producer->ingress_queue_count = 0;
+    producer->ingress_queue_bytes = 0;
+}
+
+int ve_tls_ingress_queue_push_locked(ve_tls_producer * producer, const char * norm_key, ve_tls_log_group_builder * batch, int force_flush, int wait_ms) {
+    if (!producer || !batch || !producer->ingress_queue || producer->ingress_queue_cap == 0) {
+        return -1;
+    }
+    int64_t start = producer->config.platform.time_ms ? producer->config.platform.time_ms() : 0;
+    while (producer->ingress_queue_count >= producer->ingress_queue_cap) {
+        if (producer->stop || !producer->accepting) {
+            return -2;
+        }
+        if (wait_ms == 0) {
+            return -1;
+        }
+        if (wait_ms < 0) {
+            producer->config.platform.cond_wait(producer->cond, producer->mutex);
+            continue;
+        }
+        int64_t now = producer->config.platform.time_ms ? producer->config.platform.time_ms() : start;
+        int64_t elapsed = now - start;
+        int64_t remain = (int64_t)wait_ms - elapsed;
+        if (remain <= 0) {
+            return -3;
+        }
+        if (producer->config.platform.cond_timedwait_ms) {
+            (void)producer->config.platform.cond_timedwait_ms(producer->cond, producer->mutex, remain);
+        } else {
+            producer->config.platform.cond_wait(producer->cond, producer->mutex);
+        }
+    }
+    ve_tls_ingress_task * slot = &producer->ingress_queue[producer->ingress_queue_tail];
+    slot->norm_key = norm_key;
+    slot->batch = batch;
+    slot->force_flush = force_flush ? 1 : 0;
+    producer->ingress_queue_tail = (producer->ingress_queue_tail + 1) % producer->ingress_queue_cap;
+    producer->ingress_queue_count++;
+    producer->ingress_queue_bytes += batch->logs_len;
+    producer->config.platform.cond_signal(producer->cond);
+    return 0;
+}
+
+int ve_tls_ingress_queue_pop_locked(ve_tls_producer * producer, ve_tls_ingress_task * out) {
+    if (!producer || !out || !producer->ingress_queue || producer->ingress_queue_count == 0) {
+        return -1;
+    }
+    *out = producer->ingress_queue[producer->ingress_queue_head];
+    producer->ingress_queue[producer->ingress_queue_head].norm_key = NULL;
+    producer->ingress_queue[producer->ingress_queue_head].batch = NULL;
+    producer->ingress_queue[producer->ingress_queue_head].force_flush = 0;
+    producer->ingress_queue_head = (producer->ingress_queue_head + 1) % producer->ingress_queue_cap;
+    producer->ingress_queue_count--;
+    if (out->batch) {
+        if (producer->ingress_queue_bytes >= out->batch->logs_len) {
+            producer->ingress_queue_bytes -= out->batch->logs_len;
+        } else {
+            producer->ingress_queue_bytes = 0;
+        }
+    }
+    producer->config.platform.cond_signal(producer->cond);
+    return 0;
 }
 
 static uint32_t ve_tls_hash32_fnv1a(const char * s) {

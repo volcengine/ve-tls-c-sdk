@@ -6,9 +6,12 @@
 #include "ve_tls_compress.h"
 #include "ve_tls_retry.h"
 #include "ve_tls_error.h"
+#include "ve_tls_pool.h"
+#include "ve_tls_snapshot.h"
 
 #include <stdint.h>
 #include <stddef.h>
+#include <stdatomic.h>
 
 typedef struct {
     int64_t id;
@@ -53,6 +56,8 @@ typedef struct {
     int32_t partition_id;
     unsigned char * precompressed;
     size_t precompressed_size;
+    ve_tls_obj_pool * body_pool;
+    ve_tls_obj_pool * precompressed_pool;
 } ve_tls_send_task;
 
 typedef struct {
@@ -60,13 +65,20 @@ typedef struct {
     ve_tls_mutex * mutex;
     ve_tls_cond * not_empty;
     ve_tls_cond * not_full;
-    ve_tls_send_task * buf;
+    ve_tls_send_task ** buf;
+    ve_tls_obj_pool * task_pool;
     size_t cap;
     size_t head;
     size_t tail;
     size_t count;
     int stop;
 } ve_tls_send_queue;
+
+typedef struct {
+    const char * norm_key;
+    ve_tls_log_group_builder * batch;
+    int force_flush;
+} ve_tls_ingress_task;
 
 typedef struct ve_tls_key_queue ve_tls_key_queue;
 
@@ -113,7 +125,8 @@ struct ve_tls_producer {
     ve_tls_mutex * mutex;
     ve_tls_cond * cond;
     ve_tls_cond * send_cond;
-    ve_tls_thread * worker;
+    ve_tls_thread ** workers;
+    int32_t worker_count;
     ve_tls_thread ** senders;
     int32_t sender_count;
     ve_tls_key_queue ** key_buckets;
@@ -131,7 +144,7 @@ struct ve_tls_producer {
     int flush_requested;
     int accepting;
     int closing;
-    int worker_flushing;
+    int32_t worker_flushing_count;
     int64_t next_id;
     ve_tls_log_item * queue;
     size_t queue_cap;
@@ -139,6 +152,12 @@ struct ve_tls_producer {
     size_t queue_tail;
     size_t queue_count;
     size_t queue_bytes;
+    ve_tls_ingress_task * ingress_queue;
+    size_t ingress_queue_cap;
+    size_t ingress_queue_head;
+    size_t ingress_queue_tail;
+    size_t ingress_queue_count;
+    size_t ingress_queue_bytes;
     size_t tls_bytes;
     ve_tls_log_group_builder * sealed_head;
     ve_tls_log_group_builder * sealed_tail;
@@ -177,6 +196,10 @@ struct ve_tls_producer {
     char * cfg_persistent_file_path;
     int64_t send_cfg_version;
     int64_t static_cred_version;
+    _Atomic(ve_tls_runtime_snapshot *) runtime_snapshot;
+    ve_tls_obj_pool send_task_pool;
+    ve_tls_obj_pool header_buf_pool;
+    ve_tls_obj_pool compress_buf_pool;
     uint64_t m_logs_enqueued_total;
     uint64_t m_logs_dropped_total;
     uint64_t m_bytes_enqueued_total;
@@ -215,14 +238,19 @@ ve_tls_log_group_builder * ve_tls_log_builder_create(const char * norm_key);
 void ve_tls_log_builder_free(ve_tls_log_group_builder * b);
 int ve_tls_log_builder_add_kv_lens(ve_tls_log_group_builder * b, int64_t id, int64_t time_ms, uint32_t time_ns, int32_t has_time_ns, const ve_tls_kv * kvs, const size_t * key_lens, const size_t * val_lens, size_t kv_count);
 int ve_tls_log_builder_append(ve_tls_log_group_builder * b, const unsigned char * logs, size_t logs_len, int32_t log_count, int64_t earliest, int64_t latest, int64_t start_id, int64_t end_id, int64_t last_time_ms, uint32_t last_time_ns, int32_t last_has_time_ns);
+void ve_tls_log_builder_shrink_if_needed(ve_tls_log_group_builder * b, size_t shrink_threshold, size_t shrink_to);
 int ve_tls_producer_build_group_suffix(ve_tls_producer * producer);
 int ve_tls_builder_to_send_task(ve_tls_producer * producer, ve_tls_log_group_builder * b, ve_tls_send_task * out);
 
-int ve_tls_send_queue_init(ve_tls_send_queue * q, ve_tls_platform * platform, size_t cap);
+int ve_tls_send_queue_init(ve_tls_send_queue * q, ve_tls_platform * platform, size_t cap, ve_tls_obj_pool * task_pool);
 int ve_tls_send_queue_push(ve_tls_send_queue * q, const ve_tls_send_task * t, int wait_ms);
 int ve_tls_send_queue_pop(ve_tls_send_queue * q, ve_tls_send_task * out, int wait_ms);
 void ve_tls_send_queue_stop(ve_tls_send_queue * q);
 void ve_tls_send_queue_destroy(ve_tls_send_queue * q);
+int ve_tls_ingress_queue_init(ve_tls_producer * producer, size_t cap);
+void ve_tls_ingress_queue_destroy(ve_tls_producer * producer);
+int ve_tls_ingress_queue_push_locked(ve_tls_producer * producer, const char * norm_key, ve_tls_log_group_builder * batch, int force_flush, int wait_ms);
+int ve_tls_ingress_queue_pop_locked(ve_tls_producer * producer, ve_tls_ingress_task * out);
 
 void ve_tls_key_map_free_all(ve_tls_producer * producer);
 ve_tls_key_queue * ve_tls_key_queue_get_or_create(ve_tls_producer * producer, const char * norm_key);
@@ -236,6 +264,7 @@ void ve_tls_idle_cleanup(ve_tls_producer * producer);
 const char * ve_tls_normalize_hash_key(ve_tls_producer * producer, const char * hash_key);
 ve_tls_key_queue * ve_tls_ready_pop(ve_tls_producer * producer);
 void ve_tls_delayed_add_sorted(ve_tls_producer * producer, ve_tls_key_queue * q, int64_t next_ready_ms);
+int ve_tls_ingress_task_merge_locked(ve_tls_producer * producer, const ve_tls_ingress_task * task);
 
 int ve_tls_producer_is_drained_locked(ve_tls_producer * producer);
 int ve_tls_sender_step(ve_tls_producer * producer);

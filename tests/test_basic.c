@@ -9,6 +9,8 @@
 #include "ve_tls_http.h"
 #include "ve_tls_version.h"
 #include "producer/ve_tls_producer_internal.h"
+#include "producer/ve_tls_snapshot.h"
+#include "producer/ve_tls_pool.h"
 
 #include <string.h>
 #include <stdlib.h>
@@ -1326,6 +1328,11 @@ static int g_sender_hdr_ok = 0;
 static int g_sender_seen_retryable = 0;
 static int g_sender_seen_transport_curl = 0;
 static char g_sender_seen_url[256];
+static int g_func_matrix_req_count = 0;
+static int g_func_matrix_seen_old_url = 0;
+static int g_func_matrix_seen_new_url = 0;
+static int g_func_matrix_seen_old_ak = 0;
+static int g_func_matrix_seen_new_ak = 0;
 
 static int test_http_sender_check_default_hashkey_do(ve_tls_http_client * client, const ve_tls_http_request * req, ve_tls_http_response * resp) {
     (void)client;
@@ -1382,6 +1389,141 @@ static int test_http_sender_capture_url_and_auth_do(ve_tls_http_client * client,
     }
     resp->status_code = 200;
     resp->request_id = strdup("rid-ok");
+    return 0;
+}
+
+static int test_http_functional_matrix_capture_do(ve_tls_http_client * client, const ve_tls_http_request * req, ve_tls_http_response * resp) {
+    (void)client;
+    if (!req || !resp) return -1;
+    if (req->url && strstr(req->url, "https://example.com/PutLogs?TopicId=t1")) {
+        __atomic_store_n(&g_func_matrix_seen_old_url, 1, __ATOMIC_RELAXED);
+    }
+    if (req->url && strstr(req->url, "https://new.example.com/PutLogs?TopicId=t2")) {
+        __atomic_store_n(&g_func_matrix_seen_new_url, 1, __ATOMIC_RELAXED);
+    }
+    if (req->headers && strstr(req->headers, "Authorization: HMAC-SHA256 Credential=ak/")) {
+        __atomic_store_n(&g_func_matrix_seen_old_ak, 1, __ATOMIC_RELAXED);
+    }
+    if (req->headers && strstr(req->headers, "Authorization: HMAC-SHA256 Credential=ak2/")) {
+        __atomic_store_n(&g_func_matrix_seen_new_ak, 1, __ATOMIC_RELAXED);
+    }
+    (void)__atomic_fetch_add(&g_func_matrix_req_count, 1, __ATOMIC_RELAXED);
+    resp->status_code = 200;
+    resp->request_id = strdup("rid-func");
+    return 0;
+}
+
+static int test_pipeline_v2_functional_matrix_raw_kv_template_and_runtime_updates(void) {
+    __atomic_store_n(&g_func_matrix_req_count, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_func_matrix_seen_old_url, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_func_matrix_seen_new_url, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_func_matrix_seen_old_ak, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_func_matrix_seen_new_ak, 0, __ATOMIC_RELAXED);
+
+    ve_tls_config cfg;
+    ve_tls_config_init(&cfg);
+    cfg.endpoint = "https://example.com";
+    cfg.region = "cn-beijing";
+    cfg.topic_id = "t1";
+    cfg.access_key_id = "ak";
+    cfg.access_key_secret = "sk";
+    cfg.compress_type = "none";
+    cfg.send_thread_count = 1;
+    cfg.log_count_per_package = 1;
+    cfg.flush_interval_ms = 10;
+    cfg.retry_policy.max_attempts = 1;
+    cfg.http_client.do_request = test_http_functional_matrix_capture_do;
+    cfg.http_client.free_response = test_http_ok_free;
+
+    ve_tls_producer * p = ve_tls_producer_create(&cfg);
+    if (!p) return -1;
+
+    const char * tpl_keys[1];
+    size_t tpl_key_lens[1];
+    tpl_keys[0] = "message";
+    tpl_key_lens[0] = 7;
+    ve_tls_log_template * tpl = ve_tls_template_create(p, tpl_keys, tpl_key_lens, 1, NULL);
+    if (!tpl) {
+        ve_tls_producer_destroy(p);
+        return -1;
+    }
+
+    const char * raw1 = "{\"m\":\"raw1\"}";
+    ve_tls_kv kvs[1];
+    kvs[0].key = "message";
+    kvs[0].value = "kv1";
+    const char * values1[1];
+    size_t value_lens1[1];
+    values1[0] = "tpl1";
+    value_lens1[0] = 4;
+
+    if (ve_tls_producer_add_log_raw(p, raw1, strlen(raw1), 1) != VE_TLS_OK) {
+        ve_tls_template_destroy(tpl);
+        ve_tls_producer_destroy(p);
+        return -1;
+    }
+    if (ve_tls_producer_add_log_kv(p, 0, kvs, 1, 1) != VE_TLS_OK) {
+        ve_tls_template_destroy(tpl);
+        ve_tls_producer_destroy(p);
+        return -1;
+    }
+    if (ve_tls_template_add_values(tpl, 0, 0, 0, values1, value_lens1, 1, 1) != VE_TLS_OK) {
+        ve_tls_template_destroy(tpl);
+        ve_tls_producer_destroy(p);
+        return -1;
+    }
+
+    for (int i = 0; i < 2000; i++) {
+        if (__atomic_load_n(&g_func_matrix_req_count, __ATOMIC_RELAXED) >= 1) {
+            break;
+        }
+        cfg.platform.sleep_ms(1);
+    }
+
+    if (ve_tls_producer_update_endpoint(p, "https://new.example.com", "cn-beijing", "t2") != VE_TLS_OK) {
+        ve_tls_template_destroy(tpl);
+        ve_tls_producer_destroy(p);
+        return -1;
+    }
+    if (ve_tls_producer_update_static_credentials(p, "ak2", "sk2", NULL) != VE_TLS_OK) {
+        ve_tls_template_destroy(tpl);
+        ve_tls_producer_destroy(p);
+        return -1;
+    }
+
+    const char * raw2 = "{\"m\":\"raw2\"}";
+    kvs[0].value = "kv2";
+    const char * values2[1];
+    size_t value_lens2[1];
+    values2[0] = "tpl2";
+    value_lens2[0] = 4;
+
+    if (ve_tls_producer_add_log_raw(p, raw2, strlen(raw2), 1) != VE_TLS_OK) {
+        ve_tls_template_destroy(tpl);
+        ve_tls_producer_destroy(p);
+        return -1;
+    }
+    if (ve_tls_producer_add_log_kv(p, 0, kvs, 1, 1) != VE_TLS_OK) {
+        ve_tls_template_destroy(tpl);
+        ve_tls_producer_destroy(p);
+        return -1;
+    }
+    if (ve_tls_template_add_values(tpl, 0, 0, 0, values2, value_lens2, 1, 1) != VE_TLS_OK) {
+        ve_tls_template_destroy(tpl);
+        ve_tls_producer_destroy(p);
+        return -1;
+    }
+
+    ve_tls_result close_rc = ve_tls_producer_close(p, 5000);
+    ve_tls_template_destroy(tpl);
+    ve_tls_producer_destroy(p);
+    if (close_rc != VE_TLS_OK) return -1;
+
+    if (!__atomic_load_n(&g_func_matrix_seen_old_url, __ATOMIC_RELAXED)) return -1;
+    if (!__atomic_load_n(&g_func_matrix_seen_new_url, __ATOMIC_RELAXED)) return -1;
+    if (!__atomic_load_n(&g_func_matrix_seen_old_ak, __ATOMIC_RELAXED)) return -1;
+    if (!__atomic_load_n(&g_func_matrix_seen_new_ak, __ATOMIC_RELAXED)) return -1;
+    if (__atomic_load_n(&g_func_matrix_req_count, __ATOMIC_RELAXED) < 2) return -1;
     return 0;
 }
 
@@ -1640,12 +1782,14 @@ static int init_fake_sender_producer(ve_tls_producer * p, ve_tls_config * cfg) {
     if (!p->key_buckets) return -1;
     size_t sq = (cfg->send_queue_size > 0) ? (size_t)cfg->send_queue_size : 16;
     if (sq == 0) sq = 16;
-    if (ve_tls_send_queue_init(&p->send_queue, &p->config.platform, sq) != 0) return -1;
+    if (ve_tls_send_queue_init(&p->send_queue, &p->config.platform, sq, NULL) != 0) return -1;
+    if (ve_tls_runtime_snapshot_refresh(p) != 0) return -1;
     return 0;
 }
 
 static void destroy_fake_sender_producer(ve_tls_producer * p) {
     if (!p) return;
+    ve_tls_runtime_snapshot_clear(p);
     ve_tls_send_queue_stop(&p->send_queue);
     ve_tls_send_queue_destroy(&p->send_queue);
     ve_tls_key_map_free_all(p);
@@ -2093,7 +2237,7 @@ static int test_sender_step_compress_unsupported_drops(void) {
     cfg.access_key_secret = "sk";
     cfg.compress_type = "bad";
     cfg.retry_policy.max_attempts = 1;
-    cfg.http_client.do_request = test_http_should_not_call_do;
+    cfg.http_client.do_request = test_http_step_ok_do;
     cfg.http_client.free_response = test_http_free;
 
     ve_tls_producer p;
@@ -2133,9 +2277,9 @@ static int test_sender_step_compress_unsupported_drops(void) {
         return -1;
     }
     destroy_fake_sender_producer(&p);
-    if (g_step_drop_calls < 1) return -1;
-    if (strcmp(g_step_drop_code, "ClientError") != 0) return -1;
-    return 0;
+    if (g_step_drop_calls != 0) return -1;
+    if (g_step_ok_calls < 1) return -1;
+    return g_step_http_calls == 1 ? 0 : -1;
 }
 
 static int test_sender_step_breaker_half_open_curl_nonretry_drops(void) {
@@ -2668,8 +2812,95 @@ static int test_queue_delayed_promote_due_moves_to_ready(void) {
     return ok ? 0 : -1;
 }
 
+static int test_ingress_queue_push_pop_order_and_drain_state(void) {
+    ve_tls_config cfg;
+    ve_tls_config_init(&cfg);
+
+    ve_tls_producer p;
+    memset(&p, 0, sizeof(p));
+    p.config = cfg;
+    p.accepting = 1;
+    p.mutex = p.config.platform.mutex_create();
+    p.cond = p.config.platform.cond_create();
+    if (!p.mutex || !p.cond) {
+        if (p.cond) p.config.platform.cond_destroy(p.cond);
+        if (p.mutex) p.config.platform.mutex_destroy(p.mutex);
+        return -1;
+    }
+
+    if (ve_tls_ingress_queue_init(&p, 2) != 0) {
+        p.config.platform.cond_destroy(p.cond);
+        p.config.platform.mutex_destroy(p.mutex);
+        return -1;
+    }
+
+    ve_tls_log_group_builder * b1 = ve_tls_log_builder_create("");
+    ve_tls_log_group_builder * b2 = ve_tls_log_builder_create("");
+    ve_tls_log_group_builder * b3 = ve_tls_log_builder_create("");
+    if (!b1 || !b2 || !b3) {
+        ve_tls_log_builder_free(b1);
+        ve_tls_log_builder_free(b2);
+        ve_tls_log_builder_free(b3);
+        ve_tls_ingress_queue_destroy(&p);
+        p.config.platform.cond_destroy(p.cond);
+        p.config.platform.mutex_destroy(p.mutex);
+        return -1;
+    }
+    b1->log_count = 1;
+    b2->log_count = 2;
+    b3->log_count = 3;
+
+    p.config.platform.mutex_lock(p.mutex);
+    int rc1 = ve_tls_ingress_queue_push_locked(&p, "", b1, 0, 0);
+    int rc2 = ve_tls_ingress_queue_push_locked(&p, "", b2, 1, 0);
+    int rc3 = ve_tls_ingress_queue_push_locked(&p, "", b3, 0, 0);
+    int drained_when_nonempty = ve_tls_producer_is_drained_locked(&p);
+    p.config.platform.mutex_unlock(p.mutex);
+    if (rc1 != 0 || rc2 != 0 || rc3 != -1 || drained_when_nonempty != 0) {
+        ve_tls_log_builder_free(b3);
+        ve_tls_ingress_queue_destroy(&p);
+        p.config.platform.cond_destroy(p.cond);
+        p.config.platform.mutex_destroy(p.mutex);
+        return -1;
+    }
+    ve_tls_log_builder_free(b3);
+
+    ve_tls_ingress_task t;
+    memset(&t, 0, sizeof(t));
+    p.config.platform.mutex_lock(p.mutex);
+    int pop1 = ve_tls_ingress_queue_pop_locked(&p, &t);
+    p.config.platform.mutex_unlock(p.mutex);
+    if (pop1 != 0 || t.batch != b1 || t.force_flush != 0) {
+        ve_tls_ingress_queue_destroy(&p);
+        p.config.platform.cond_destroy(p.cond);
+        p.config.platform.mutex_destroy(p.mutex);
+        return -1;
+    }
+    ve_tls_log_builder_free(t.batch);
+
+    memset(&t, 0, sizeof(t));
+    p.config.platform.mutex_lock(p.mutex);
+    int pop2 = ve_tls_ingress_queue_pop_locked(&p, &t);
+    int drained_after_pop = ve_tls_producer_is_drained_locked(&p);
+    p.config.platform.mutex_unlock(p.mutex);
+    if (pop2 != 0 || t.batch != b2 || t.force_flush != 1 || drained_after_pop != 1) {
+        ve_tls_ingress_queue_destroy(&p);
+        p.config.platform.cond_destroy(p.cond);
+        p.config.platform.mutex_destroy(p.mutex);
+        return -1;
+    }
+    ve_tls_log_builder_free(t.batch);
+
+    ve_tls_ingress_queue_destroy(&p);
+    p.config.platform.cond_destroy(p.cond);
+    p.config.platform.mutex_destroy(p.mutex);
+    return 0;
+}
+
 static int g_worker_drop_full = 0;
 static int g_worker_drop_timeout = 0;
+static int g_worker_pack_drop = 0;
+static char g_worker_pack_drop_msg[96];
 
 static void on_worker_done_v2(
     ve_tls_result result,
@@ -2690,6 +2921,27 @@ static void on_worker_done_v2(
     if (result != VE_TLS_DROP_ERROR || !error || !error->error_code) return;
     if (strcmp(error->error_code, "SendQueueFull") == 0) g_worker_drop_full++;
     if (strcmp(error->error_code, "SendQueueTimeout") == 0) g_worker_drop_timeout++;
+}
+
+static void on_worker_pack_done_v2(
+    ve_tls_result result,
+    size_t log_bytes,
+    size_t compressed_bytes,
+    const ve_tls_error * error,
+    const unsigned char * raw_buffer,
+    void * user_param,
+    int64_t start_id,
+    int64_t end_id
+) {
+    (void)log_bytes;
+    (void)compressed_bytes;
+    (void)raw_buffer;
+    (void)user_param;
+    (void)start_id;
+    (void)end_id;
+    if (result != VE_TLS_DROP_ERROR || !error || !error->error_message) return;
+    g_worker_pack_drop++;
+    snprintf(g_worker_pack_drop_msg, sizeof(g_worker_pack_drop_msg), "%s", error->error_message);
 }
 
 static int test_worker_send_queue_full_drop_sampled_paths(void) {
@@ -2804,6 +3056,66 @@ static int test_worker_send_queue_block_timeout_path(void) {
     if (ret != NULL) return -1;
     if (g_worker_drop_timeout < 1) return -1;
     return 0;
+}
+
+static int test_worker_pack_stage_unsupported_compress_drops_before_enqueue(void) {
+    g_worker_pack_drop = 0;
+    memset(g_worker_pack_drop_msg, 0, sizeof(g_worker_pack_drop_msg));
+
+    ve_tls_config cfg;
+    ve_tls_config_init(&cfg);
+    g_real_platform = cfg.platform;
+    g_fake_time = 3000;
+    cfg.platform.time_ms = test_fake_time_ms;
+    cfg.platform.sleep_ms = test_fake_sleep_ms;
+    cfg.platform.cond_timedwait_ms = test_fake_cond_timedwait_ms;
+    cfg.endpoint = "https://example.com";
+    cfg.region = "cn-beijing";
+    cfg.topic_id = "t";
+    cfg.access_key_id = "ak";
+    cfg.access_key_secret = "sk";
+    cfg.compress_type = "bad";
+    cfg.agg_strategy = 1;
+    cfg.log_count_per_package = 1;
+    cfg.flush_interval_ms = 0;
+    cfg.send_queue_size = 8;
+    cfg.key_queue_idle_ttl_ms = 100000;
+
+    ve_tls_producer p;
+    if (init_fake_sender_producer(&p, &cfg) != 0) return -1;
+    p.send_done_v2 = on_worker_pack_done_v2;
+
+    ve_tls_kv kvs[1];
+    kvs[0].key = "k";
+    kvs[0].value = "v";
+    ve_tls_bytes log;
+    memset(&log, 0, sizeof(log));
+    if (ve_tls_proto_encode_log_ex(1710000000001LL, 0, 0, kvs, 1, &log) != 0) {
+        destroy_fake_sender_producer(&p);
+        return -1;
+    }
+    int rc = ve_tls_queue_push(&p, log.data, log.size, 1, 1710000000001LL, 0, 0, "hk");
+    ve_tls_bytes_free(&log);
+    if (rc != 0) {
+        destroy_fake_sender_producer(&p);
+        return -1;
+    }
+
+    p.stop = 1;
+    p.flush_requested = 1;
+    (void)ve_tls_worker_main(&p);
+
+    size_t send_count = 0;
+    if (p.send_queue.mutex && p.send_queue.platform) {
+        p.send_queue.platform->mutex_lock(p.send_queue.mutex);
+        send_count = p.send_queue.count;
+        p.send_queue.platform->mutex_unlock(p.send_queue.mutex);
+    }
+    destroy_fake_sender_producer(&p);
+
+    if (send_count != 0) return -1;
+    if (g_worker_pack_drop < 1) return -1;
+    return strcmp(g_worker_pack_drop_msg, "unsupported compress_type") == 0 ? 0 : -1;
 }
 
 static int g_mgr_done = 0;
@@ -4259,7 +4571,7 @@ static int test_send_queue_push_timeout_returns_minus2(void) {
 
     ve_tls_send_queue q;
     memset(&q, 0, sizeof(q));
-    if (ve_tls_send_queue_init(&q, &plat, 1) != 0) return -1;
+    if (ve_tls_send_queue_init(&q, &plat, 1, NULL) != 0) return -1;
 
     ve_tls_send_task t1;
     memset(&t1, 0, sizeof(t1));
@@ -4302,7 +4614,7 @@ static int test_send_queue_stop_causes_push_pop_fail(void) {
     ve_tls_platform plat = cfg.platform;
     ve_tls_send_queue q;
     memset(&q, 0, sizeof(q));
-    if (ve_tls_send_queue_init(&q, &plat, 1) != 0) return -1;
+    if (ve_tls_send_queue_init(&q, &plat, 1, NULL) != 0) return -1;
     ve_tls_send_queue_stop(&q);
 
     ve_tls_send_task t;
@@ -4585,6 +4897,161 @@ static int test_export_raw_buffer_includes_tls_batch_with_len(void) {
     ve_tls_producer_free_raw_buffer(b);
     ve_tls_producer_destroy(p);
     return count == 1 ? 0 : -1;
+}
+
+static int test_template_lifecycle_and_add_values_exports_one_record(void) {
+    ve_tls_config cfg;
+    ve_tls_config_init(&cfg);
+    cfg.endpoint = "https://example.com";
+    cfg.region = "cn-beijing";
+    cfg.topic_id = "t";
+    cfg.access_key_id = "ak";
+    cfg.access_key_secret = "sk";
+    cfg.retry_policy.max_attempts = 1;
+    cfg.flush_interval_ms = 100000;
+    cfg.log_count_per_package = 1000000;
+    cfg.log_bytes_per_package = 100000000;
+
+    ve_tls_producer * p = ve_tls_producer_create(&cfg);
+    if (!p) return -1;
+
+    const unsigned char k_raw[6] = {'K','E','Y','X','X','X'};
+    const char * keys[1] = {(const char *)k_raw};
+    size_t key_lens[1] = {3};
+    ve_tls_log_template * tpl = ve_tls_template_create(p, keys, key_lens, 1, NULL);
+    if (!tpl) {
+        ve_tls_producer_destroy(p);
+        return -1;
+    }
+
+    const unsigned char v_raw[7] = {'V','A','L','U','E','Y','Y'};
+    const char * values[1] = {(const char *)v_raw};
+    size_t value_lens[1] = {5};
+    if (ve_tls_template_add_values(tpl, 1710000000000LL, 0, 0, values, value_lens, 1, 0) != VE_TLS_OK) {
+        ve_tls_template_destroy(tpl);
+        ve_tls_producer_destroy(p);
+        return -1;
+    }
+
+    unsigned char * b = NULL;
+    size_t n = 0;
+    if (ve_tls_producer_export_raw_buffer(p, &b, &n) != VE_TLS_OK || !b || n < 4 + 4 + 4 + 8) {
+        ve_tls_template_destroy(tpl);
+        ve_tls_producer_destroy(p);
+        return -1;
+    }
+    uint32_t count = read_u32_le(b + 8);
+    if (count != 1) {
+        ve_tls_producer_free_raw_buffer(b);
+        ve_tls_template_destroy(tpl);
+        ve_tls_producer_destroy(p);
+        return -1;
+    }
+
+    size_t off = 4 + 4 + 4 + 8;
+    if (n < off + 8 + 8 + 1 + 4 + 4 + 4) {
+        ve_tls_producer_free_raw_buffer(b);
+        ve_tls_template_destroy(tpl);
+        ve_tls_producer_destroy(p);
+        return -1;
+    }
+    off += 8 + 8 + 1 + 4;
+    uint32_t hk_len = read_u32_le(b + off);
+    off += 4;
+    uint32_t data_size = read_u32_le(b + off);
+    off += 4;
+    if (n < off + (size_t)hk_len + (size_t)data_size) {
+        ve_tls_producer_free_raw_buffer(b);
+        ve_tls_template_destroy(tpl);
+        ve_tls_producer_destroy(p);
+        return -1;
+    }
+    off += (size_t)hk_len;
+    const unsigned char * body = b + off;
+    size_t body_len = (size_t)data_size;
+    const unsigned char k_expect[3] = {'K','E','Y'};
+    const unsigned char v_expect[5] = {'V','A','L','U','E'};
+    const unsigned char k_full[6] = {'K','E','Y','X','X','X'};
+    const unsigned char v_full[7] = {'V','A','L','U','E','Y','Y'};
+    int ok = mem_has(body, body_len, k_expect, sizeof(k_expect)) &&
+             mem_has(body, body_len, v_expect, sizeof(v_expect)) &&
+             !mem_has(body, body_len, k_full, sizeof(k_full)) &&
+             !mem_has(body, body_len, v_full, sizeof(v_full));
+
+    ve_tls_producer_free_raw_buffer(b);
+    ve_tls_template_destroy(tpl);
+    ve_tls_producer_destroy(p);
+    return ok ? 0 : -1;
+}
+
+static int test_template_add_values_value_count_mismatch_invalid(void) {
+    ve_tls_config cfg;
+    ve_tls_config_init(&cfg);
+    cfg.endpoint = "https://example.com";
+    cfg.region = "cn-beijing";
+    cfg.topic_id = "t";
+    cfg.access_key_id = "ak";
+    cfg.access_key_secret = "sk";
+    cfg.retry_policy.max_attempts = 1;
+    cfg.flush_interval_ms = 0;
+
+    ve_tls_producer * p = ve_tls_producer_create(&cfg);
+    if (!p) return -1;
+
+    const char * keys[2] = {"k1", "k2"};
+    size_t key_lens[2] = {2, 2};
+    ve_tls_log_template * tpl = ve_tls_template_create(p, keys, key_lens, 2, NULL);
+    if (!tpl) {
+        ve_tls_producer_destroy(p);
+        return -1;
+    }
+
+    const char * values[1] = {"v1"};
+    size_t value_lens[1] = {2};
+    ve_tls_result rc = ve_tls_template_add_values(tpl, 1710000000000LL, 0, 0, values, value_lens, 1, 0);
+    ve_tls_template_destroy(tpl);
+    ve_tls_producer_destroy(p);
+    return rc == VE_TLS_INVALID ? 0 : -1;
+}
+
+static int test_template_high_rate_submit_metrics(void) {
+    ve_tls_config cfg;
+    ve_tls_config_init(&cfg);
+    cfg.endpoint = "https://example.com";
+    cfg.region = "cn-beijing";
+    cfg.topic_id = "t";
+    cfg.access_key_id = "ak";
+    cfg.access_key_secret = "sk";
+    cfg.retry_policy.max_attempts = 1;
+    cfg.flush_interval_ms = 100000;
+    cfg.log_count_per_package = 1000000;
+    cfg.log_bytes_per_package = 100000000;
+
+    ve_tls_producer * p = ve_tls_producer_create(&cfg);
+    if (!p) return -1;
+    const char * keys[2] = {"k1", "k2"};
+    size_t key_lens[2] = {2, 2};
+    ve_tls_log_template * tpl = ve_tls_template_create(p, keys, key_lens, 2, "hk_tpl");
+    if (!tpl) {
+        ve_tls_producer_destroy(p);
+        return -1;
+    }
+
+    for (int i = 0; i < 64; i++) {
+        const char * values[2] = {"v1", "v2"};
+        size_t value_lens[2] = {2, 2};
+        if (ve_tls_template_add_values(tpl, 1710000000000LL + i, 0, 0, values, value_lens, 2, 0) != VE_TLS_OK) {
+            ve_tls_template_destroy(tpl);
+            ve_tls_producer_destroy(p);
+            return -1;
+        }
+    }
+
+    ve_tls_metrics m;
+    ve_tls_producer_get_metrics(p, &m);
+    ve_tls_template_destroy(tpl);
+    ve_tls_producer_destroy(p);
+    return (m.logs_enqueued_total >= 64 && m.logs_dropped_total == 0) ? 0 : -1;
 }
 
 static int test_import_raw_buffer_invalid_magic(void) {
@@ -5236,6 +5703,94 @@ static int test_runtime_config_update_effective_for_new_requests(void) {
     return ok ? 0 : -1;
 }
 
+static int test_runtime_snapshot_reflects_runtime_updates(void) {
+    ve_tls_config cfg;
+    ve_tls_config_init(&cfg);
+    cfg.endpoint = "https://old.example.com";
+    cfg.region = "cn-beijing";
+    cfg.topic_id = "old-topic";
+    cfg.access_key_id = "ak1";
+    cfg.access_key_secret = "sk1";
+    cfg.retry_policy.max_attempts = 1;
+    cfg.flush_interval_ms = 0;
+    cfg.http_client.do_request = test_http_capture_url_and_ak_do;
+    cfg.http_client.free_response = test_http_ok_free;
+
+    ve_tls_producer * p = ve_tls_producer_create(&cfg);
+    if (!p) {
+        return -1;
+    }
+    if (ve_tls_runtime_snapshot_refresh(p) != 0) {
+        ve_tls_producer_destroy(p);
+        return -1;
+    }
+
+    const ve_tls_runtime_snapshot * s1 = ve_tls_runtime_snapshot_acquire(p);
+    if (!s1) {
+        ve_tls_producer_destroy(p);
+        return -1;
+    }
+    if (!s1->endpoint || strcmp(s1->endpoint, "https://old.example.com") != 0) {
+        ve_tls_runtime_snapshot_release(s1);
+        ve_tls_producer_destroy(p);
+        return -1;
+    }
+    if (!s1->access_key_id || strcmp(s1->access_key_id, "ak1") != 0) {
+        ve_tls_runtime_snapshot_release(s1);
+        ve_tls_producer_destroy(p);
+        return -1;
+    }
+    ve_tls_runtime_snapshot_release(s1);
+
+    if (ve_tls_producer_update_endpoint(p, "https://new.example.com", "cn-beijing", "new-topic") != VE_TLS_OK) {
+        ve_tls_producer_destroy(p);
+        return -1;
+    }
+    if (ve_tls_producer_update_static_credentials(p, "ak2", "sk2", NULL) != VE_TLS_OK) {
+        ve_tls_producer_destroy(p);
+        return -1;
+    }
+
+    const ve_tls_runtime_snapshot * s2 = ve_tls_runtime_snapshot_acquire(p);
+    if (!s2) {
+        ve_tls_producer_destroy(p);
+        return -1;
+    }
+    int ok = (s2->endpoint && strcmp(s2->endpoint, "https://new.example.com") == 0 &&
+              s2->topic_id && strcmp(s2->topic_id, "new-topic") == 0 &&
+              s2->access_key_id && strcmp(s2->access_key_id, "ak2") == 0);
+    ve_tls_runtime_snapshot_release(s2);
+    ve_tls_producer_destroy(p);
+    return ok ? 0 : -1;
+}
+
+static int test_obj_pool_reuses_recent_item(void) {
+    ve_tls_obj_pool pool;
+    if (ve_tls_obj_pool_init(&pool, 64, 8) != 0) {
+        return -1;
+    }
+    void * p1 = ve_tls_obj_pool_get(&pool);
+    if (!p1) {
+        ve_tls_obj_pool_destroy(&pool);
+        return -1;
+    }
+    memset(p1, 0xAB, 64);
+    ve_tls_obj_pool_put(&pool, p1);
+    if (ve_tls_obj_pool_cached(&pool) != 1) {
+        ve_tls_obj_pool_destroy(&pool);
+        return -1;
+    }
+    void * p2 = ve_tls_obj_pool_get(&pool);
+    if (!p2) {
+        ve_tls_obj_pool_destroy(&pool);
+        return -1;
+    }
+    int ok = (p2 == p1);
+    ve_tls_obj_pool_put(&pool, p2);
+    ve_tls_obj_pool_destroy(&pool);
+    return ok ? 0 : -1;
+}
+
 static int test_runtime_update_rejected_during_close(void) {
     ve_tls_config cfg;
     ve_tls_config_init(&cfg);
@@ -5496,7 +6051,7 @@ static int test_send_queue_blocking_push(void) {
     ve_tls_platform_init_default(&platform);
 
     ve_tls_send_queue q;
-    if (ve_tls_send_queue_init(&q, &platform, 1) != 0) {
+    if (ve_tls_send_queue_init(&q, &platform, 1, NULL) != 0) {
         return -1;
     }
 
@@ -6808,8 +7363,10 @@ int main(void) {
     RUN(104, test_queue_push_front_pop_order());
     RUN(105, test_queue_idle_cleanup_removes_expired());
     RUN(106, test_queue_delayed_promote_due_moves_to_ready());
+    RUN(119, test_ingress_queue_push_pop_order_and_drain_state());
     RUN(107, test_worker_send_queue_full_drop_sampled_paths());
     RUN(108, test_worker_send_queue_block_timeout_path());
+    RUN(120, test_worker_pack_stage_unsupported_compress_drops_before_enqueue());
     RUN(8, test_manager_callback_no_raw_buffer_on_compress_error());
     RUN(9, test_time_parts_roundtrip_in_raw_buffer());
     RUN(10, test_auto_time_ns_when_time_missing());
@@ -6849,6 +7406,8 @@ int main(void) {
     RUN(23, test_create_fail_fast_missing_required());
     RUN(24, test_create_deep_copies_string_fields());
     RUN(25, test_runtime_config_update_effective_for_new_requests());
+    RUN(109, test_runtime_snapshot_reflects_runtime_updates());
+    RUN(110, test_obj_pool_reuses_recent_item());
     RUN(26, test_runtime_update_rejected_during_close());
     RUN(27, test_sender_builds_headers_and_http_options());
     RUN(28, test_raw_add_log_paths_ok());
@@ -6875,6 +7434,10 @@ int main(void) {
     RUN(113, test_send_queue_stop_causes_push_pop_fail());
     RUN(115, test_add_log_with_len_exports_one_record());
     RUN(116, test_export_raw_buffer_includes_tls_batch_with_len());
+    RUN(121, test_template_lifecycle_and_add_values_exports_one_record());
+    RUN(122, test_template_add_values_value_count_mismatch_invalid());
+    RUN(123, test_template_high_rate_submit_metrics());
+    RUN(124, test_pipeline_v2_functional_matrix_raw_kv_template_and_runtime_updates());
 #if defined(VE_TLS_HAVE_ZLIB)
     RUN(37, test_zlib_compress_roundtrip());
 #endif

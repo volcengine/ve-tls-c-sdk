@@ -224,8 +224,75 @@ static char * ve_tls_extract_host(const char * endpoint) {
     return ve_tls_strdup_n(p, n);
 }
 
-static int ve_tls_headers_append(char ** headers, size_t * len, size_t * cap, const char * k, const char * v) {
-    if (!headers || !len || !cap || !k || !v) {
+static void ve_tls_header_buf_release(ve_tls_producer * producer, char * buf, int pooled) {
+    if (!buf) {
+        return;
+    }
+    if (pooled && producer && producer->header_buf_pool.obj_size > 0) {
+        ve_tls_obj_pool_put(&producer->header_buf_pool, buf);
+        return;
+    }
+    ve_tls_free(buf);
+}
+
+static int ve_tls_headers_grow(ve_tls_producer * producer, char ** headers, size_t len, size_t * cap, size_t required, int * pooled) {
+    if (!headers || !cap || !pooled) {
+        return -1;
+    }
+    size_t next = *cap ? *cap : 256;
+    while (next < required) {
+        if (next > (size_t)-1 / 2) {
+            next = required;
+            break;
+        }
+        next *= 2;
+    }
+    if (*pooled) {
+        char * p = (char *)ve_tls_malloc(next);
+        if (!p) {
+            return -1;
+        }
+        if (*headers && len > 0) {
+            memcpy(p, *headers, len);
+        }
+        p[len] = 0;
+        ve_tls_header_buf_release(producer, *headers, 1);
+        *headers = p;
+        *cap = next;
+        *pooled = 0;
+        return 0;
+    }
+    char * p = (char *)ve_tls_realloc(*headers, next);
+    if (!p) {
+        return -1;
+    }
+    *headers = p;
+    *cap = next;
+    return 0;
+}
+
+static void ve_tls_headers_try_use_pool(ve_tls_producer * producer, char ** headers, size_t len, size_t * cap, int * pooled) {
+    if (!producer || !headers || !*headers || !cap || !pooled || *pooled) {
+        return;
+    }
+    size_t pool_cap = producer->header_buf_pool.obj_size;
+    if (pool_cap == 0 || len + 1 > pool_cap) {
+        return;
+    }
+    char * pooled_buf = (char *)ve_tls_obj_pool_get(&producer->header_buf_pool);
+    if (!pooled_buf) {
+        return;
+    }
+    memcpy(pooled_buf, *headers, len);
+    pooled_buf[len] = 0;
+    ve_tls_free(*headers);
+    *headers = pooled_buf;
+    *cap = pool_cap;
+    *pooled = 1;
+}
+
+static int ve_tls_headers_append(ve_tls_producer * producer, char ** headers, size_t * len, size_t * cap, int * pooled, const char * k, const char * v) {
+    if (!headers || !len || !cap || !pooled || !k || !v) {
         return -1;
     }
     size_t kn = strlen(k);
@@ -243,20 +310,9 @@ static int ve_tls_headers_append(char ** headers, size_t * len, size_t * cap, co
     if (required > (size_t)-1 - 1) return -1;
     required += 1;
     if (required > *cap) {
-        size_t next = *cap ? *cap : 256;
-        while (next < required) {
-            if (next > (size_t)-1 / 2) {
-                next = required;
-                break;
-            }
-            next *= 2;
-        }
-        char * p = (char *)ve_tls_realloc(*headers, next);
-        if (!p) {
+        if (ve_tls_headers_grow(producer, headers, *len, cap, required, pooled) != 0) {
             return -1;
         }
-        *headers = p;
-        *cap = next;
     }
     int written = snprintf(*headers + *len, *cap - *len, "%s: %s\n", k, v);
     if (written <= 0) {
@@ -384,6 +440,25 @@ static void ve_tls_static_cred_cache_free(ve_tls_static_cred_cache * cache) {
     memset(cache, 0, sizeof(*cache));
 }
 
+static const ve_tls_runtime_snapshot * ve_tls_snapshot_acquire_static_cred(ve_tls_producer * producer, int64_t * out_version) {
+    if (!producer || !out_version) {
+        return NULL;
+    }
+    for (int i = 0; i < 4; i++) {
+        int64_t want_version = __atomic_load_n(&producer->static_cred_version, __ATOMIC_ACQUIRE);
+        const ve_tls_runtime_snapshot * snapshot = ve_tls_runtime_snapshot_acquire(producer);
+        if (!snapshot) {
+            return NULL;
+        }
+        if (snapshot->static_cred_version == want_version) {
+            *out_version = want_version;
+            return snapshot;
+        }
+        ve_tls_runtime_snapshot_release(snapshot);
+    }
+    return NULL;
+}
+
 static int ve_tls_static_cred_cache_refresh(ve_tls_producer * producer, ve_tls_static_cred_cache * cache) {
     if (!producer || !cache) {
         return -1;
@@ -392,12 +467,14 @@ static int ve_tls_static_cred_cache_refresh(ve_tls_producer * producer, ve_tls_s
     char * sk = NULL;
     char * tok = NULL;
     int64_t version = 0;
-    producer->config.platform.mutex_lock(producer->mutex);
-    version = producer->static_cred_version;
-    ak = producer->cfg_access_key_id ? ve_tls_strdup(producer->cfg_access_key_id) : NULL;
-    sk = producer->cfg_access_key_secret ? ve_tls_strdup(producer->cfg_access_key_secret) : NULL;
-    tok = producer->cfg_security_token ? ve_tls_strdup(producer->cfg_security_token) : NULL;
-    producer->config.platform.mutex_unlock(producer->mutex);
+    const ve_tls_runtime_snapshot * snapshot = ve_tls_snapshot_acquire_static_cred(producer, &version);
+    if (!snapshot) {
+        return -2;
+    }
+    ak = snapshot->access_key_id ? ve_tls_strdup(snapshot->access_key_id) : NULL;
+    sk = snapshot->access_key_secret ? ve_tls_strdup(snapshot->access_key_secret) : NULL;
+    tok = snapshot->security_token ? ve_tls_strdup(snapshot->security_token) : NULL;
+    ve_tls_runtime_snapshot_release(snapshot);
     if (!ak || !sk) {
         ve_tls_free(ak);
         ve_tls_free(sk);
@@ -670,6 +747,11 @@ static void ve_tls_send_cfg_cache_free(ve_tls_send_cfg_cache * s) {
     memset(s, 0, sizeof(*s));
 }
 
+static void ve_tls_sender_thread_cache_clear(void) {
+    ve_tls_send_cfg_cache_free(&g_send_cfg_cache);
+    ve_tls_static_cred_cache_free(&g_static_cred_cache);
+}
+
 static char * ve_tls_build_topic_query(const char * topic_id) {
     if (!topic_id || topic_id[0] == 0) {
         return ve_tls_strdup("");
@@ -692,33 +774,53 @@ static char * ve_tls_build_topic_query(const char * topic_id) {
     return query;
 }
 
+static const ve_tls_runtime_snapshot * ve_tls_snapshot_acquire_send_cfg(ve_tls_producer * producer, int64_t * out_version) {
+    if (!producer || !out_version) {
+        return NULL;
+    }
+    for (int i = 0; i < 4; i++) {
+        int64_t want_version = __atomic_load_n(&producer->send_cfg_version, __ATOMIC_ACQUIRE);
+        const ve_tls_runtime_snapshot * snapshot = ve_tls_runtime_snapshot_acquire(producer);
+        if (!snapshot) {
+            return NULL;
+        }
+        if (snapshot->send_cfg_version == want_version) {
+            *out_version = want_version;
+            return snapshot;
+        }
+        ve_tls_runtime_snapshot_release(snapshot);
+    }
+    return NULL;
+}
+
 static int ve_tls_send_cfg_cache_refresh(ve_tls_producer * producer, ve_tls_send_cfg_cache * out) {
     if (!producer || !out) {
         return -1;
     }
     ve_tls_send_cfg_cache next;
     memset(&next, 0, sizeof(next));
-
-    producer->config.platform.mutex_lock(producer->mutex);
-    next.version = producer->send_cfg_version;
-    next.endpoint = producer->cfg_endpoint ? ve_tls_strdup(producer->cfg_endpoint) : ve_tls_strdup("");
-    next.topic_id = producer->cfg_topic_id ? ve_tls_strdup(producer->cfg_topic_id) : ve_tls_strdup("");
-    next.region = producer->cfg_region ? ve_tls_strdup(producer->cfg_region) : ve_tls_strdup("");
-    next.api_version = producer->cfg_api_version ? ve_tls_strdup(producer->cfg_api_version) : ve_tls_strdup(VE_TLS_C_SDK_API_VERSION);
-    next.compress_type = producer->cfg_compress_type ? ve_tls_strdup(producer->cfg_compress_type) : ve_tls_strdup("none");
-    next.default_hash_key = producer->cfg_hash_key ? ve_tls_strdup(producer->cfg_hash_key) : NULL;
-    next.ca_cert_path = producer->cfg_ca_cert_path ? ve_tls_strdup(producer->cfg_ca_cert_path) : NULL;
-    next.proxy = producer->cfg_proxy ? ve_tls_strdup(producer->cfg_proxy) : NULL;
-    next.user_agent = producer->cfg_user_agent ? ve_tls_strdup(producer->cfg_user_agent) : NULL;
-    next.connect_timeout_ms = producer->config.connect_timeout_ms;
-    next.request_timeout_ms = producer->config.request_timeout_ms;
-    next.tls_verify_peer = producer->config.tls_verify_peer;
-    next.tls_verify_host = producer->config.tls_verify_host;
-    next.http_debug = producer->config.http_debug;
-    next.tcp_keepalive = producer->config.tcp_keepalive;
-    next.tcp_keepidle = producer->config.tcp_keepidle;
-    next.tcp_keepintvl = producer->config.tcp_keepintvl;
-    producer->config.platform.mutex_unlock(producer->mutex);
+    const ve_tls_runtime_snapshot * snapshot = ve_tls_snapshot_acquire_send_cfg(producer, &next.version);
+    if (!snapshot) {
+        return -3;
+    }
+    next.endpoint = snapshot->endpoint ? ve_tls_strdup(snapshot->endpoint) : ve_tls_strdup("");
+    next.topic_id = snapshot->topic_id ? ve_tls_strdup(snapshot->topic_id) : ve_tls_strdup("");
+    next.region = snapshot->region ? ve_tls_strdup(snapshot->region) : ve_tls_strdup("");
+    next.api_version = snapshot->api_version ? ve_tls_strdup(snapshot->api_version) : ve_tls_strdup(VE_TLS_C_SDK_API_VERSION);
+    next.compress_type = snapshot->compress_type ? ve_tls_strdup(snapshot->compress_type) : ve_tls_strdup("none");
+    next.default_hash_key = snapshot->default_hash_key ? ve_tls_strdup(snapshot->default_hash_key) : NULL;
+    next.ca_cert_path = snapshot->ca_cert_path ? ve_tls_strdup(snapshot->ca_cert_path) : NULL;
+    next.proxy = snapshot->proxy ? ve_tls_strdup(snapshot->proxy) : NULL;
+    next.user_agent = snapshot->user_agent ? ve_tls_strdup(snapshot->user_agent) : NULL;
+    next.connect_timeout_ms = snapshot->connect_timeout_ms;
+    next.request_timeout_ms = snapshot->request_timeout_ms;
+    next.tls_verify_peer = snapshot->tls_verify_peer;
+    next.tls_verify_host = snapshot->tls_verify_host;
+    next.http_debug = snapshot->http_debug;
+    next.tcp_keepalive = snapshot->tcp_keepalive;
+    next.tcp_keepidle = snapshot->tcp_keepidle;
+    next.tcp_keepintvl = snapshot->tcp_keepintvl;
+    ve_tls_runtime_snapshot_release(snapshot);
 
     if (!next.endpoint || !next.topic_id || !next.region || !next.api_version || !next.compress_type) {
         ve_tls_send_cfg_cache_free(&next);
@@ -729,7 +831,7 @@ static int ve_tls_send_cfg_cache_refresh(ve_tls_producer * producer, ve_tls_send
     next.query = ve_tls_build_topic_query(next.topic_id);
     if (!next.url || !next.host || !next.query) {
         ve_tls_send_cfg_cache_free(&next);
-        return -1;
+        return -2;
     }
     next.producer = producer;
     ve_tls_send_cfg_cache_free(out);
@@ -757,26 +859,31 @@ static ve_tls_send_callbacks ve_tls_capture_callbacks(ve_tls_producer * producer
     return out;
 }
 
-#define VE_TLS_SMALL_PAYLOAD_NO_COMPRESS_THRESHOLD 256
-
-static int ve_tls_is_none_compress_type(const char * compress_type) {
-    return (!compress_type || compress_type[0] == 0 || strcasecmp(compress_type, "none") == 0);
-}
-
-static int ve_tls_is_supported_codec(const char * compress_type) {
-    if (!compress_type) {
-        return 0;
+static int ve_tls_sender_resolve_payload(ve_tls_producer * producer, const ve_tls_send_task * task, const unsigned char ** out_body, size_t * out_body_size, size_t * out_raw_body_size, const char ** out_compress_type) {
+    if (!producer || !task || !out_body || !out_body_size || !out_raw_body_size || !out_compress_type) {
+        return -1;
     }
-    return (strcasecmp(compress_type, "lz4") == 0 || strcasecmp(compress_type, "zlib") == 0);
-}
+    const unsigned char * body = task->body;
+    size_t body_size = task->body_size;
+    size_t raw_body_size = task->raw_body_size > 0 ? task->raw_body_size : task->body_size;
+    const char * compress_type = "none";
 
-static int ve_tls_should_skip_compress(const char * compress_type, size_t body_size) {
-    if (ve_tls_is_none_compress_type(compress_type)) {
-        return 1;
+    if (task->precompressed && task->precompressed_size > 0) {
+        body = task->precompressed;
+        body_size = task->precompressed_size;
+        compress_type = producer->config.compress_type ? producer->config.compress_type : "none";
     }
-    if (ve_tls_is_supported_codec(compress_type) && body_size <= VE_TLS_SMALL_PAYLOAD_NO_COMPRESS_THRESHOLD) {
-        return 1;
+    if (!body || body_size == 0) {
+        return -1;
     }
+    if (raw_body_size == 0) {
+        raw_body_size = body_size;
+    }
+
+    *out_body = body;
+    *out_body_size = body_size;
+    *out_raw_body_size = raw_body_size;
+    *out_compress_type = compress_type;
     return 0;
 }
 
@@ -790,8 +897,13 @@ static int ve_tls_send_put_logs(ve_tls_producer * producer, const char * access_
     }
     int64_t cfg_version = __atomic_load_n(&producer->send_cfg_version, __ATOMIC_ACQUIRE);
     if (g_send_cfg_cache.producer != producer || g_send_cfg_cache.version != cfg_version) {
-        if (ve_tls_send_cfg_cache_refresh(producer, &g_send_cfg_cache) != 0) {
-            ve_tls_error_set_client(out_error, "snapshot config failed");
+        int cfg_rc = ve_tls_send_cfg_cache_refresh(producer, &g_send_cfg_cache);
+        if (cfg_rc != 0) {
+            if (cfg_rc == -2) {
+                ve_tls_error_set_client(out_error, "build url failed");
+            } else {
+                ve_tls_error_set_client(out_error, "snapshot config failed");
+            }
             return -1;
         }
     }
@@ -803,6 +915,7 @@ static int ve_tls_send_put_logs(ve_tls_producer * producer, const char * access_
     char * headers = NULL;
     size_t hlen = 0;
     size_t hcap = 0;
+    int headers_pooled = 0;
 
     char raw_size[32];
     snprintf(raw_size, sizeof(raw_size), "%zu", raw_body_size);
@@ -814,11 +927,11 @@ static int ve_tls_send_put_logs(ve_tls_producer * producer, const char * access_
     snprintf(latest_s, sizeof(latest_s), "%lld", (long long)latest);
     const char * compress_type = actual_compress_type ? actual_compress_type : (cfg->compress_type ? cfg->compress_type : "none");
 
-    if (ve_tls_headers_append(&headers, &hlen, &hcap, "Content-Type", "application/x-protobuf") != 0 ||
-        ve_tls_headers_append(&headers, &hlen, &hcap, "x-tls-apiversion", cfg->api_version ? cfg->api_version : VE_TLS_C_SDK_API_VERSION) != 0 ||
-        ve_tls_headers_append(&headers, &hlen, &hcap, "x-tls-bodyrawsize", raw_size) != 0 ||
-        ve_tls_headers_append(&headers, &hlen, &hcap, "x-tls-compresstype", compress_type) != 0) {
-        ve_tls_free(headers);
+    if (ve_tls_headers_append(producer, &headers, &hlen, &hcap, &headers_pooled, "Content-Type", "application/x-protobuf") != 0 ||
+        ve_tls_headers_append(producer, &headers, &hlen, &hcap, &headers_pooled, "x-tls-apiversion", cfg->api_version ? cfg->api_version : VE_TLS_C_SDK_API_VERSION) != 0 ||
+        ve_tls_headers_append(producer, &headers, &hlen, &hcap, &headers_pooled, "x-tls-bodyrawsize", raw_size) != 0 ||
+        ve_tls_headers_append(producer, &headers, &hlen, &hcap, &headers_pooled, "x-tls-compresstype", compress_type) != 0) {
+        ve_tls_header_buf_release(producer, headers, headers_pooled);
         ve_tls_error_set_client(out_error, "build headers failed");
         return -1;
     }
@@ -827,14 +940,15 @@ static int ve_tls_send_put_logs(ve_tls_producer * producer, const char * access_
         hk = cfg->default_hash_key;
     }
     if (hk && hk[0] != 0) {
-        if (ve_tls_headers_append(&headers, &hlen, &hcap, "x-tls-hashkey", hk) != 0) {
-            ve_tls_free(headers);
+        if (ve_tls_headers_append(producer, &headers, &hlen, &hcap, &headers_pooled, "x-tls-hashkey", hk) != 0) {
+            ve_tls_header_buf_release(producer, headers, headers_pooled);
             ve_tls_error_set_client(out_error, "build headers failed");
             return -1;
         }
     }
 
     char * signed_headers = NULL;
+    int signed_pooled = 0;
     int sign_ok = ve_tls_sign_v4_append(
         access_key_id,
         access_key_secret,
@@ -851,32 +965,18 @@ static int ve_tls_send_put_logs(ve_tls_producer * producer, const char * access_
         &signed_headers
     );
     if (sign_ok != 0) {
-        ve_tls_free(headers);
+        ve_tls_header_buf_release(producer, headers, headers_pooled);
         ve_tls_error_set_client(out_error, "sign request failed");
         return -1;
     }
     size_t signed_len = signed_headers ? strlen(signed_headers) : 0;
     size_t signed_cap = signed_len + 1;
-    size_t append_need = (strlen("log-count") + 2 + strlen(count) + 1) +
-                         (strlen("earliest-log-time") + 2 + strlen(earliest_s) + 1) +
-                         (strlen("latest-log-time") + 2 + strlen(latest_s) + 1);
-    if (signed_cap <= (size_t)-1 - append_need) {
-        size_t target_cap = signed_cap + append_need;
-        char * grown = (char *)ve_tls_realloc(signed_headers, target_cap);
-        if (!grown) {
-            ve_tls_free(headers);
-            ve_tls_free(signed_headers);
-            ve_tls_error_set_client(out_error, "build headers failed");
-            return -1;
-        }
-        signed_headers = grown;
-        signed_cap = target_cap;
-    }
-    if (ve_tls_headers_append(&signed_headers, &signed_len, &signed_cap, "log-count", count) != 0 ||
-        ve_tls_headers_append(&signed_headers, &signed_len, &signed_cap, "earliest-log-time", earliest_s) != 0 ||
-        ve_tls_headers_append(&signed_headers, &signed_len, &signed_cap, "latest-log-time", latest_s) != 0) {
-        ve_tls_free(headers);
-        ve_tls_free(signed_headers);
+    ve_tls_headers_try_use_pool(producer, &signed_headers, signed_len, &signed_cap, &signed_pooled);
+    if (ve_tls_headers_append(producer, &signed_headers, &signed_len, &signed_cap, &signed_pooled, "log-count", count) != 0 ||
+        ve_tls_headers_append(producer, &signed_headers, &signed_len, &signed_cap, &signed_pooled, "earliest-log-time", earliest_s) != 0 ||
+        ve_tls_headers_append(producer, &signed_headers, &signed_len, &signed_cap, &signed_pooled, "latest-log-time", latest_s) != 0) {
+        ve_tls_header_buf_release(producer, headers, headers_pooled);
+        ve_tls_header_buf_release(producer, signed_headers, signed_pooled);
         ve_tls_error_set_client(out_error, "build headers failed");
         return -1;
     }
@@ -907,8 +1007,8 @@ static int ve_tls_send_put_logs(ve_tls_producer * producer, const char * access_
 
     ve_tls_http_debug_log_request(&req);
     int rc = producer->config.http_client.do_request(&producer->config.http_client, &req, &resp);
-    ve_tls_free(headers);
-    ve_tls_free(signed_headers);
+    ve_tls_header_buf_release(producer, headers, headers_pooled);
+    ve_tls_header_buf_release(producer, signed_headers, signed_pooled);
 
     if (rc != 0) {
         ve_tls_http_debug_log_failure(&req, &resp);
@@ -1010,87 +1110,35 @@ int ve_tls_sender_step(ve_tls_producer * producer) {
     return 0;
 
 have_task: {
-    ve_tls_bytes compressed;
-    memset(&compressed, 0, sizeof(compressed));
-    int compressed_owned = 0;
-    const unsigned char * send_body_data = task.body;
-    size_t send_body_size = task.body_size;
-    size_t raw_body_size = task.raw_body_size;
-    const char * send_compress_type = producer->config.compress_type ? producer->config.compress_type : "none";
-
-    if (task.precompressed && task.precompressed_size > 0) {
-        send_body_data = task.precompressed;
-        send_body_size = task.precompressed_size;
-    } else if (ve_tls_should_skip_compress(producer->config.compress_type, task.body_size)) {
-        send_compress_type = "none";
-    } else {
-        int c_rc = ve_tls_compress_apply(producer->config.compress_type, task.body, task.body_size, &compressed);
-        if (c_rc == 0 && compressed.data && compressed.size > 0) {
-            compressed_owned = 1;
-            send_body_data = compressed.data;
-            send_body_size = compressed.size;
-            send_compress_type = producer->config.compress_type;
-        } else if (c_rc == -2) {
-            send_compress_type = "none";
-        } else if (c_rc == -1 || c_rc == -3) {
-            ve_tls_error err;
-            memset(&err, 0, sizeof(err));
-            err.http_code = -1;
-            err.transport_kind = VE_TLS_TRANSPORT_GENERIC;
-            err.transport_code = 0;
-            err.retryable = 0;
-            err.error_code = ve_tls_strdup("ClientError");
-            err.error_message = ve_tls_strdup(c_rc == -1 ? "compress failed" : "unsupported compress_type");
-            ve_tls_send_callbacks cbs = ve_tls_capture_callbacks(producer);
-            if (cbs.cb) {
-                cbs.cb(VE_TLS_DROP_ERROR, task.batch_bytes, 0, NULL, err.error_message, NULL, cbs.cb_param, task.start_id, task.end_id);
-            }
-            if (cbs.cb2) {
-                cbs.cb2(VE_TLS_DROP_ERROR, task.batch_bytes, 0, &err, NULL, cbs.cb2_param, task.start_id, task.end_id);
-            }
-            ve_tls_error_free_fields(&err);
-            ve_tls_send_task_free(&task);
-            producer->config.platform.mutex_lock(producer->mutex);
-            ve_tls_key_queue_finish(producer, kq);
-            producer->config.platform.mutex_unlock(producer->mutex);
-            if (producer->use_global_env) {
-                ve_tls_env_notify(producer);
-            }
-            return 1;
+    const unsigned char * send_body_data = NULL;
+    size_t send_body_size = 0;
+    size_t raw_body_size = 0;
+    const char * send_compress_type = "none";
+    if (ve_tls_sender_resolve_payload(producer, &task, &send_body_data, &send_body_size, &raw_body_size, &send_compress_type) != 0) {
+        ve_tls_error err;
+        memset(&err, 0, sizeof(err));
+        err.http_code = -1;
+        err.transport_kind = VE_TLS_TRANSPORT_GENERIC;
+        err.transport_code = 0;
+        err.retryable = 0;
+        err.error_code = ve_tls_strdup("ClientError");
+        err.error_message = ve_tls_strdup("invalid send payload");
+        ve_tls_send_callbacks cbs = ve_tls_capture_callbacks(producer);
+        if (cbs.cb) {
+            cbs.cb(VE_TLS_DROP_ERROR, task.batch_bytes, 0, NULL, err.error_message, NULL, cbs.cb_param, task.start_id, task.end_id);
         }
-    }
-
-    if (producer->config.agg_strategy == 1 && producer->config.agg_max_compressed_bytes_per_request > 0) {
-        size_t maxc = (size_t)producer->config.agg_max_compressed_bytes_per_request;
-        if (maxc > 0 && send_body_size > maxc) {
-            ve_tls_error err;
-            memset(&err, 0, sizeof(err));
-            err.http_code = -1;
-            err.transport_kind = VE_TLS_TRANSPORT_GENERIC;
-            err.transport_code = 0;
-            err.retryable = 0;
-            err.error_code = ve_tls_strdup("PayloadTooLarge");
-            err.error_message = ve_tls_strdup("payload too large after compression");
-            ve_tls_send_callbacks cbs = ve_tls_capture_callbacks(producer);
-            if (cbs.cb) {
-                cbs.cb(VE_TLS_DROP_ERROR, task.batch_bytes, 0, NULL, err.error_message, NULL, cbs.cb_param, task.start_id, task.end_id);
-            }
-            if (cbs.cb2) {
-                cbs.cb2(VE_TLS_DROP_ERROR, task.batch_bytes, 0, &err, NULL, cbs.cb2_param, task.start_id, task.end_id);
-            }
-            ve_tls_error_free_fields(&err);
-            if (compressed_owned) {
-                ve_tls_bytes_free(&compressed);
-            }
-            ve_tls_send_task_free(&task);
-            producer->config.platform.mutex_lock(producer->mutex);
-            ve_tls_key_queue_finish(producer, kq);
-            producer->config.platform.mutex_unlock(producer->mutex);
-            if (producer->use_global_env) {
-                ve_tls_env_notify(producer);
-            }
-            return 1;
+        if (cbs.cb2) {
+            cbs.cb2(VE_TLS_DROP_ERROR, task.batch_bytes, 0, &err, NULL, cbs.cb2_param, task.start_id, task.end_id);
         }
+        ve_tls_error_free_fields(&err);
+        ve_tls_send_task_free(&task);
+        producer->config.platform.mutex_lock(producer->mutex);
+        ve_tls_key_queue_finish(producer, kq);
+        producer->config.platform.mutex_unlock(producer->mutex);
+        if (producer->use_global_env) {
+            ve_tls_env_notify(producer);
+        }
+        return 1;
     }
 
     int32_t attempt = 0;
@@ -1114,13 +1162,6 @@ have_task: {
             if (next <= 0) {
                 next = gate_now + 10;
             }
-            if (compressed_owned) {
-                task.precompressed = compressed.data;
-                task.precompressed_size = compressed.size;
-                compressed.data = NULL;
-                compressed.size = 0;
-                compressed_owned = 0;
-            }
             producer->config.platform.mutex_lock(producer->mutex);
             (void)ve_tls_key_queue_push_front_task(kq, &task);
             memset(&task, 0, sizeof(task));
@@ -1129,9 +1170,6 @@ have_task: {
             producer->config.platform.cond_signal(producer->send_cond);
             producer->config.platform.mutex_unlock(producer->mutex);
             ve_tls_error_free_fields(&err);
-            if (compressed_owned) {
-                ve_tls_bytes_free(&compressed);
-            }
             if (producer->use_global_env) {
                 ve_tls_env_notify(producer);
             }
@@ -1244,9 +1282,6 @@ have_task: {
     }
     ve_tls_key_breaker_on_final_result(producer, kq, sent_ok ? 1 : 0);
     ve_tls_error_free_fields(&err);
-    if (compressed_owned) {
-        ve_tls_bytes_free(&compressed);
-    }
     ve_tls_send_task_free(&task);
     producer->config.platform.mutex_lock(producer->mutex);
     ve_tls_key_queue_finish(producer, kq);
@@ -1264,84 +1299,35 @@ static void * ve_tls_sender_main_fast(void * arg) {
         ve_tls_send_task task;
         memset(&task, 0, sizeof(task));
         if (ve_tls_send_queue_pop(&producer->send_queue, &task, -1) != 0) {
+            ve_tls_sender_thread_cache_clear();
             return NULL;
         }
         (void)__atomic_fetch_add(&producer->fast_inflight, 1, __ATOMIC_RELAXED);
 
-        ve_tls_bytes compressed;
-        memset(&compressed, 0, sizeof(compressed));
-        int compressed_owned = 0;
-        const unsigned char * send_body_data = task.body;
-        size_t send_body_size = task.body_size;
-        size_t raw_body_size = task.raw_body_size;
-        const char * send_compress_type = producer->config.compress_type ? producer->config.compress_type : "none";
-
-        if (task.precompressed && task.precompressed_size > 0) {
-            send_body_data = task.precompressed;
-            send_body_size = task.precompressed_size;
-        } else if (ve_tls_should_skip_compress(producer->config.compress_type, task.body_size)) {
-            send_compress_type = "none";
-        } else {
-            int c_rc = ve_tls_compress_apply(producer->config.compress_type, task.body, task.body_size, &compressed);
-            if (c_rc == 0 && compressed.data && compressed.size > 0) {
-                compressed_owned = 1;
-                send_body_data = compressed.data;
-                send_body_size = compressed.size;
-                send_compress_type = producer->config.compress_type;
-            } else if (c_rc == -2) {
-                send_compress_type = "none";
-            } else if (c_rc == -1 || c_rc == -3) {
-                ve_tls_error err;
-                memset(&err, 0, sizeof(err));
-                err.http_code = -1;
-                err.transport_kind = VE_TLS_TRANSPORT_GENERIC;
-                err.transport_code = 0;
-                err.retryable = 0;
-                err.error_code = ve_tls_strdup("ClientError");
-                err.error_message = ve_tls_strdup(c_rc == -1 ? "compress failed" : "unsupported compress_type");
-                ve_tls_send_callbacks cbs = ve_tls_capture_callbacks(producer);
-                if (cbs.cb) {
-                    cbs.cb(VE_TLS_DROP_ERROR, task.batch_bytes, 0, NULL, err.error_message, NULL, cbs.cb_param, task.start_id, task.end_id);
-                }
-                if (cbs.cb2) {
-                    cbs.cb2(VE_TLS_DROP_ERROR, task.batch_bytes, 0, &err, NULL, cbs.cb2_param, task.start_id, task.end_id);
-                }
-                ve_tls_error_free_fields(&err);
-                if (compressed_owned) {
-                    ve_tls_bytes_free(&compressed);
-                }
-                ve_tls_send_task_free(&task);
-                (void)__atomic_fetch_sub(&producer->fast_inflight, 1, __ATOMIC_RELAXED);
-                continue;
+        const unsigned char * send_body_data = NULL;
+        size_t send_body_size = 0;
+        size_t raw_body_size = 0;
+        const char * send_compress_type = "none";
+        if (ve_tls_sender_resolve_payload(producer, &task, &send_body_data, &send_body_size, &raw_body_size, &send_compress_type) != 0) {
+            ve_tls_error err;
+            memset(&err, 0, sizeof(err));
+            err.http_code = -1;
+            err.transport_kind = VE_TLS_TRANSPORT_GENERIC;
+            err.transport_code = 0;
+            err.retryable = 0;
+            err.error_code = ve_tls_strdup("ClientError");
+            err.error_message = ve_tls_strdup("invalid send payload");
+            ve_tls_send_callbacks cbs = ve_tls_capture_callbacks(producer);
+            if (cbs.cb) {
+                cbs.cb(VE_TLS_DROP_ERROR, task.batch_bytes, 0, NULL, err.error_message, NULL, cbs.cb_param, task.start_id, task.end_id);
             }
-        }
-
-        if (producer->config.agg_strategy == 1 && producer->config.agg_max_compressed_bytes_per_request > 0) {
-            size_t maxc = (size_t)producer->config.agg_max_compressed_bytes_per_request;
-            if (maxc > 0 && send_body_size > maxc) {
-                ve_tls_error err;
-                memset(&err, 0, sizeof(err));
-                err.http_code = -1;
-                err.transport_kind = VE_TLS_TRANSPORT_GENERIC;
-                err.transport_code = 0;
-                err.retryable = 0;
-                err.error_code = ve_tls_strdup("PayloadTooLarge");
-                err.error_message = ve_tls_strdup("payload too large after compression");
-                ve_tls_send_callbacks cbs = ve_tls_capture_callbacks(producer);
-                if (cbs.cb) {
-                    cbs.cb(VE_TLS_DROP_ERROR, task.batch_bytes, 0, NULL, err.error_message, NULL, cbs.cb_param, task.start_id, task.end_id);
-                }
-                if (cbs.cb2) {
-                    cbs.cb2(VE_TLS_DROP_ERROR, task.batch_bytes, 0, &err, NULL, cbs.cb2_param, task.start_id, task.end_id);
-                }
-                ve_tls_error_free_fields(&err);
-                if (compressed_owned) {
-                    ve_tls_bytes_free(&compressed);
-                }
-                ve_tls_send_task_free(&task);
-                (void)__atomic_fetch_sub(&producer->fast_inflight, 1, __ATOMIC_RELAXED);
-                continue;
+            if (cbs.cb2) {
+                cbs.cb2(VE_TLS_DROP_ERROR, task.batch_bytes, 0, &err, NULL, cbs.cb2_param, task.start_id, task.end_id);
             }
+            ve_tls_error_free_fields(&err);
+            ve_tls_send_task_free(&task);
+            (void)__atomic_fetch_sub(&producer->fast_inflight, 1, __ATOMIC_RELAXED);
+            continue;
         }
 
         int32_t attempt = 0;
@@ -1431,9 +1417,6 @@ static void * ve_tls_sender_main_fast(void * arg) {
             ve_tls_free(msg);
         }
         ve_tls_error_free_fields(&err);
-        if (compressed_owned) {
-            ve_tls_bytes_free(&compressed);
-        }
         ve_tls_send_task_free(&task);
         (void)__atomic_fetch_sub(&producer->fast_inflight, 1, __ATOMIC_RELAXED);
     }
@@ -1545,6 +1528,7 @@ next_task:
                 producer->config.platform.mutex_lock(producer->mutex);
                 if (!pending) {
                     producer->config.platform.mutex_unlock(producer->mutex);
+                    ve_tls_sender_thread_cache_clear();
                     return NULL;
                 }
             }
@@ -1565,81 +1549,32 @@ next_task:
         }
         producer->config.platform.mutex_unlock(producer->mutex);
 
-        ve_tls_bytes compressed;
-        memset(&compressed, 0, sizeof(compressed));
-        int compressed_owned = 0;
-        const unsigned char * send_body_data = task.body;
-        size_t send_body_size = task.body_size;
-        size_t raw_body_size = task.raw_body_size;
-        const char * send_compress_type = producer->config.compress_type ? producer->config.compress_type : "none";
-
-        if (task.precompressed && task.precompressed_size > 0) {
-            send_body_data = task.precompressed;
-            send_body_size = task.precompressed_size;
-        } else if (ve_tls_should_skip_compress(producer->config.compress_type, task.body_size)) {
-            send_compress_type = "none";
-        } else {
-            int c_rc = ve_tls_compress_apply(producer->config.compress_type, task.body, task.body_size, &compressed);
-            if (c_rc == 0 && compressed.data && compressed.size > 0) {
-                compressed_owned = 1;
-                send_body_data = compressed.data;
-                send_body_size = compressed.size;
-                send_compress_type = producer->config.compress_type;
-            } else if (c_rc == -2) {
-                send_compress_type = "none";
-            } else if (c_rc == -1 || c_rc == -3) {
-                ve_tls_error err;
-                memset(&err, 0, sizeof(err));
-                err.http_code = -1;
-                err.transport_kind = VE_TLS_TRANSPORT_GENERIC;
-                err.transport_code = 0;
-                err.retryable = 0;
-                err.error_code = ve_tls_strdup("ClientError");
-                err.error_message = ve_tls_strdup(c_rc == -1 ? "compress failed" : "unsupported compress_type");
-                ve_tls_send_callbacks cbs = ve_tls_capture_callbacks(producer);
-                if (cbs.cb) {
-                    cbs.cb(VE_TLS_DROP_ERROR, task.batch_bytes, 0, NULL, err.error_message, NULL, cbs.cb_param, task.start_id, task.end_id);
-                }
-                if (cbs.cb2) {
-                    cbs.cb2(VE_TLS_DROP_ERROR, task.batch_bytes, 0, &err, NULL, cbs.cb2_param, task.start_id, task.end_id);
-                }
-                ve_tls_error_free_fields(&err);
-                ve_tls_send_task_free(&task);
-                producer->config.platform.mutex_lock(producer->mutex);
-                ve_tls_key_queue_finish(producer, kq);
-                producer->config.platform.mutex_unlock(producer->mutex);
-                continue;
+        const unsigned char * send_body_data = NULL;
+        size_t send_body_size = 0;
+        size_t raw_body_size = 0;
+        const char * send_compress_type = "none";
+        if (ve_tls_sender_resolve_payload(producer, &task, &send_body_data, &send_body_size, &raw_body_size, &send_compress_type) != 0) {
+            ve_tls_error err;
+            memset(&err, 0, sizeof(err));
+            err.http_code = -1;
+            err.transport_kind = VE_TLS_TRANSPORT_GENERIC;
+            err.transport_code = 0;
+            err.retryable = 0;
+            err.error_code = ve_tls_strdup("ClientError");
+            err.error_message = ve_tls_strdup("invalid send payload");
+            ve_tls_send_callbacks cbs = ve_tls_capture_callbacks(producer);
+            if (cbs.cb) {
+                cbs.cb(VE_TLS_DROP_ERROR, task.batch_bytes, 0, NULL, err.error_message, NULL, cbs.cb_param, task.start_id, task.end_id);
             }
-        }
-
-        if (producer->config.agg_strategy == 1 && producer->config.agg_max_compressed_bytes_per_request > 0) {
-            size_t maxc = (size_t)producer->config.agg_max_compressed_bytes_per_request;
-            if (maxc > 0 && send_body_size > maxc) {
-                ve_tls_error err;
-                memset(&err, 0, sizeof(err));
-                err.http_code = -1;
-                err.transport_kind = VE_TLS_TRANSPORT_GENERIC;
-                err.transport_code = 0;
-                err.retryable = 0;
-                err.error_code = ve_tls_strdup("PayloadTooLarge");
-                err.error_message = ve_tls_strdup("payload too large after compression");
-                ve_tls_send_callbacks cbs = ve_tls_capture_callbacks(producer);
-                if (cbs.cb) {
-                    cbs.cb(VE_TLS_DROP_ERROR, task.batch_bytes, 0, NULL, err.error_message, NULL, cbs.cb_param, task.start_id, task.end_id);
-                }
-                if (cbs.cb2) {
-                    cbs.cb2(VE_TLS_DROP_ERROR, task.batch_bytes, 0, &err, NULL, cbs.cb2_param, task.start_id, task.end_id);
-                }
-                ve_tls_error_free_fields(&err);
-                if (compressed_owned) {
-                    ve_tls_bytes_free(&compressed);
-                }
-                ve_tls_send_task_free(&task);
-                producer->config.platform.mutex_lock(producer->mutex);
-                ve_tls_key_queue_finish(producer, kq);
-                producer->config.platform.mutex_unlock(producer->mutex);
-                continue;
+            if (cbs.cb2) {
+                cbs.cb2(VE_TLS_DROP_ERROR, task.batch_bytes, 0, &err, NULL, cbs.cb2_param, task.start_id, task.end_id);
             }
+            ve_tls_error_free_fields(&err);
+            ve_tls_send_task_free(&task);
+            producer->config.platform.mutex_lock(producer->mutex);
+            ve_tls_key_queue_finish(producer, kq);
+            producer->config.platform.mutex_unlock(producer->mutex);
+            continue;
         }
 
         int32_t attempt = 0;
@@ -1663,13 +1598,6 @@ next_task:
                 if (next <= 0) {
                     next = gate_now + 10;
                 }
-                if (compressed_owned) {
-                    task.precompressed = compressed.data;
-                    task.precompressed_size = compressed.size;
-                    compressed.data = NULL;
-                    compressed.size = 0;
-                    compressed_owned = 0;
-                }
                 producer->config.platform.mutex_lock(producer->mutex);
                 (void)ve_tls_key_queue_push_front_task(kq, &task);
                 memset(&task, 0, sizeof(task));
@@ -1678,9 +1606,6 @@ next_task:
                 producer->config.platform.cond_signal(producer->send_cond);
                 producer->config.platform.mutex_unlock(producer->mutex);
                 ve_tls_error_free_fields(&err);
-                if (compressed_owned) {
-                    ve_tls_bytes_free(&compressed);
-                }
                 goto next_task;
             }
 
@@ -1790,13 +1715,11 @@ next_task:
         }
         ve_tls_key_breaker_on_final_result(producer, kq, sent_ok ? 1 : 0);
         ve_tls_error_free_fields(&err);
-        if (compressed_owned) {
-            ve_tls_bytes_free(&compressed);
-        }
         ve_tls_send_task_free(&task);
         producer->config.platform.mutex_lock(producer->mutex);
         ve_tls_key_queue_finish(producer, kq);
         producer->config.platform.mutex_unlock(producer->mutex);
     }
+    ve_tls_sender_thread_cache_clear();
     return NULL;
 }

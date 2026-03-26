@@ -10,6 +10,7 @@
 #include "ve_tls_platform.h"
 
 typedef struct ve_tls_producer ve_tls_producer;
+typedef struct ve_tls_log_template ve_tls_log_template;
 
 typedef enum {
     VE_TLS_OK = 0,
@@ -72,6 +73,7 @@ typedef struct {
     const char * api_version;
     const char * compress_type;
     int32_t send_thread_count;
+    int32_t pack_thread_count;
     int32_t use_global_env;
     int32_t ordered_send;
     int32_t rate_limit_rps;
@@ -183,6 +185,9 @@ ve_tls_result ve_tls_producer_add_log_with_len(ve_tls_producer * producer, int64
 ve_tls_result ve_tls_producer_add_log_with_len_hashkey(ve_tls_producer * producer, int64_t time_ms, const char * hash_key, const char * const * keys, const size_t * key_lens, const char * const * values, const size_t * value_lens, size_t pair_count, int flush);
 ve_tls_result ve_tls_producer_add_log_with_len_time_parts(ve_tls_producer * producer, int64_t time_ms, int32_t has_time_ns, uint32_t time_ns, const char * const * keys, const size_t * key_lens, const char * const * values, const size_t * value_lens, size_t pair_count, int flush);
 ve_tls_result ve_tls_producer_add_log_with_len_time_parts_hashkey(ve_tls_producer * producer, int64_t time_ms, int32_t has_time_ns, uint32_t time_ns, const char * hash_key, const char * const * keys, const size_t * key_lens, const char * const * values, const size_t * value_lens, size_t pair_count, int flush);
+ve_tls_log_template * ve_tls_template_create(ve_tls_producer * producer, const char * const * keys, const size_t * key_lens, size_t key_count, const char * hash_key);
+ve_tls_result ve_tls_template_add_values(ve_tls_log_template * tpl, int64_t time_ms, int32_t has_time_ns, uint32_t time_ns, const char * const * values, const size_t * value_lens, size_t value_count, int flush);
+void ve_tls_template_destroy(ve_tls_log_template * tpl);
 ve_tls_result ve_tls_producer_flush(ve_tls_producer * producer);
 ve_tls_result ve_tls_producer_recover(ve_tls_producer * producer);
 ve_tls_result ve_tls_producer_export_raw_buffer(ve_tls_producer * producer, unsigned char ** out_buf, size_t * out_size);

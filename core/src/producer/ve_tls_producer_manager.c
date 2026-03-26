@@ -3,6 +3,9 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
+
+#define VE_TLS_SMALL_PAYLOAD_NO_COMPRESS_THRESHOLD 256
 
 typedef struct {
     ve_tls_send_done_fn cb;
@@ -60,6 +63,85 @@ static void ve_tls_manager_drop_range(ve_tls_producer * producer, size_t bytes, 
         cbs.cb2(VE_TLS_DROP_ERROR, bytes, 0, &err, NULL, cbs.cb2_param, start_id, end_id);
     }
     ve_tls_error_free_fields(&err);
+}
+
+static int ve_tls_is_none_compress_type(const char * compress_type) {
+    return (!compress_type || compress_type[0] == 0 || strcasecmp(compress_type, "none") == 0);
+}
+
+static int ve_tls_is_supported_codec(const char * compress_type) {
+    if (!compress_type) {
+        return 0;
+    }
+    return (strcasecmp(compress_type, "lz4") == 0 || strcasecmp(compress_type, "zlib") == 0);
+}
+
+static int ve_tls_should_skip_compress(const char * compress_type, size_t body_size) {
+    if (ve_tls_is_none_compress_type(compress_type)) {
+        return 1;
+    }
+    if (ve_tls_is_supported_codec(compress_type) && body_size <= VE_TLS_SMALL_PAYLOAD_NO_COMPRESS_THRESHOLD) {
+        return 1;
+    }
+    return 0;
+}
+
+static int ve_tls_manager_prepare_send_task(ve_tls_producer * producer, ve_tls_send_task * t, const char ** err_code, const char ** err_msg) {
+    if (!producer || !t || !t->body || t->body_size == 0) {
+        if (err_code) *err_code = "ClientError";
+        if (err_msg) *err_msg = "invalid task";
+        return -1;
+    }
+    if (err_code) *err_code = "ClientError";
+    if (err_msg) *err_msg = "drop";
+
+    size_t send_size = t->body_size;
+    const char * compress_type = producer->config.compress_type ? producer->config.compress_type : "none";
+    if (t->precompressed && t->precompressed_size > 0) {
+        send_size = t->precompressed_size;
+    } else if (!ve_tls_should_skip_compress(compress_type, t->body_size)) {
+        t->precompressed_pool = NULL;
+        size_t pool_cap = producer->compress_buf_pool.obj_size;
+        if (pool_cap > 0) {
+            unsigned char * pooled = (unsigned char *)ve_tls_obj_pool_get(&producer->compress_buf_pool);
+            if (pooled) {
+                size_t pooled_size = 0;
+                int pooled_rc = ve_tls_compress_apply_to_buffer(compress_type, t->body, t->body_size, pooled, pool_cap, &pooled_size);
+                if (pooled_rc == 0 && pooled_size > 0) {
+                    t->precompressed = pooled;
+                    t->precompressed_size = pooled_size;
+                    t->precompressed_pool = &producer->compress_buf_pool;
+                    send_size = pooled_size;
+                } else {
+                    ve_tls_obj_pool_put(&producer->compress_buf_pool, pooled);
+                }
+            }
+        }
+        if (!t->precompressed || t->precompressed_size == 0) {
+            ve_tls_bytes c;
+            memset(&c, 0, sizeof(c));
+            int c_rc = ve_tls_compress_apply(compress_type, t->body, t->body_size, &c);
+            if (c_rc != 0 || !c.data || c.size == 0) {
+                if (err_msg) *err_msg = (c_rc == -1) ? "compress failed" : "unsupported compress_type";
+                ve_tls_bytes_free(&c);
+                return -1;
+            }
+            t->precompressed = c.data;
+            t->precompressed_size = c.size;
+            t->precompressed_pool = NULL;
+            send_size = c.size;
+        }
+    }
+
+    if (producer->config.agg_strategy == 1 && producer->config.agg_max_compressed_bytes_per_request > 0) {
+        size_t maxc = (size_t)producer->config.agg_max_compressed_bytes_per_request;
+        if (send_size > maxc) {
+            if (err_code) *err_code = "PayloadTooLarge";
+            if (err_msg) *err_msg = "payload too large after compression";
+            return -1;
+        }
+    }
+    return 0;
 }
 
 static int ve_tls_manager_push_send_task(ve_tls_producer * producer, ve_tls_send_task * t) {
@@ -149,6 +231,7 @@ static void * ve_tls_worker_main_builder(void * arg) {
     for (;;) {
         producer->config.platform.mutex_lock(producer->mutex);
         int have_any_builder = (producer->default_builder && producer->default_builder->log_count > 0) ? 1 : 0;
+        int have_ingress = producer->ingress_queue_count > 0 ? 1 : 0;
         for (size_t i = 0; i < producer->key_bucket_count && !have_any_builder; i++) {
             for (ve_tls_key_queue * q = producer->key_buckets[i]; q; q = q->hnext) {
                 if (q->builder && q->builder->log_count > 0) {
@@ -157,9 +240,10 @@ static void * ve_tls_worker_main_builder(void * arg) {
                 }
             }
         }
-        while (!producer->stop && producer->queue_count == 0 && !producer->flush_requested && !producer->sealed_head && !have_any_builder) {
+        while (!producer->stop && producer->queue_count == 0 && producer->ingress_queue_count == 0 && !producer->flush_requested && !producer->sealed_head && !have_any_builder) {
             producer->config.platform.cond_wait(producer->cond, producer->mutex);
             have_any_builder = (producer->default_builder && producer->default_builder->log_count > 0) ? 1 : 0;
+            have_ingress = producer->ingress_queue_count > 0 ? 1 : 0;
             for (size_t i = 0; i < producer->key_bucket_count && !have_any_builder; i++) {
                 for (ve_tls_key_queue * q = producer->key_buckets[i]; q; q = q->hnext) {
                     if (q->builder && q->builder->log_count > 0) {
@@ -169,17 +253,35 @@ static void * ve_tls_worker_main_builder(void * arg) {
                 }
             }
         }
-        if (!producer->stop && producer->queue_count == 0 && !producer->flush_requested && !producer->sealed_head && have_any_builder && producer->config.platform.cond_timedwait_ms) {
+        if (!producer->stop && producer->queue_count == 0 && producer->ingress_queue_count == 0 && !producer->flush_requested && !producer->sealed_head && have_any_builder && producer->config.platform.cond_timedwait_ms) {
             (void)producer->config.platform.cond_timedwait_ms(producer->cond, producer->mutex, 100);
         }
-        if (producer->stop && producer->queue_count == 0 && !producer->sealed_head && !have_any_builder) {
+        if (producer->stop && producer->queue_count == 0 && producer->ingress_queue_count == 0 && !producer->sealed_head && !have_any_builder && !have_ingress) {
             producer->config.platform.mutex_unlock(producer->mutex);
             break;
+        }
+        for (;;) {
+            ve_tls_ingress_task ingress_task;
+            memset(&ingress_task, 0, sizeof(ingress_task));
+            if (ve_tls_ingress_queue_pop_locked(producer, &ingress_task) != 0) {
+                break;
+            }
+            if (ve_tls_ingress_task_merge_locked(producer, &ingress_task) != 0) {
+                ve_tls_manager_drop_range(producer,
+                    ingress_task.batch ? ingress_task.batch->logs_len : 0,
+                    ingress_task.batch ? ingress_task.batch->start_id : 0,
+                    ingress_task.batch ? ingress_task.batch->end_id : 0,
+                    "MemoryAllocFailed",
+                    "ingress merge failed");
+            }
+            if (ingress_task.batch) {
+                ve_tls_log_builder_free(ingress_task.batch);
+            }
         }
         int64_t now = producer->config.platform.time_ms ? producer->config.platform.time_ms() : 0;
         int flush_all = producer->flush_requested || producer->stop;
         producer->flush_requested = 0;
-        producer->worker_flushing = 1;
+        producer->worker_flushing_count++;
         int64_t pkg_timeout = producer->config.flush_interval_ms;
         if (pkg_timeout < 0) {
             pkg_timeout = 0;
@@ -256,6 +358,13 @@ static void * ve_tls_worker_main_builder(void * arg) {
             t.hash_key = item.hash_key;
             item.data = NULL;
             item.hash_key = NULL;
+            const char * err_code = NULL;
+            const char * err_msg = NULL;
+            if (ve_tls_manager_prepare_send_task(producer, &t, &err_code, &err_msg) != 0) {
+                ve_tls_manager_drop_range(producer, t.batch_bytes, t.start_id, t.end_id, err_code ? err_code : "ClientError", err_msg ? err_msg : "drop");
+                ve_tls_send_task_free(&t);
+                continue;
+            }
             if (ve_tls_manager_push_send_task(producer, &t) != 0) {
                 ve_tls_free(item.data);
                 ve_tls_free(item.hash_key);
@@ -270,7 +379,14 @@ static void * ve_tls_worker_main_builder(void * arg) {
             if (ve_tls_builder_to_send_task(producer, b, &t) != 0) {
                 ve_tls_manager_drop_range(producer, bytes_in_builder, b->start_id, b->end_id, "MemoryAllocFailed", "build body failed");
             } else {
-                (void)ve_tls_manager_push_send_task(producer, &t);
+                const char * err_code = NULL;
+                const char * err_msg = NULL;
+                if (ve_tls_manager_prepare_send_task(producer, &t, &err_code, &err_msg) != 0) {
+                    ve_tls_manager_drop_range(producer, t.batch_bytes, t.start_id, t.end_id, err_code ? err_code : "ClientError", err_msg ? err_msg : "drop");
+                    ve_tls_send_task_free(&t);
+                } else {
+                    (void)ve_tls_manager_push_send_task(producer, &t);
+                }
             }
             producer->config.platform.mutex_lock(producer->mutex);
             if (producer->queue_bytes >= bytes_in_builder) {
@@ -284,7 +400,9 @@ static void * ve_tls_worker_main_builder(void * arg) {
         }
 
         producer->config.platform.mutex_lock(producer->mutex);
-        producer->worker_flushing = 0;
+        if (producer->worker_flushing_count > 0) {
+            producer->worker_flushing_count--;
+        }
         producer->config.platform.cond_broadcast(producer->send_cond);
         producer->config.platform.mutex_unlock(producer->mutex);
     }

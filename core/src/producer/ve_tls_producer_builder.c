@@ -217,6 +217,30 @@ void ve_tls_log_builder_free(ve_tls_log_group_builder * b) {
     ve_tls_free(b);
 }
 
+void ve_tls_log_builder_shrink_if_needed(ve_tls_log_group_builder * b, size_t shrink_threshold, size_t shrink_to) {
+    if (!b || !b->logs) {
+        return;
+    }
+    if (b->logs_cap <= shrink_threshold) {
+        return;
+    }
+    if (b->logs_len > shrink_to) {
+        return;
+    }
+    if (shrink_to == 0) {
+        ve_tls_free(b->logs);
+        b->logs = NULL;
+        b->logs_cap = 0;
+        return;
+    }
+    unsigned char * p = (unsigned char *)ve_tls_realloc(b->logs, shrink_to);
+    if (!p) {
+        return;
+    }
+    b->logs = p;
+    b->logs_cap = shrink_to;
+}
+
 int ve_tls_log_builder_append(ve_tls_log_group_builder * b, const unsigned char * logs, size_t logs_len, int32_t log_count, int64_t earliest, int64_t latest, int64_t start_id, int64_t end_id, int64_t last_time_ms, uint32_t last_time_ns, int32_t last_has_time_ns) {
     if (!b || !logs || logs_len == 0 || log_count <= 0) {
         return -1;
