@@ -9,6 +9,13 @@ typedef struct {
     size_t buf_len;
 } ve_tls_sha256_ctx;
 
+typedef struct {
+    uint32_t h[4];
+    uint64_t len;
+    unsigned char buf[64];
+    size_t buf_len;
+} ve_tls_md5_ctx;
+
 static uint32_t ve_tls_rotr32(uint32_t x, uint32_t n) {
     return (x >> n) | (x << (32 - n));
 }
@@ -33,6 +40,31 @@ static void ve_tls_store_be64(unsigned char * p, uint64_t v) {
     p[5] = (unsigned char)(v >> 16);
     p[6] = (unsigned char)(v >> 8);
     p[7] = (unsigned char)(v);
+}
+
+static uint32_t ve_tls_load_le32(const unsigned char * p) {
+    return ((uint32_t)p[0]) |
+           ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) |
+           ((uint32_t)p[3] << 24);
+}
+
+static void ve_tls_store_le32(unsigned char * p, uint32_t v) {
+    p[0] = (unsigned char)(v);
+    p[1] = (unsigned char)(v >> 8);
+    p[2] = (unsigned char)(v >> 16);
+    p[3] = (unsigned char)(v >> 24);
+}
+
+static void ve_tls_store_le64(unsigned char * p, uint64_t v) {
+    p[0] = (unsigned char)(v);
+    p[1] = (unsigned char)(v >> 8);
+    p[2] = (unsigned char)(v >> 16);
+    p[3] = (unsigned char)(v >> 24);
+    p[4] = (unsigned char)(v >> 32);
+    p[5] = (unsigned char)(v >> 40);
+    p[6] = (unsigned char)(v >> 48);
+    p[7] = (unsigned char)(v >> 56);
 }
 
 static void ve_tls_sha256_init(ve_tls_sha256_ctx * ctx) {
@@ -144,6 +176,122 @@ static void ve_tls_sha256_final(ve_tls_sha256_ctx * ctx, unsigned char out32[32]
     }
 }
 
+static uint32_t ve_tls_rotl32(uint32_t x, uint32_t n) {
+    return (x << n) | (x >> (32 - n));
+}
+
+static void ve_tls_md5_init(ve_tls_md5_ctx * ctx) {
+    ctx->h[0] = 0x67452301U;
+    ctx->h[1] = 0xefcdab89U;
+    ctx->h[2] = 0x98badcfeU;
+    ctx->h[3] = 0x10325476U;
+    ctx->len = 0;
+    ctx->buf_len = 0;
+}
+
+static void ve_tls_md5_transform(ve_tls_md5_ctx * ctx, const unsigned char block[64]) {
+    static const uint32_t k[64] = {
+        0xd76aa478U, 0xe8c7b756U, 0x242070dbU, 0xc1bdceeeU,
+        0xf57c0fafU, 0x4787c62aU, 0xa8304613U, 0xfd469501U,
+        0x698098d8U, 0x8b44f7afU, 0xffff5bb1U, 0x895cd7beU,
+        0x6b901122U, 0xfd987193U, 0xa679438eU, 0x49b40821U,
+        0xf61e2562U, 0xc040b340U, 0x265e5a51U, 0xe9b6c7aaU,
+        0xd62f105dU, 0x02441453U, 0xd8a1e681U, 0xe7d3fbc8U,
+        0x21e1cde6U, 0xc33707d6U, 0xf4d50d87U, 0x455a14edU,
+        0xa9e3e905U, 0xfcefa3f8U, 0x676f02d9U, 0x8d2a4c8aU,
+        0xfffa3942U, 0x8771f681U, 0x6d9d6122U, 0xfde5380cU,
+        0xa4beea44U, 0x4bdecfa9U, 0xf6bb4b60U, 0xbebfbc70U,
+        0x289b7ec6U, 0xeaa127faU, 0xd4ef3085U, 0x04881d05U,
+        0xd9d4d039U, 0xe6db99e5U, 0x1fa27cf8U, 0xc4ac5665U,
+        0xf4292244U, 0x432aff97U, 0xab9423a7U, 0xfc93a039U,
+        0x655b59c3U, 0x8f0ccc92U, 0xffeff47dU, 0x85845dd1U,
+        0x6fa87e4fU, 0xfe2ce6e0U, 0xa3014314U, 0x4e0811a1U,
+        0xf7537e82U, 0xbd3af235U, 0x2ad7d2bbU, 0xeb86d391U
+    };
+    static const uint32_t s[64] = {
+        7,12,17,22, 7,12,17,22, 7,12,17,22, 7,12,17,22,
+        5,9,14,20, 5,9,14,20, 5,9,14,20, 5,9,14,20,
+        4,11,16,23, 4,11,16,23, 4,11,16,23, 4,11,16,23,
+        6,10,15,21, 6,10,15,21, 6,10,15,21, 6,10,15,21
+    };
+    uint32_t m[16];
+    for (int i = 0; i < 16; i++) {
+        m[i] = ve_tls_load_le32(block + i * 4);
+    }
+    uint32_t a = ctx->h[0];
+    uint32_t b = ctx->h[1];
+    uint32_t c = ctx->h[2];
+    uint32_t d = ctx->h[3];
+    for (int i = 0; i < 64; i++) {
+        uint32_t f;
+        uint32_t g;
+        if (i < 16) {
+            f = (b & c) | ((~b) & d);
+            g = (uint32_t)i;
+        } else if (i < 32) {
+            f = (d & b) | ((~d) & c);
+            g = (uint32_t)((5 * i + 1) & 15);
+        } else if (i < 48) {
+            f = b ^ c ^ d;
+            g = (uint32_t)((3 * i + 5) & 15);
+        } else {
+            f = c ^ (b | (~d));
+            g = (uint32_t)((7 * i) & 15);
+        }
+        uint32_t tmp = d;
+        d = c;
+        c = b;
+        b = b + ve_tls_rotl32(a + f + k[i] + m[g], s[i]);
+        a = tmp;
+    }
+    ctx->h[0] += a;
+    ctx->h[1] += b;
+    ctx->h[2] += c;
+    ctx->h[3] += d;
+}
+
+static void ve_tls_md5_update(ve_tls_md5_ctx * ctx, const unsigned char * data, size_t len) {
+    ctx->len += (uint64_t)len;
+    if (ctx->buf_len > 0) {
+        size_t n = 64 - ctx->buf_len;
+        if (n > len) {
+            n = len;
+        }
+        memcpy(ctx->buf + ctx->buf_len, data, n);
+        ctx->buf_len += n;
+        data += n;
+        len -= n;
+        if (ctx->buf_len == 64) {
+            ve_tls_md5_transform(ctx, ctx->buf);
+            ctx->buf_len = 0;
+        }
+    }
+    while (len >= 64) {
+        ve_tls_md5_transform(ctx, data);
+        data += 64;
+        len -= 64;
+    }
+    if (len > 0) {
+        memcpy(ctx->buf, data, len);
+        ctx->buf_len = len;
+    }
+}
+
+static void ve_tls_md5_final(ve_tls_md5_ctx * ctx, unsigned char out16[16]) {
+    unsigned char pad[64];
+    memset(pad, 0, sizeof(pad));
+    pad[0] = 0x80;
+    uint64_t bit_len = ctx->len * 8;
+    size_t pad_len = (ctx->buf_len < 56) ? (56 - ctx->buf_len) : (120 - ctx->buf_len);
+    ve_tls_md5_update(ctx, pad, pad_len);
+    unsigned char lenbuf[8];
+    ve_tls_store_le64(lenbuf, bit_len);
+    ve_tls_md5_update(ctx, lenbuf, 8);
+    for (int i = 0; i < 4; i++) {
+        ve_tls_store_le32(out16 + i * 4, ctx->h[i]);
+    }
+}
+
 void ve_tls_sha256(const unsigned char * data, size_t len, unsigned char out32[32]) {
     ve_tls_sha256_ctx ctx;
     ve_tls_sha256_init(&ctx);
@@ -180,8 +328,32 @@ void ve_tls_hmac_sha256(const unsigned char * key, size_t key_len, const unsigne
     ve_tls_sha256_final(&outer, out32);
 }
 
+void ve_tls_md5(const unsigned char * data, size_t len, unsigned char out16[16]) {
+    ve_tls_md5_ctx ctx;
+    ve_tls_md5_init(&ctx);
+    ve_tls_md5_update(&ctx, data, len);
+    ve_tls_md5_final(&ctx, out16);
+}
+
 void ve_tls_hex_lower(const unsigned char * data, size_t len, char * out_hex, size_t out_hex_cap) {
     static const char * digits = "0123456789abcdef";
+    if (!out_hex || out_hex_cap == 0) {
+        return;
+    }
+    size_t need = len * 2 + 1;
+    if (out_hex_cap < need) {
+        out_hex[0] = 0;
+        return;
+    }
+    for (size_t i = 0; i < len; i++) {
+        out_hex[i * 2] = digits[(data[i] >> 4) & 0xF];
+        out_hex[i * 2 + 1] = digits[data[i] & 0xF];
+    }
+    out_hex[len * 2] = 0;
+}
+
+void ve_tls_hex_upper(const unsigned char * data, size_t len, char * out_hex, size_t out_hex_cap) {
+    static const char * digits = "0123456789ABCDEF";
     if (!out_hex || out_hex_cap == 0) {
         return;
     }

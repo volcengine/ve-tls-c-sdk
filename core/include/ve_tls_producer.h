@@ -32,6 +32,18 @@ typedef enum {
     VE_TLS_BUFFER_FULL_BLOCK = 1
 } ve_tls_buffer_full_policy;
 
+typedef enum {
+    VE_TLS_POVERFLOW_REJECT_NEW = 0,
+    VE_TLS_POVERFLOW_BLOCK = 1,
+    VE_TLS_POVERFLOW_DROP_OLDEST_UNACKED = 2,
+    VE_TLS_POVERFLOW_DROP_NEWEST_SAMPLE = 3
+} ve_tls_persistent_overflow_policy;
+
+typedef enum {
+    VE_TLS_POPEN_FAIL_IF_OWNED = 0,
+    VE_TLS_POPEN_TAKEOVER_IF_STALE = 1
+} ve_tls_persistent_open_mode;
+
 typedef struct {
     const char * key;
     const char * value;
@@ -122,6 +134,17 @@ typedef struct {
     int32_t max_persistent_file_size;
     int32_t max_persistent_file_count;
     int32_t force_flush_disk;
+    int32_t persistent_max_bytes;
+    int32_t persistent_max_records;
+    int32_t persistent_max_segments;
+    int32_t persistent_high_watermark_pct;
+    int32_t persistent_low_watermark_pct;
+    int32_t persistent_overflow_policy;
+    int32_t persistent_sample_every_n;
+    int32_t persistent_block_timeout_ms;
+    int32_t persistent_lease_timeout_ms;
+    int32_t persistent_heartbeat_interval_ms;
+    int32_t persistent_open_mode;
     ve_tls_platform platform;
     ve_tls_http_client http_client;
 } ve_tls_config;
@@ -177,10 +200,16 @@ size_t ve_tls_producer_get_buffered_bytes(ve_tls_producer * producer);
 
 ve_tls_result ve_tls_producer_add_log_raw(ve_tls_producer * producer, const char * log_buf, size_t log_size, int flush);
 ve_tls_result ve_tls_producer_add_log_raw_time_parts(ve_tls_producer * producer, int64_t time_ms, int32_t has_time_ns, uint32_t time_ns, const char * log_buf, size_t log_size, int flush);
+ve_tls_result ve_tls_producer_add_log_raw_with_id(ve_tls_producer * producer, const char * log_buf, size_t log_size, int flush, int64_t * out_log_id);
+ve_tls_result ve_tls_producer_add_log_raw_time_parts_with_id(ve_tls_producer * producer, int64_t time_ms, int32_t has_time_ns, uint32_t time_ns, const char * log_buf, size_t log_size, int flush, int64_t * out_log_id);
 ve_tls_result ve_tls_producer_add_log_kv(ve_tls_producer * producer, int64_t time_ms, const ve_tls_kv * kvs, size_t kv_count, int flush);
 ve_tls_result ve_tls_producer_add_log_kv_hashkey(ve_tls_producer * producer, int64_t time_ms, const char * hash_key, const ve_tls_kv * kvs, size_t kv_count, int flush);
 ve_tls_result ve_tls_producer_add_log_kv_time_parts(ve_tls_producer * producer, int64_t time_ms, int32_t has_time_ns, uint32_t time_ns, const ve_tls_kv * kvs, size_t kv_count, int flush);
 ve_tls_result ve_tls_producer_add_log_kv_time_parts_hashkey(ve_tls_producer * producer, int64_t time_ms, int32_t has_time_ns, uint32_t time_ns, const char * hash_key, const ve_tls_kv * kvs, size_t kv_count, int flush);
+ve_tls_result ve_tls_producer_add_log_kv_with_id(ve_tls_producer * producer, int64_t time_ms, const ve_tls_kv * kvs, size_t kv_count, int flush, int64_t * out_log_id);
+ve_tls_result ve_tls_producer_add_log_kv_hashkey_with_id(ve_tls_producer * producer, int64_t time_ms, const char * hash_key, const ve_tls_kv * kvs, size_t kv_count, int flush, int64_t * out_log_id);
+ve_tls_result ve_tls_producer_add_log_kv_time_parts_with_id(ve_tls_producer * producer, int64_t time_ms, int32_t has_time_ns, uint32_t time_ns, const ve_tls_kv * kvs, size_t kv_count, int flush, int64_t * out_log_id);
+ve_tls_result ve_tls_producer_add_log_kv_time_parts_hashkey_with_id(ve_tls_producer * producer, int64_t time_ms, int32_t has_time_ns, uint32_t time_ns, const char * hash_key, const ve_tls_kv * kvs, size_t kv_count, int flush, int64_t * out_log_id);
 ve_tls_result ve_tls_producer_add_log_with_len(ve_tls_producer * producer, int64_t time_ms, const char * const * keys, const size_t * key_lens, const char * const * values, const size_t * value_lens, size_t pair_count, int flush);
 ve_tls_result ve_tls_producer_add_log_with_len_hashkey(ve_tls_producer * producer, int64_t time_ms, const char * hash_key, const char * const * keys, const size_t * key_lens, const char * const * values, const size_t * value_lens, size_t pair_count, int flush);
 ve_tls_result ve_tls_producer_add_log_with_len_time_parts(ve_tls_producer * producer, int64_t time_ms, int32_t has_time_ns, uint32_t time_ns, const char * const * keys, const size_t * key_lens, const char * const * values, const size_t * value_lens, size_t pair_count, int flush);

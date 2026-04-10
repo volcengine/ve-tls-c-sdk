@@ -1,4 +1,5 @@
 #include "ve_tls_producer_internal.h"
+#include "ve_tls_hash.h"
 #include "ve_tls_sign.h"
 #include "ve_tls_version.h"
 #include "ve_tls_alloc.h"
@@ -26,6 +27,12 @@ static void ve_tls_secure_free_str(char ** ps) {
     ve_tls_secure_zero(*ps, n);
     ve_tls_free(*ps);
     *ps = NULL;
+}
+
+static void ve_tls_sender_heartbeat_persistent(ve_tls_producer * producer) {
+    if (producer && producer->persistent) {
+        (void)ve_tls_persistent_heartbeat_if_due(producer->persistent, 0);
+    }
 }
 
 static int ve_tls_key_rate_limit_reserve(ve_tls_producer * producer, ve_tls_key_queue * q, size_t bytes, int64_t now_ms, int64_t * next_ready_ms) {
@@ -926,8 +933,13 @@ static int ve_tls_send_put_logs(ve_tls_producer * producer, const char * access_
     char latest_s[32];
     snprintf(latest_s, sizeof(latest_s), "%lld", (long long)latest);
     const char * compress_type = actual_compress_type ? actual_compress_type : (cfg->compress_type ? cfg->compress_type : "none");
+    unsigned char md5_raw[16];
+    char content_md5[33];
+    ve_tls_md5(body, body_size, md5_raw);
+    ve_tls_hex_upper(md5_raw, sizeof(md5_raw), content_md5, sizeof(content_md5));
 
     if (ve_tls_headers_append(producer, &headers, &hlen, &hcap, &headers_pooled, "Content-Type", "application/x-protobuf") != 0 ||
+        ve_tls_headers_append(producer, &headers, &hlen, &hcap, &headers_pooled, "Content-MD5", content_md5) != 0 ||
         ve_tls_headers_append(producer, &headers, &hlen, &hcap, &headers_pooled, "x-tls-apiversion", cfg->api_version ? cfg->api_version : VE_TLS_C_SDK_API_VERSION) != 0 ||
         ve_tls_headers_append(producer, &headers, &hlen, &hcap, &headers_pooled, "x-tls-bodyrawsize", raw_size) != 0 ||
         ve_tls_headers_append(producer, &headers, &hlen, &hcap, &headers_pooled, "x-tls-compresstype", compress_type) != 0) {
@@ -939,12 +951,13 @@ static int ve_tls_send_put_logs(ve_tls_producer * producer, const char * access_
     if (!hk || hk[0] == 0) {
         hk = cfg->default_hash_key;
     }
-    if (hk && hk[0] != 0) {
-        if (ve_tls_headers_append(producer, &headers, &hlen, &hcap, &headers_pooled, "x-tls-hashkey", hk) != 0) {
-            ve_tls_header_buf_release(producer, headers, headers_pooled);
-            ve_tls_error_set_client(out_error, "build headers failed");
-            return -1;
-        }
+    if (!hk) {
+        hk = "";
+    }
+    if (ve_tls_headers_append(producer, &headers, &hlen, &hcap, &headers_pooled, "x-tls-hashkey", hk) != 0) {
+        ve_tls_header_buf_release(producer, headers, headers_pooled);
+        ve_tls_error_set_client(out_error, "build headers failed");
+        return -1;
     }
 
     char * signed_headers = NULL;
@@ -1090,6 +1103,7 @@ int ve_tls_sender_step(ve_tls_producer * producer) {
             derr.error_code = ve_tls_strdup("KeyQueueLimitExceeded");
             derr.error_message = ve_tls_strdup("key queue limit exceeded");
             ve_tls_send_callbacks cbs = ve_tls_capture_callbacks(producer);
+            ve_tls_persistent_on_final_result(producer, VE_TLS_DROP_ERROR, inbound.start_id, inbound.end_id);
             if (cbs.cb) {
                 cbs.cb(VE_TLS_DROP_ERROR, inbound.batch_bytes, 0, NULL, derr.error_message, NULL, cbs.cb_param, inbound.start_id, inbound.end_id);
             }
@@ -1124,6 +1138,7 @@ have_task: {
         err.error_code = ve_tls_strdup("ClientError");
         err.error_message = ve_tls_strdup("invalid send payload");
         ve_tls_send_callbacks cbs = ve_tls_capture_callbacks(producer);
+        ve_tls_persistent_on_final_result(producer, VE_TLS_DROP_ERROR, task.start_id, task.end_id);
         if (cbs.cb) {
             cbs.cb(VE_TLS_DROP_ERROR, task.batch_bytes, 0, NULL, err.error_message, NULL, cbs.cb_param, task.start_id, task.end_id);
         }
@@ -1253,6 +1268,7 @@ have_task: {
     if (sent_ok) {
         ve_tls_metric_inc_u64(&producer->m_bytes_sent_total, send_body_size);
         ve_tls_metrics_emit(producer, "send_ok", total_ms, send_body_size);
+        ve_tls_persistent_on_final_result(producer, VE_TLS_OK, task.start_id, task.end_id);
         ve_tls_send_callbacks cbs = ve_tls_capture_callbacks(producer);
         if (cbs.cb) {
             cbs.cb(VE_TLS_OK, task.batch_bytes, send_body_size, err.request_id, NULL, NULL, cbs.cb_param, task.start_id, task.end_id);
@@ -1264,6 +1280,7 @@ have_task: {
         ve_tls_metric_inc_u64(&producer->m_requests_failed_total, 1);
         ve_tls_metrics_emit(producer, "send_failed", total_ms, err.http_code);
         char * msg = ve_tls_error_build_message(&err);
+        ve_tls_persistent_on_final_result(producer, VE_TLS_DROP_ERROR, task.start_id, task.end_id);
         ve_tls_send_callbacks cbs = ve_tls_capture_callbacks(producer);
         if (cbs.cb) {
             cbs.cb(VE_TLS_DROP_ERROR, task.batch_bytes, send_body_size, err.request_id, msg, NULL, cbs.cb_param, task.start_id, task.end_id);
@@ -1296,6 +1313,7 @@ have_task: {
 static void * ve_tls_sender_main_fast(void * arg) {
     ve_tls_producer * producer = (ve_tls_producer *)arg;
     for (;;) {
+        ve_tls_sender_heartbeat_persistent(producer);
         ve_tls_send_task task;
         memset(&task, 0, sizeof(task));
         if (ve_tls_send_queue_pop(&producer->send_queue, &task, -1) != 0) {
@@ -1318,6 +1336,7 @@ static void * ve_tls_sender_main_fast(void * arg) {
             err.error_code = ve_tls_strdup("ClientError");
             err.error_message = ve_tls_strdup("invalid send payload");
             ve_tls_send_callbacks cbs = ve_tls_capture_callbacks(producer);
+            ve_tls_persistent_on_final_result(producer, VE_TLS_DROP_ERROR, task.start_id, task.end_id);
             if (cbs.cb) {
                 cbs.cb(VE_TLS_DROP_ERROR, task.batch_bytes, 0, NULL, err.error_message, NULL, cbs.cb_param, task.start_id, task.end_id);
             }
@@ -1396,6 +1415,7 @@ static void * ve_tls_sender_main_fast(void * arg) {
         if (sent_ok) {
             ve_tls_metric_inc_u64(&producer->m_bytes_sent_total, send_body_size);
             ve_tls_metrics_emit(producer, "send_ok", total_ms, send_body_size);
+            ve_tls_persistent_on_final_result(producer, VE_TLS_OK, task.start_id, task.end_id);
             ve_tls_send_callbacks cbs = ve_tls_capture_callbacks(producer);
             if (cbs.cb) {
                 cbs.cb(VE_TLS_OK, task.batch_bytes, send_body_size, err.request_id, NULL, NULL, cbs.cb_param, task.start_id, task.end_id);
@@ -1407,6 +1427,7 @@ static void * ve_tls_sender_main_fast(void * arg) {
             ve_tls_metric_inc_u64(&producer->m_requests_failed_total, 1);
             ve_tls_metrics_emit(producer, "send_failed", total_ms, err.http_code);
             char * msg = ve_tls_error_build_message(&err);
+            ve_tls_persistent_on_final_result(producer, VE_TLS_DROP_ERROR, task.start_id, task.end_id);
             ve_tls_send_callbacks cbs = ve_tls_capture_callbacks(producer);
             if (cbs.cb) {
                 cbs.cb(VE_TLS_DROP_ERROR, task.batch_bytes, send_body_size, err.request_id, msg, NULL, cbs.cb_param, task.start_id, task.end_id);
@@ -1428,6 +1449,7 @@ void * ve_tls_sender_main(void * arg) {
         return ve_tls_sender_main_fast(arg);
     }
     for (;;) {
+        ve_tls_sender_heartbeat_persistent(producer);
         ve_tls_send_task task;
         ve_tls_key_queue * kq = NULL;
 next_task:
@@ -1460,6 +1482,7 @@ next_task:
                     derr.error_code = ve_tls_strdup("KeyQueueLimitExceeded");
                     derr.error_message = ve_tls_strdup("key queue limit exceeded");
                     ve_tls_send_callbacks cbs = ve_tls_capture_callbacks(producer);
+                    ve_tls_persistent_on_final_result(producer, VE_TLS_DROP_ERROR, inbound.start_id, inbound.end_id);
                     if (cbs.cb) {
                         cbs.cb(VE_TLS_DROP_ERROR, inbound.batch_bytes, 0, NULL, derr.error_message, NULL, cbs.cb_param, inbound.start_id, inbound.end_id);
                     }
@@ -1510,6 +1533,7 @@ next_task:
                         derr.error_code = ve_tls_strdup("KeyQueueLimitExceeded");
                         derr.error_message = ve_tls_strdup("key queue limit exceeded");
                         ve_tls_send_callbacks cbs = ve_tls_capture_callbacks(producer);
+                        ve_tls_persistent_on_final_result(producer, VE_TLS_DROP_ERROR, tail.start_id, tail.end_id);
                         if (cbs.cb) {
                             cbs.cb(VE_TLS_DROP_ERROR, tail.batch_bytes, 0, NULL, derr.error_message, NULL, cbs.cb_param, tail.start_id, tail.end_id);
                         }
@@ -1563,6 +1587,7 @@ next_task:
             err.error_code = ve_tls_strdup("ClientError");
             err.error_message = ve_tls_strdup("invalid send payload");
             ve_tls_send_callbacks cbs = ve_tls_capture_callbacks(producer);
+            ve_tls_persistent_on_final_result(producer, VE_TLS_DROP_ERROR, task.start_id, task.end_id);
             if (cbs.cb) {
                 cbs.cb(VE_TLS_DROP_ERROR, task.batch_bytes, 0, NULL, err.error_message, NULL, cbs.cb_param, task.start_id, task.end_id);
             }
@@ -1686,6 +1711,7 @@ next_task:
         if (sent_ok) {
             ve_tls_metric_inc_u64(&producer->m_bytes_sent_total, send_body_size);
             ve_tls_metrics_emit(producer, "send_ok", total_ms, send_body_size);
+            ve_tls_persistent_on_final_result(producer, VE_TLS_OK, task.start_id, task.end_id);
             ve_tls_send_callbacks cbs = ve_tls_capture_callbacks(producer);
             if (cbs.cb) {
                 cbs.cb(VE_TLS_OK, task.batch_bytes, send_body_size, err.request_id, NULL, NULL, cbs.cb_param, task.start_id, task.end_id);
@@ -1697,6 +1723,7 @@ next_task:
             ve_tls_metric_inc_u64(&producer->m_requests_failed_total, 1);
             ve_tls_metrics_emit(producer, "send_failed", total_ms, err.http_code);
             char * msg = ve_tls_error_build_message(&err);
+            ve_tls_persistent_on_final_result(producer, VE_TLS_DROP_ERROR, task.start_id, task.end_id);
             ve_tls_send_callbacks cbs = ve_tls_capture_callbacks(producer);
             if (cbs.cb) {
                 cbs.cb(VE_TLS_DROP_ERROR, task.batch_bytes, send_body_size, err.request_id, msg, NULL, cbs.cb_param, task.start_id, task.end_id);

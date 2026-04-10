@@ -90,6 +90,14 @@ void ve_tls_producer_config_init(ve_tls_config * config) {
     config->credentials_provider_param = NULL;
     config->credentials_expire_advance_ms = 300000;
     config->credentials_refresh_min_interval_ms = 60000;
+    config->persistent_high_watermark_pct = 85;
+    config->persistent_low_watermark_pct = 70;
+    config->persistent_overflow_policy = VE_TLS_POVERFLOW_REJECT_NEW;
+    config->persistent_sample_every_n = 10;
+    config->persistent_block_timeout_ms = 1000;
+    config->persistent_lease_timeout_ms = 60000;
+    config->persistent_heartbeat_interval_ms = 10000;
+    config->persistent_open_mode = VE_TLS_POPEN_TAKEOVER_IF_STALE;
     ve_tls_retry_policy_init(&config->retry_policy);
     ve_tls_platform_init_default(&config->platform);
 #if defined(VE_TLS_HAVE_CURL)

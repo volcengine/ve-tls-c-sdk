@@ -9,6 +9,7 @@ option(VE_TLS_ENABLE_CURL "Enable libcurl http adapter" OFF)
 option(VE_TLS_ENABLE_ZLIB "Enable zlib compression" OFF)
 option(VE_TLS_ENABLE_LZ4 "Enable lz4 compression" ON)
 option(VE_TLS_BUILD_TESTS "Build unit tests" ON)
+option(VE_TLS_BUILD_TOOLS "Build demo and benchmark tools" ON)
 option(VE_TLS_ENABLE_COVERAGE "Enable llvm coverage instrumentation" OFF)
 option(VE_TLS_ENABLE_ASAN "Enable address sanitizer" OFF)
 option(VE_TLS_ENABLE_UBSAN "Enable undefined behavior sanitizer" OFF)
@@ -23,6 +24,11 @@ target_sources(ve_tls_core PRIVATE
     core/src/producer/ve_tls_producer_config.c
     core/src/producer/ve_tls_producer_manager.c
     core/src/producer/ve_tls_producer_sender.c
+    core/src/producer/ve_tls_persistent_format.c
+    core/src/producer/ve_tls_segment_store.c
+    core/src/producer/ve_tls_checkpoint.c
+    core/src/producer/ve_tls_lease.c
+    core/src/producer/ve_tls_persistent.c
     core/src/producer/ve_tls_pool.c
     core/src/producer/ve_tls_snapshot.c
     core/src/producer/ve_tls_env.c
@@ -75,23 +81,29 @@ if(UNIX AND NOT APPLE)
     target_link_libraries(ve_tls_core PUBLIC m)
 endif()
 
-add_executable(ve_tls_demo tools/demo.c)
-target_link_libraries(ve_tls_demo PRIVATE ve_tls_core)
+if(VE_TLS_BUILD_TOOLS AND NOT ANDROID)
+    add_executable(ve_tls_demo tools/demo.c)
+    target_link_libraries(ve_tls_demo PRIVATE ve_tls_core)
 
-add_executable(ve_tls_demo_real tools/real_demo.c)
-target_link_libraries(ve_tls_demo_real PRIVATE ve_tls_core)
+    add_executable(ve_tls_demo_real tools/real_demo.c)
+    target_link_libraries(ve_tls_demo_real PRIVATE ve_tls_core)
 
-add_executable(ve_tls_bench tools/bench.c)
-target_link_libraries(ve_tls_bench PRIVATE ve_tls_core)
+    add_executable(ve_tls_bench tools/bench.c)
+    target_link_libraries(ve_tls_bench PRIVATE ve_tls_core)
 
-add_executable(ve_tls_gen_raw_log tools/gen_raw_log.c)
-target_link_libraries(ve_tls_gen_raw_log PRIVATE ve_tls_core)
+    add_executable(ve_tls_gen_raw_log tools/gen_raw_log.c)
+    target_link_libraries(ve_tls_gen_raw_log PRIVATE ve_tls_core)
 
-add_executable(ve_tls_perf_sls tools/perf_sls.c)
-target_link_libraries(ve_tls_perf_sls PRIVATE ve_tls_core)
+    add_executable(ve_tls_perf_sls tools/perf_sls.c)
+    target_link_libraries(ve_tls_perf_sls PRIVATE ve_tls_core)
 
-add_executable(ve_tls_benchmark_sls tools/benchmark_sls.c)
-target_link_libraries(ve_tls_benchmark_sls PRIVATE ve_tls_core)
+    add_executable(ve_tls_benchmark_sls tools/benchmark_sls.c)
+    target_link_libraries(ve_tls_benchmark_sls PRIVATE ve_tls_core)
+
+    add_executable(ve_tls_persistent_bench tools/persistent_bench.c)
+    target_link_libraries(ve_tls_persistent_bench PRIVATE ve_tls_core)
+    target_include_directories(ve_tls_persistent_bench PRIVATE core/src)
+endif()
 
 if(VE_TLS_BUILD_TESTS)
     enable_testing()

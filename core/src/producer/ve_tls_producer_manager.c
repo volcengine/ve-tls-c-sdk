@@ -27,6 +27,12 @@ static ve_tls_send_callbacks ve_tls_capture_callbacks(ve_tls_producer * producer
     return out;
 }
 
+static void ve_tls_manager_heartbeat_persistent(ve_tls_producer * producer) {
+    if (producer && producer->persistent) {
+        (void)ve_tls_persistent_heartbeat_if_due(producer->persistent, 0);
+    }
+}
+
 static void ve_tls_manager_drop_item(ve_tls_producer * producer, size_t bytes, int64_t id, const char * code, const char * message) {
     ve_tls_send_callbacks cbs = ve_tls_capture_callbacks(producer);
     ve_tls_error err;
@@ -37,6 +43,7 @@ static void ve_tls_manager_drop_item(ve_tls_producer * producer, size_t bytes, i
     err.retryable = 0;
     err.error_code = (code && code[0] != 0) ? ve_tls_strdup(code) : ve_tls_strdup("ClientError");
     err.error_message = (message && message[0] != 0) ? ve_tls_strdup(message) : ve_tls_strdup("drop");
+    ve_tls_persistent_on_final_result(producer, VE_TLS_DROP_ERROR, id, id);
     if (cbs.cb) {
         cbs.cb(VE_TLS_DROP_ERROR, bytes, 0, NULL, err.error_message, NULL, cbs.cb_param, id, id);
     }
@@ -56,6 +63,7 @@ static void ve_tls_manager_drop_range(ve_tls_producer * producer, size_t bytes, 
     err.retryable = 0;
     err.error_code = (code && code[0] != 0) ? ve_tls_strdup(code) : ve_tls_strdup("ClientError");
     err.error_message = (message && message[0] != 0) ? ve_tls_strdup(message) : ve_tls_strdup("drop");
+    ve_tls_persistent_on_final_result(producer, VE_TLS_DROP_ERROR, start_id, end_id);
     if (cbs.cb) {
         cbs.cb(VE_TLS_DROP_ERROR, bytes, 0, NULL, err.error_message, NULL, cbs.cb_param, start_id, end_id);
     }
@@ -229,6 +237,7 @@ static int ve_tls_manager_requeue_item(ve_tls_producer * producer, const ve_tls_
 static void * ve_tls_worker_main_builder(void * arg) {
     ve_tls_producer * producer = (ve_tls_producer *)arg;
     for (;;) {
+        ve_tls_manager_heartbeat_persistent(producer);
         producer->config.platform.mutex_lock(producer->mutex);
         int have_any_builder = (producer->default_builder && producer->default_builder->log_count > 0) ? 1 : 0;
         int have_ingress = producer->ingress_queue_count > 0 ? 1 : 0;
@@ -687,6 +696,7 @@ void * ve_tls_worker_main(void * arg) {
                             err.error_code = ve_tls_strdup("ClientError");
                             err.error_message = ve_tls_strdup(c_rc == -1 ? "compress failed" : "unsupported compress_type");
                             ve_tls_send_callbacks cbs = ve_tls_capture_callbacks(producer);
+                            ve_tls_persistent_on_final_result(producer, VE_TLS_DROP_ERROR, g->start_id, g->end_id);
                             if (cbs.cb) {
                                 cbs.cb(VE_TLS_DROP_ERROR, g->bytes, 0, NULL, err.error_message, NULL, cbs.cb_param, g->start_id, g->end_id);
                             }
@@ -714,6 +724,7 @@ void * ve_tls_worker_main(void * arg) {
                             err.error_code = ve_tls_strdup("PayloadTooLarge");
                             err.error_message = ve_tls_strdup("payload too large after compression");
                             ve_tls_send_callbacks cbs = ve_tls_capture_callbacks(producer);
+                            ve_tls_persistent_on_final_result(producer, VE_TLS_DROP_ERROR, g->ids[r.start], g->ids[r.start]);
                             if (cbs.cb) {
                                 cbs.cb(VE_TLS_DROP_ERROR, g->logs[r.start].size, 0, NULL, err.error_message, NULL, cbs.cb_param, g->ids[r.start], g->ids[r.start]);
                             }
@@ -800,6 +811,7 @@ void * ve_tls_worker_main(void * arg) {
                         err.error_code = ve_tls_strdup("KeyQueueLimitExceeded");
                         err.error_message = ve_tls_strdup("key queue limit exceeded");
                         ve_tls_send_callbacks cbs = ve_tls_capture_callbacks(producer);
+                        ve_tls_persistent_on_final_result(producer, VE_TLS_DROP_ERROR, t.start_id, t.end_id);
                         if (cbs.cb) {
                             cbs.cb(VE_TLS_DROP_ERROR, t.batch_bytes, 0, NULL, err.error_message, NULL, cbs.cb_param, t.start_id, t.end_id);
                         }
@@ -874,6 +886,7 @@ void * ve_tls_worker_main(void * arg) {
                             }
                         }
                         ve_tls_send_callbacks cbs = ve_tls_capture_callbacks(producer);
+                        ve_tls_persistent_on_final_result(producer, VE_TLS_DROP_ERROR, t.start_id, t.end_id);
                         if (cbs.cb) {
                             cbs.cb(VE_TLS_DROP_ERROR, t.batch_bytes, 0, NULL, err.error_message, NULL, cbs.cb_param, t.start_id, t.end_id);
                         }

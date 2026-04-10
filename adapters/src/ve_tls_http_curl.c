@@ -156,7 +156,31 @@ static int ve_tls_http_curl_do(ve_tls_http_client * client, const ve_tls_http_re
                 char end = *p;
                 *p = 0;
                 if (line[0] != 0) {
-                    struct curl_slist * nh = curl_slist_append(headers, line);
+                    const char * header_line = line;
+                    char * empty_header = NULL;
+                    char * colon = strchr(line, ':');
+                    if (colon) {
+                        const char * value = colon + 1;
+                        while (*value == ' ' || *value == '\t') {
+                            value++;
+                        }
+                        if (*value == 0) {
+                            size_t key_len = (size_t)(colon - line);
+                            empty_header = (char *)malloc(key_len + 2);
+                            if (!empty_header) {
+                                free(tmp);
+                                curl_slist_free_all(headers);
+                                free(body.data);
+                                return -1;
+                            }
+                            memcpy(empty_header, line, key_len);
+                            empty_header[key_len] = ';';
+                            empty_header[key_len + 1] = 0;
+                            header_line = empty_header;
+                        }
+                    }
+                    struct curl_slist * nh = curl_slist_append(headers, header_line);
+                    free(empty_header);
                     if (!nh) {
                         free(tmp);
                         curl_slist_free_all(headers);
@@ -182,6 +206,9 @@ static int ve_tls_http_curl_do(ve_tls_http_client * client, const ve_tls_http_re
     curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, ve_tls_header_cb);
     curl_easy_setopt(curl, CURLOPT_HEADERDATA, resp);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+    if (req->debug_log > 0) {
+        curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
+    }
     if (req->tls_verify_peer == 0) {
         curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
     } else {

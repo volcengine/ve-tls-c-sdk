@@ -731,12 +731,51 @@ int ve_tls_sign_v4_append(
     const char * headers_in,
     char ** headers_out
 ) {
+    return ve_tls_sign_v4_append_at(
+        access_key_id,
+        access_key_secret,
+        security_token,
+        region,
+        service,
+        method,
+        host,
+        path,
+        query,
+        body,
+        body_size,
+        NULL,
+        headers_in,
+        headers_out
+    );
+}
+
+int ve_tls_sign_v4_append_at(
+    const char * access_key_id,
+    const char * access_key_secret,
+    const char * security_token,
+    const char * region,
+    const char * service,
+    const char * method,
+    const char * host,
+    const char * path,
+    const char * query,
+    const unsigned char * body,
+    size_t body_size,
+    const char * xdate_override,
+    const char * headers_in,
+    char ** headers_out
+) {
     if (!access_key_id || !access_key_secret || !region || !service || !method || !host || !path || !headers_out) {
         return -1;
     }
     *headers_out = NULL;
     char xdate[17];
-    ve_tls_format_xdate(xdate);
+    if (xdate_override && strlen(xdate_override) == 16) {
+        memcpy(xdate, xdate_override, 16);
+        xdate[16] = 0;
+    } else {
+        ve_tls_format_xdate(xdate);
+    }
     char date8[9];
     ve_tls_format_date(date8, xdate);
 
@@ -806,7 +845,7 @@ int ve_tls_sign_v4_append(
     size_t canon_headers_n = strlen(canon_headers);
     size_t signed_headers_n = strlen(signed_headers);
     size_t payload_hash_n = strlen(payload_hash_hex);
-    size_t canon_req_need = method_n + norm_uri_n + norm_query_n + canon_headers_n + signed_headers_n + payload_hash_n + 6;
+    size_t canon_req_need = method_n + norm_uri_n + norm_query_n + canon_headers_n + signed_headers_n + payload_hash_n + 5;
 
     char canon_req_stack[1024];
     char * canon_req = canon_req_stack;

@@ -8,6 +8,11 @@
 #include "ve_tls_error.h"
 #include "ve_tls_http.h"
 #include "ve_tls_version.h"
+#include "producer/ve_tls_persistent_format.h"
+#include "producer/ve_tls_segment_store.h"
+#include "producer/ve_tls_checkpoint.h"
+#include "producer/ve_tls_lease.h"
+#include "producer/ve_tls_persistent.h"
 #include "producer/ve_tls_producer_internal.h"
 #include "producer/ve_tls_snapshot.h"
 #include "producer/ve_tls_pool.h"
@@ -17,6 +22,7 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <limits.h>
+#include <sys/stat.h>
 
 #if defined(VE_TLS_HAVE_ZLIB)
 #include <zlib.h>
@@ -3427,6 +3433,10 @@ static int g_hdr_small_done = 0;
 static int g_hdr_small_ok = 0;
 static int g_hdr_order_done = 0;
 static int g_hdr_order_ok = 0;
+static int g_hdr_md5_done = 0;
+static int g_hdr_md5_ok = 0;
+static int g_hdr_empty_hash_done = 0;
+static int g_hdr_empty_hash_ok = 0;
 
 static int test_http_assert_headers_do(ve_tls_http_client * client, const ve_tls_http_request * req, ve_tls_http_response * resp) {
     (void)client;
@@ -3679,6 +3689,116 @@ static int test_sender_unsigned_headers_appended_after_authorization(void) {
     return g_hdr_order_ok ? 0 : -1;
 }
 
+static int test_http_assert_content_md5_signed_do(ve_tls_http_client * client, const ve_tls_http_request * req, ve_tls_http_response * resp) {
+    (void)client;
+    g_hdr_md5_done = 1;
+    g_hdr_md5_ok = 0;
+    if (!req || !req->headers || !resp) {
+        return -1;
+    }
+    const char * h = req->headers;
+    if (strstr(h, "Content-MD5: ") &&
+        strstr(h, "Authorization: HMAC-SHA256 Credential=") &&
+        strstr(h, "SignedHeaders=content-md5;")) {
+        g_hdr_md5_ok = 1;
+    }
+    resp->status_code = 200;
+    resp->request_id = strdup("rid-md5");
+    resp->body = NULL;
+    resp->body_size = 0;
+    return 0;
+}
+
+static int test_sender_putlogs_includes_content_md5_header(void) {
+    g_hdr_md5_done = 0;
+    g_hdr_md5_ok = 0;
+
+    ve_tls_config cfg;
+    ve_tls_config_init(&cfg);
+    cfg.endpoint = "https://example.com";
+    cfg.region = "cn-beijing";
+    cfg.topic_id = "t";
+    cfg.access_key_id = "ak";
+    cfg.access_key_secret = "sk";
+    cfg.retry_policy.max_attempts = 1;
+    cfg.flush_interval_ms = 0;
+    cfg.log_count_per_package = 1;
+    cfg.compress_type = "none";
+    cfg.http_client.do_request = test_http_assert_content_md5_signed_do;
+    cfg.http_client.free_response = test_http_free;
+
+    ve_tls_producer * p = ve_tls_producer_create(&cfg);
+    if (!p) return -1;
+
+    ve_tls_kv kvs[1];
+    kvs[0].key = "k";
+    kvs[0].value = "v";
+    if (ve_tls_producer_add_log_kv(p, 0, kvs, 1, 1) != VE_TLS_OK) {
+        ve_tls_producer_destroy(p);
+        return -1;
+    }
+    for (int i = 0; i < 200 && !g_hdr_md5_done; i++) {
+        cfg.platform.sleep_ms(10);
+    }
+    ve_tls_producer_destroy(p);
+    return g_hdr_md5_ok ? 0 : -1;
+}
+
+static int test_http_assert_empty_hashkey_signed_do(ve_tls_http_client * client, const ve_tls_http_request * req, ve_tls_http_response * resp) {
+    (void)client;
+    g_hdr_empty_hash_done = 1;
+    g_hdr_empty_hash_ok = 0;
+    if (!req || !req->headers || !resp) {
+        return -1;
+    }
+    const char * h = req->headers;
+    if (strstr(h, "x-tls-hashkey: \n") &&
+        strstr(h, "SignedHeaders=") &&
+        strstr(h, "x-tls-hashkey")) {
+        g_hdr_empty_hash_ok = 1;
+    }
+    resp->status_code = 200;
+    resp->request_id = strdup("rid-empty-hash");
+    resp->body = NULL;
+    resp->body_size = 0;
+    return 0;
+}
+
+static int test_sender_putlogs_includes_empty_hashkey_header(void) {
+    g_hdr_empty_hash_done = 0;
+    g_hdr_empty_hash_ok = 0;
+
+    ve_tls_config cfg;
+    ve_tls_config_init(&cfg);
+    cfg.endpoint = "https://example.com";
+    cfg.region = "cn-beijing";
+    cfg.topic_id = "t";
+    cfg.access_key_id = "ak";
+    cfg.access_key_secret = "sk";
+    cfg.retry_policy.max_attempts = 1;
+    cfg.flush_interval_ms = 0;
+    cfg.log_count_per_package = 1;
+    cfg.compress_type = "none";
+    cfg.http_client.do_request = test_http_assert_empty_hashkey_signed_do;
+    cfg.http_client.free_response = test_http_free;
+
+    ve_tls_producer * p = ve_tls_producer_create(&cfg);
+    if (!p) return -1;
+
+    ve_tls_kv kvs[1];
+    kvs[0].key = "k";
+    kvs[0].value = "v";
+    if (ve_tls_producer_add_log_kv(p, 0, kvs, 1, 1) != VE_TLS_OK) {
+        ve_tls_producer_destroy(p);
+        return -1;
+    }
+    for (int i = 0; i < 200 && !g_hdr_empty_hash_done; i++) {
+        cfg.platform.sleep_ms(10);
+    }
+    ve_tls_producer_destroy(p);
+    return g_hdr_empty_hash_ok ? 0 : -1;
+}
+
 static int g_raw_done = 0;
 static int g_raw_ok = 0;
 static int g_raw_ok_count = 0;
@@ -3748,6 +3868,45 @@ static int test_raw_add_log_paths_ok(void) {
     }
     ve_tls_producer_destroy(p);
     return g_raw_ok ? 0 : -1;
+}
+
+static int test_add_log_with_id_returns_monotonic_ids(void) {
+    ve_tls_config cfg;
+    ve_tls_config_init(&cfg);
+    cfg.endpoint = "https://example.com";
+    cfg.region = "cn-beijing";
+    cfg.topic_id = "t";
+    cfg.access_key_id = "ak";
+    cfg.access_key_secret = "sk";
+    cfg.retry_policy.max_attempts = 1;
+    cfg.flush_interval_ms = 0;
+    cfg.agg_strategy = 0;
+    cfg.compress_type = "none";
+    cfg.http_client.do_request = test_http_ok_do;
+    cfg.http_client.free_response = test_http_free;
+
+    ve_tls_producer * p = ve_tls_producer_create(&cfg);
+    if (!p) {
+        return -1;
+    }
+
+    const char * raw = "{\"k\":\"v\"}";
+    int64_t raw_id = 0;
+    int64_t kv_id = 0;
+    ve_tls_kv kvs[1];
+    kvs[0].key = "k";
+    kvs[0].value = "v";
+    if (ve_tls_producer_add_log_raw_with_id(p, raw, strlen(raw), 1, &raw_id) != VE_TLS_OK || raw_id <= 0) {
+        ve_tls_producer_destroy(p);
+        return -1;
+    }
+    if (ve_tls_producer_add_log_kv_hashkey_with_id(p, 0, "hk", kvs, 1, 1, &kv_id) != VE_TLS_OK || kv_id <= raw_id) {
+        ve_tls_producer_destroy(p);
+        return -1;
+    }
+
+    ve_tls_producer_destroy(p);
+    return 0;
 }
 
 static int g_sq_drop_done = 0;
@@ -4772,6 +4931,14 @@ static uint32_t read_u32_le(const unsigned char * p) {
            ((uint32_t)p[1] << 8) |
            ((uint32_t)p[2] << 16) |
            ((uint32_t)p[3] << 24);
+}
+
+static uint64_t read_u64_le_buf(const unsigned char * p) {
+    uint64_t v = 0;
+    for (int i = 0; i < 8; i++) {
+        v |= ((uint64_t)p[i]) << (8 * i);
+    }
+    return v;
 }
 
 static int mem_has(const unsigned char * hay, size_t hay_len, const unsigned char * needle, size_t needle_len) {
@@ -6343,6 +6510,18 @@ static int test_http_sleep_do(ve_tls_http_client * client, const ve_tls_http_req
     return 0;
 }
 
+static int test_http_takeover_block_do(ve_tls_http_client * client, const ve_tls_http_request * req, ve_tls_http_response * resp) {
+    (void)client;
+    (void)req;
+    if (!resp) {
+        return -1;
+    }
+    usleep(200 * 1000);
+    resp->status_code = 200;
+    resp->request_id = strdup("rid-takeover");
+    return 0;
+}
+
 static void test_http_sleep_free(ve_tls_http_client * client, ve_tls_http_response * resp) {
     (void)client;
     if (!resp) {
@@ -7073,6 +7252,42 @@ static int test_sign(void) {
     return ok ? 0 : -1;
 }
 
+static int test_sign_matches_go_reference_with_fixed_xdate(void) {
+    const char * headers =
+        "Content-Type: application/x-protobuf\n"
+        "Content-MD5: EC292B5AF5705CA644BEB1BAE239DBD9\n"
+        "x-tls-apiversion: 0.3.0\n"
+        "x-tls-bodyrawsize: 79\n"
+        "x-tls-compresstype: lz4\n"
+        "x-tls-hashkey: \n";
+    const unsigned char body[5] = {1, 2, 3, 4, 5};
+    char * out = NULL;
+    int rc = ve_tls_sign_v4_append_at(
+        "your-ak",
+        "WkRnd1lXUmhOak5oTkRNeE5HSTNZMkZrWlRRellUa3hZV015Wm1NeFpHWQ==",
+        "",
+        "cn-guilin-boe",
+        "TLS",
+        "POST",
+        "tls-cn-guilin-boe.volces.com",
+        "/PutLogs",
+        "TopicId=3db5e9ad-7706-4cb2-9567-2909a98b9638",
+        body,
+        sizeof(body),
+        "20260410T032329Z",
+        headers,
+        &out
+    );
+    if (rc != 0 || !out) {
+        free(out);
+        return -1;
+    }
+    int ok = strstr(out, "X-Date: 20260410T032329Z\n") != NULL &&
+             strstr(out, "Signature=b149a648374cc58cb847c7fa8fc79dba48ecb99a2dc52200bc9107501a79d678") != NULL;
+    free(out);
+    return ok ? 0 : -1;
+}
+
 static int test_sign_cache_secret_change_same_pointer_effective(void) {
     const char * headers = "Content-Type: application/x-protobuf\nx-tls-apiversion: " VE_TLS_C_SDK_API_VERSION "\n";
     unsigned char body[3] = {1,2,3};
@@ -7304,6 +7519,1023 @@ static int test_lz4_compress_roundtrip(void) {
 }
 #endif
 
+static int make_temp_dir(char * out, size_t out_size) {
+    static int seq = 0;
+    int id = __atomic_add_fetch(&seq, 1, __ATOMIC_RELAXED);
+    if (!out || out_size < 64) {
+        return -1;
+    }
+    snprintf(out, out_size, "/tmp/ve-tls-persistent-%d-%d", (int)getpid(), id);
+    if (mkdir(out, 0700) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+static void join_path(char * out, size_t out_size, const char * dir, const char * name) {
+    if (!out || out_size == 0) {
+        return;
+    }
+    snprintf(out, out_size, "%s/%s", dir, name);
+}
+
+static void cleanup_persistent_dir(const char * dir) {
+    char path[PATH_MAX];
+    static const char * names[] = {
+        "manifest",
+        "checkpoint",
+        "lease",
+        "seg-000001.log",
+        "seg-000002.log",
+        "seg-000003.log"
+    };
+    if (!dir || dir[0] == 0) {
+        return;
+    }
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        join_path(path, sizeof(path), dir, names[i]);
+        unlink(path);
+    }
+    rmdir(dir);
+}
+
+static int test_platform_default_has_file_hooks(void) {
+    ve_tls_config cfg;
+    ve_tls_config_init(&cfg);
+    return cfg.platform.file_open &&
+           cfg.platform.file_close &&
+           cfg.platform.file_read &&
+           cfg.platform.file_write &&
+           cfg.platform.file_seek &&
+           cfg.platform.file_fsync &&
+           cfg.platform.file_truncate &&
+           cfg.platform.path_mkdirs &&
+           cfg.platform.path_stat &&
+           cfg.platform.path_remove &&
+           cfg.platform.path_rename ? 0 : -1;
+}
+
+static int test_persistent_record_roundtrip_hash_key(void) {
+    static const unsigned char payload[] = {'a', 'b', 'c', 'd'};
+    ve_tls_persistent_record_view view;
+    ve_tls_persistent_record out;
+    unsigned char buf[256];
+    size_t encoded = 0;
+    memset(&view, 0, sizeof(view));
+    memset(&out, 0, sizeof(out));
+    view.log_id = 42;
+    view.flags = VE_TLS_PERSISTENT_RECORD_FLAG_HAS_EXT;
+    view.hash_key = "hk-demo";
+    view.payload = payload;
+    view.payload_size = sizeof(payload);
+    encoded = ve_tls_persistent_record_encoded_size(&view);
+    if (encoded == 0 || encoded > sizeof(buf)) {
+        return -1;
+    }
+    if (ve_tls_persistent_record_encode(buf, sizeof(buf), &view, &encoded) != 0) {
+        return -1;
+    }
+    if (ve_tls_persistent_record_decode(buf, encoded, &out) != 0) {
+        return -1;
+    }
+    if (out.log_id != 42 || !out.hash_key || strcmp(out.hash_key, "hk-demo") != 0 ||
+        out.payload_size != sizeof(payload) || memcmp(out.payload, payload, sizeof(payload)) != 0) {
+        ve_tls_persistent_record_free(&out);
+        return -1;
+    }
+    ve_tls_persistent_record_free(&out);
+    return 0;
+}
+
+static int test_segment_store_append_read_rotate_and_repair(void) {
+    char dir[PATH_MAX];
+    char seg_path[PATH_MAX];
+    unsigned char encoded1[256];
+    unsigned char encoded2[256];
+    ve_tls_persistent_record_view view1;
+    ve_tls_persistent_record_view view2;
+    ve_tls_segment_store_options opt;
+    ve_tls_segment_store store;
+    ve_tls_segment_record_ref ref1;
+    ve_tls_segment_record_ref ref2;
+    unsigned char * got = NULL;
+    size_t got_size = 0;
+    uint64_t next_offset = 0;
+    size_t encoded1_size = 0;
+    size_t encoded2_size = 0;
+    ve_tls_config cfg;
+    ve_tls_file * file = NULL;
+    uint64_t valid_end = 0;
+    static const unsigned char payload1[] = {'l', 'o', 'g', '1'};
+    static const unsigned char payload2[] = {'l', 'o', 'g', '2'};
+
+    if (make_temp_dir(dir, sizeof(dir)) != 0) {
+        return -1;
+    }
+    ve_tls_config_init(&cfg);
+    memset(&view1, 0, sizeof(view1));
+    memset(&view2, 0, sizeof(view2));
+    memset(&opt, 0, sizeof(opt));
+    memset(&store, 0, sizeof(store));
+    memset(&ref1, 0, sizeof(ref1));
+    memset(&ref2, 0, sizeof(ref2));
+
+    view1.log_id = 1;
+    view1.payload = payload1;
+    view1.payload_size = sizeof(payload1);
+    encoded1_size = ve_tls_persistent_record_encoded_size(&view1);
+    if (ve_tls_persistent_record_encode(encoded1, sizeof(encoded1), &view1, &encoded1_size) != 0) {
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    view2.log_id = 2;
+    view2.flags = VE_TLS_PERSISTENT_RECORD_FLAG_HAS_EXT;
+    view2.hash_key = "hk2";
+    view2.payload = payload2;
+    view2.payload_size = sizeof(payload2);
+    encoded2_size = ve_tls_persistent_record_encoded_size(&view2);
+    if (ve_tls_persistent_record_encode(encoded2, sizeof(encoded2), &view2, &encoded2_size) != 0) {
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+
+    opt.platform = &cfg.platform;
+    opt.dir_path = dir;
+    opt.segment_max_bytes = encoded1_size + 8;
+    opt.segment_max_records = 1;
+    if (ve_tls_segment_store_open(&store, &opt) != 0) {
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    if (ve_tls_segment_store_append(&store, encoded1, encoded1_size, &ref1) != 0 ||
+        ve_tls_segment_store_append(&store, encoded2, encoded2_size, &ref2) != 0) {
+        ve_tls_segment_store_close(&store);
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    if (ref1.segment_id != 1 || ref2.segment_id != 2) {
+        ve_tls_segment_store_close(&store);
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    if (ve_tls_segment_store_read(&store, ref2.segment_id, ref2.offset, &got, &got_size, &next_offset) != 0) {
+        ve_tls_segment_store_close(&store);
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    if (got_size != encoded2_size || memcmp(got, encoded2, encoded2_size) != 0 || next_offset <= ref2.offset) {
+        ve_tls_segment_store_read_free(got);
+        ve_tls_segment_store_close(&store);
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    ve_tls_segment_store_read_free(got);
+    got = NULL;
+
+    join_path(seg_path, sizeof(seg_path), dir, "seg-000002.log");
+    file = cfg.platform.file_open(seg_path, VE_TLS_FILE_OPEN_RDWR, 0644);
+    if (!file) {
+        ve_tls_segment_store_close(&store);
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    if (cfg.platform.file_truncate(file, (int64_t)(next_offset - 1)) != 0) {
+        cfg.platform.file_close(file);
+        ve_tls_segment_store_close(&store);
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    cfg.platform.file_close(file);
+    if (ve_tls_segment_store_repair_tail(&store, 2, &valid_end) != 0 || valid_end != 0) {
+        ve_tls_segment_store_close(&store);
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+
+    ve_tls_segment_store_close(&store);
+    cleanup_persistent_dir(dir);
+    return 0;
+}
+
+static int test_checkpoint_roundtrip_and_lease_takeover(void) {
+    char dir[PATH_MAX];
+    char checkpoint_path[PATH_MAX];
+    char lease_path[PATH_MAX];
+    ve_tls_checkpoint_state ckpt_in;
+    ve_tls_checkpoint_state ckpt_out;
+    ve_tls_lease_options lease_opt;
+    ve_tls_lease_state state1;
+    ve_tls_lease_state state2;
+    ve_tls_config cfg;
+
+    if (make_temp_dir(dir, sizeof(dir)) != 0) {
+        return -1;
+    }
+    join_path(checkpoint_path, sizeof(checkpoint_path), dir, "checkpoint");
+    join_path(lease_path, sizeof(lease_path), dir, "lease");
+    ve_tls_config_init(&cfg);
+    memset(&ckpt_in, 0, sizeof(ckpt_in));
+    memset(&ckpt_out, 0, sizeof(ckpt_out));
+    memset(&lease_opt, 0, sizeof(lease_opt));
+    memset(&state1, 0, sizeof(state1));
+    memset(&state2, 0, sizeof(state2));
+
+    ckpt_in.acked_log_id = 7;
+    ckpt_in.replay_begin_log_id = 8;
+    ckpt_in.replay_begin_segment_id = 2;
+    ckpt_in.replay_begin_offset = 128;
+    ckpt_in.last_segment_id = 3;
+    if (ve_tls_checkpoint_save(&cfg.platform, checkpoint_path, &ckpt_in) != 0 ||
+        ve_tls_checkpoint_load(&cfg.platform, checkpoint_path, &ckpt_out) != 0) {
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    if (memcmp(&ckpt_in, &ckpt_out, sizeof(ckpt_in)) != 0) {
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+
+    lease_opt.platform = &cfg.platform;
+    lease_opt.lease_path = lease_path;
+    lease_opt.owner_id = "owner-a";
+    lease_opt.owner_pid = 100;
+    lease_opt.owner_process_name = "proc-a";
+    lease_opt.now_ms = 1000;
+    lease_opt.lease_timeout_ms = 200;
+    lease_opt.mode = VE_TLS_LEASE_OPEN_FAIL_IF_OWNED;
+    if (ve_tls_lease_acquire(&lease_opt, &state1) != 0 || state1.fencing_token != 1) {
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    lease_opt.owner_id = "owner-b";
+    lease_opt.owner_pid = 101;
+    lease_opt.owner_process_name = "proc-b";
+    lease_opt.now_ms = 1100;
+    if (ve_tls_lease_acquire(&lease_opt, &state2) == 0) {
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    lease_opt.mode = VE_TLS_LEASE_OPEN_TAKEOVER_IF_STALE;
+    lease_opt.now_ms = 1301;
+    if (ve_tls_lease_acquire(&lease_opt, &state2) != 0 || state2.fencing_token != 2) {
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+
+    cleanup_persistent_dir(dir);
+    return 0;
+}
+
+static int test_persistent_open_creates_metadata_files(void) {
+    char dir[PATH_MAX];
+    char manifest_path[PATH_MAX];
+    char checkpoint_path[PATH_MAX];
+    char lease_path[PATH_MAX];
+    ve_tls_persistent_options opt;
+    ve_tls_persistent persistent;
+    ve_tls_config cfg;
+    ve_tls_path_info info;
+
+    if (make_temp_dir(dir, sizeof(dir)) != 0) {
+        return -1;
+    }
+    join_path(manifest_path, sizeof(manifest_path), dir, "manifest");
+    join_path(checkpoint_path, sizeof(checkpoint_path), dir, "checkpoint");
+    join_path(lease_path, sizeof(lease_path), dir, "lease");
+    ve_tls_config_init(&cfg);
+    memset(&opt, 0, sizeof(opt));
+    memset(&persistent, 0, sizeof(persistent));
+    memset(&info, 0, sizeof(info));
+
+    opt.platform = &cfg.platform;
+    opt.dir_path = dir;
+    opt.instance_id = "test-instance";
+    opt.owner_id = "owner-a";
+    opt.owner_process_name = "proc-a";
+    opt.owner_pid = 123;
+    opt.segment_max_bytes = 1024;
+    opt.segment_max_records = 128;
+    opt.max_bytes = 4096;
+    opt.max_records = 512;
+    opt.max_segments = 8;
+    opt.now_ms = 1000;
+    opt.lease_timeout_ms = 300;
+    opt.open_mode = VE_TLS_LEASE_OPEN_TAKEOVER_IF_STALE;
+    if (ve_tls_persistent_open(&persistent, &opt) != 0) {
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    if (cfg.platform.path_stat(manifest_path, &info) != 0 || !info.exists) {
+        ve_tls_persistent_close(&persistent);
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    if (cfg.platform.path_stat(checkpoint_path, &info) != 0 || !info.exists) {
+        ve_tls_persistent_close(&persistent);
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    if (cfg.platform.path_stat(lease_path, &info) != 0 || !info.exists) {
+        ve_tls_persistent_close(&persistent);
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+
+    ve_tls_persistent_close(&persistent);
+    cleanup_persistent_dir(dir);
+    return 0;
+}
+
+static int exported_buffer_count_and_first_hash_key(const unsigned char * buf, size_t size, uint32_t * out_count, char * out_hk, size_t out_hk_size) {
+    size_t off = 0;
+    uint32_t version = 0;
+    uint32_t count = 0;
+    uint32_t hk_len = 0;
+    if (!buf || size < 4 + 4 + 4 + 8 || !out_count) {
+        return -1;
+    }
+    if (!(buf[0] == 'V' && buf[1] == 'T' && buf[2] == 'L' && buf[3] == 'S')) {
+        return -1;
+    }
+    off = 4;
+    if (off + 4 + 4 + 8 > size) {
+        return -1;
+    }
+    version = read_u32_le(buf + off);
+    off += 4;
+    count = read_u32_le(buf + off);
+    off += 4;
+    off += 8;
+    if (version != 3) {
+        return -1;
+    }
+    *out_count = count;
+    if (count == 0 || !out_hk || out_hk_size == 0) {
+        return 0;
+    }
+    if (off + 8 + 8 + 1 + 4 + 4 + 4 > size) {
+        return -1;
+    }
+    off += 8;
+    off += 8;
+    off += 1;
+    off += 4;
+    hk_len = read_u32_le(buf + off);
+    off += 4;
+    off += 4;
+    if (off + hk_len > size || hk_len >= out_hk_size) {
+        return -1;
+    }
+    memcpy(out_hk, buf + off, hk_len);
+    out_hk[hk_len] = 0;
+    return 0;
+}
+
+static int test_producer_create_with_persistent_adds_disk_record(void) {
+    char dir[PATH_MAX];
+    char seg_path[PATH_MAX];
+    unsigned char * buf = NULL;
+    size_t size = 0;
+    uint32_t count = 0;
+    ve_tls_config cfg;
+    ve_tls_path_info info;
+    ve_tls_producer * p = NULL;
+    if (make_temp_dir(dir, sizeof(dir)) != 0) {
+        return -1;
+    }
+    join_path(seg_path, sizeof(seg_path), dir, "seg-000001.log");
+    ve_tls_config_init(&cfg);
+    cfg.endpoint = "https://example.com";
+    cfg.region = "cn-beijing";
+    cfg.topic_id = "t";
+    cfg.access_key_id = "ak";
+    cfg.access_key_secret = "sk";
+    cfg.retry_policy.max_attempts = 1;
+    cfg.flush_interval_ms = 100000;
+    cfg.use_persistent = 1;
+    cfg.persistent_file_path = dir;
+    cfg.max_persistent_log_count = 64;
+    cfg.max_persistent_file_size = 1024;
+    cfg.max_persistent_file_count = 4;
+    p = ve_tls_producer_create(&cfg);
+    if (!p || !p->persistent) {
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    if (ve_tls_producer_add_log_raw(p, "{\"k\":\"v\"}", strlen("{\"k\":\"v\"}"), 0) != VE_TLS_OK) {
+        ve_tls_producer_destroy(p);
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    if (ve_tls_producer_export_raw_buffer(p, &buf, &size) != VE_TLS_OK ||
+        exported_buffer_count_and_first_hash_key(buf, size, &count, NULL, 0) != 0 ||
+        count != 1 ||
+        cfg.platform.path_stat(seg_path, &info) != 0 || !info.exists || info.size == 0) {
+        ve_tls_producer_free_raw_buffer(buf);
+        ve_tls_producer_destroy(p);
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    ve_tls_producer_free_raw_buffer(buf);
+    ve_tls_producer_destroy(p);
+    cleanup_persistent_dir(dir);
+    return 0;
+}
+
+static int test_persistent_recover_requeues_hash_key_record(void) {
+    char dir[PATH_MAX];
+    ve_tls_config cfg;
+    ve_tls_producer * p1 = NULL;
+    ve_tls_producer * p2 = NULL;
+    unsigned char * buf = NULL;
+    size_t size = 0;
+    uint32_t count = 0;
+    char hk[64];
+    static const unsigned char payload[] = "recover-payload";
+    if (make_temp_dir(dir, sizeof(dir)) != 0) {
+        return -1;
+    }
+    memset(hk, 0, sizeof(hk));
+    ve_tls_config_init(&cfg);
+    cfg.endpoint = "https://example.com";
+    cfg.region = "cn-beijing";
+    cfg.topic_id = "t";
+    cfg.access_key_id = "ak";
+    cfg.access_key_secret = "sk";
+    cfg.retry_policy.max_attempts = 1;
+    cfg.flush_interval_ms = 100000;
+    cfg.use_persistent = 1;
+    cfg.persistent_file_path = dir;
+    cfg.max_persistent_log_count = 64;
+    cfg.max_persistent_file_size = 1024;
+    cfg.max_persistent_file_count = 4;
+    p1 = ve_tls_producer_create(&cfg);
+    if (!p1 || !p1->persistent) {
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    if (ve_tls_persistent_append(p1->persistent, 1, "hk1", payload, sizeof(payload) - 1) != 0) {
+        ve_tls_producer_destroy(p1);
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    ve_tls_persistent_close(p1->persistent);
+    ve_tls_free(p1->persistent);
+    p1->persistent = NULL;
+    ve_tls_producer_destroy(p1);
+
+    p2 = ve_tls_producer_create(&cfg);
+    if (!p2) {
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    if (ve_tls_producer_recover(p2) != VE_TLS_OK) {
+        ve_tls_producer_destroy(p2);
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    if (ve_tls_producer_export_raw_buffer(p2, &buf, &size) != VE_TLS_OK) {
+        ve_tls_producer_destroy(p2);
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    if (exported_buffer_count_and_first_hash_key(buf, size, &count, hk, sizeof(hk)) != 0 ||
+        count != 1 || strcmp(hk, "hk1") != 0) {
+        ve_tls_producer_free_raw_buffer(buf);
+        ve_tls_producer_destroy(p2);
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    ve_tls_producer_free_raw_buffer(buf);
+    ve_tls_producer_destroy(p2);
+    cleanup_persistent_dir(dir);
+    return 0;
+}
+
+static int test_persistent_sender_ack_updates_checkpoint_and_reclaims_closed_segment(void) {
+    char dir[PATH_MAX];
+    char seg1[PATH_MAX];
+    char seg2[PATH_MAX];
+    ve_tls_config cfg;
+    ve_tls_producer * p = NULL;
+    ve_tls_path_info info1;
+    ve_tls_path_info info2;
+    if (make_temp_dir(dir, sizeof(dir)) != 0) {
+        return -1;
+    }
+    join_path(seg1, sizeof(seg1), dir, "seg-000001.log");
+    join_path(seg2, sizeof(seg2), dir, "seg-000002.log");
+    ve_tls_config_init(&cfg);
+    cfg.endpoint = "https://example.com";
+    cfg.region = "cn-beijing";
+    cfg.topic_id = "t";
+    cfg.access_key_id = "ak";
+    cfg.access_key_secret = "sk";
+    cfg.retry_policy.max_attempts = 1;
+    cfg.flush_interval_ms = 0;
+    cfg.agg_strategy = 0;
+    cfg.compress_type = "none";
+    cfg.http_client.do_request = test_http_ok_do;
+    cfg.http_client.free_response = test_http_free;
+    cfg.use_persistent = 1;
+    cfg.persistent_file_path = dir;
+    cfg.max_persistent_log_count = 64;
+    cfg.max_persistent_file_size = 40;
+    cfg.max_persistent_file_count = 4;
+    p = ve_tls_producer_create(&cfg);
+    if (!p || !p->persistent) {
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    if (ve_tls_producer_add_log_raw(p, "{\"a\":1}", strlen("{\"a\":1}"), 1) != VE_TLS_OK ||
+        ve_tls_producer_add_log_raw(p, "{\"b\":2}", strlen("{\"b\":2}"), 1) != VE_TLS_OK) {
+        ve_tls_producer_destroy(p);
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    for (int i = 0; i < 300; i++) {
+        if (p->persistent->checkpoint.acked_log_id >= 2) {
+            break;
+        }
+        cfg.platform.sleep_ms(10);
+    }
+    if (p->persistent->checkpoint.acked_log_id < 2 ||
+        cfg.platform.path_stat(seg1, &info1) != 0 ||
+        cfg.platform.path_stat(seg2, &info2) != 0 ||
+        info1.exists ||
+        !info2.exists) {
+        ve_tls_producer_destroy(p);
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    ve_tls_producer_destroy(p);
+    cleanup_persistent_dir(dir);
+    return 0;
+}
+
+static int test_persistent_manager_drop_updates_checkpoint_and_reclaims_closed_segment(void) {
+    char dir[PATH_MAX];
+    char seg1[PATH_MAX];
+    char seg2[PATH_MAX];
+    ve_tls_config cfg;
+    ve_tls_producer * p = NULL;
+    ve_tls_path_info info1;
+    ve_tls_path_info info2;
+    if (make_temp_dir(dir, sizeof(dir)) != 0) {
+        return -1;
+    }
+    join_path(seg1, sizeof(seg1), dir, "seg-000001.log");
+    join_path(seg2, sizeof(seg2), dir, "seg-000002.log");
+    ve_tls_config_init(&cfg);
+    cfg.endpoint = "https://example.com";
+    cfg.region = "cn-beijing";
+    cfg.topic_id = "t";
+    cfg.access_key_id = "ak";
+    cfg.access_key_secret = "sk";
+    cfg.retry_policy.max_attempts = 1;
+    cfg.flush_interval_ms = 0;
+    cfg.agg_strategy = 0;
+    cfg.compress_type = "bad";
+    cfg.use_persistent = 1;
+    cfg.persistent_file_path = dir;
+    cfg.max_persistent_log_count = 64;
+    cfg.max_persistent_file_size = 40;
+    cfg.max_persistent_file_count = 4;
+    p = ve_tls_producer_create(&cfg);
+    if (!p || !p->persistent) {
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    if (ve_tls_producer_add_log_raw(p, "{\"a\":1}", strlen("{\"a\":1}"), 1) != VE_TLS_OK ||
+        ve_tls_producer_add_log_raw(p, "{\"b\":2}", strlen("{\"b\":2}"), 1) != VE_TLS_OK) {
+        ve_tls_producer_destroy(p);
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    for (int i = 0; i < 300; i++) {
+        if (p->persistent->checkpoint.acked_log_id >= 2) {
+            break;
+        }
+        cfg.platform.sleep_ms(10);
+    }
+    if (p->persistent->checkpoint.acked_log_id < 2 ||
+        cfg.platform.path_stat(seg1, &info1) != 0 ||
+        cfg.platform.path_stat(seg2, &info2) != 0 ||
+        info1.exists ||
+        !info2.exists) {
+        ve_tls_producer_destroy(p);
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    ve_tls_producer_destroy(p);
+    cleanup_persistent_dir(dir);
+    return 0;
+}
+
+static int test_persistent_overflow_reject_new_returns_drop_error(void) {
+    char dir[PATH_MAX];
+    ve_tls_config cfg;
+    ve_tls_producer * p = NULL;
+    if (make_temp_dir(dir, sizeof(dir)) != 0) {
+        return -1;
+    }
+    ve_tls_config_init(&cfg);
+    cfg.endpoint = "https://example.com";
+    cfg.region = "cn-beijing";
+    cfg.topic_id = "t";
+    cfg.access_key_id = "ak";
+    cfg.access_key_secret = "sk";
+    cfg.retry_policy.max_attempts = 1;
+    cfg.flush_interval_ms = 100000;
+    cfg.use_persistent = 1;
+    cfg.persistent_file_path = dir;
+    cfg.max_persistent_log_count = 64;
+    cfg.max_persistent_file_size = 1024;
+    cfg.max_persistent_file_count = 4;
+    cfg.persistent_max_records = 1;
+    cfg.persistent_overflow_policy = VE_TLS_POVERFLOW_REJECT_NEW;
+    p = ve_tls_producer_create(&cfg);
+    if (!p || !p->persistent) {
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    if (ve_tls_producer_add_log_raw(p, "{\"a\":1}", strlen("{\"a\":1}"), 0) != VE_TLS_OK ||
+        ve_tls_producer_add_log_raw(p, "{\"b\":2}", strlen("{\"b\":2}"), 0) != VE_TLS_DROP_ERROR) {
+        ve_tls_producer_destroy(p);
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    ve_tls_producer_destroy(p);
+    cleanup_persistent_dir(dir);
+    return 0;
+}
+
+static int test_persistent_overflow_block_times_out(void) {
+    char dir[PATH_MAX];
+    ve_tls_config cfg;
+    ve_tls_producer * p = NULL;
+    if (make_temp_dir(dir, sizeof(dir)) != 0) {
+        return -1;
+    }
+    ve_tls_config_init(&cfg);
+    cfg.endpoint = "https://example.com";
+    cfg.region = "cn-beijing";
+    cfg.topic_id = "t";
+    cfg.access_key_id = "ak";
+    cfg.access_key_secret = "sk";
+    cfg.retry_policy.max_attempts = 1;
+    cfg.flush_interval_ms = 100000;
+    cfg.use_persistent = 1;
+    cfg.persistent_file_path = dir;
+    cfg.max_persistent_log_count = 64;
+    cfg.max_persistent_file_size = 1024;
+    cfg.max_persistent_file_count = 4;
+    cfg.persistent_max_records = 1;
+    cfg.persistent_overflow_policy = VE_TLS_POVERFLOW_BLOCK;
+    cfg.persistent_block_timeout_ms = 20;
+    p = ve_tls_producer_create(&cfg);
+    if (!p || !p->persistent) {
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    if (ve_tls_producer_add_log_raw(p, "{\"a\":1}", strlen("{\"a\":1}"), 0) != VE_TLS_OK ||
+        ve_tls_producer_add_log_raw(p, "{\"b\":2}", strlen("{\"b\":2}"), 0) != VE_TLS_TIMEOUT) {
+        ve_tls_producer_destroy(p);
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    ve_tls_producer_destroy(p);
+    cleanup_persistent_dir(dir);
+    return 0;
+}
+
+static int test_persistent_heartbeat_updates_lease(void) {
+    char dir[PATH_MAX];
+    char lease_path[PATH_MAX];
+    ve_tls_persistent_options opt;
+    ve_tls_persistent persistent;
+    ve_tls_lease_state loaded;
+    ve_tls_config cfg;
+    if (make_temp_dir(dir, sizeof(dir)) != 0) {
+        return -1;
+    }
+    join_path(lease_path, sizeof(lease_path), dir, "lease");
+    ve_tls_config_init(&cfg);
+    memset(&opt, 0, sizeof(opt));
+    memset(&persistent, 0, sizeof(persistent));
+    memset(&loaded, 0, sizeof(loaded));
+    opt.platform = &cfg.platform;
+    opt.dir_path = dir;
+    opt.instance_id = "test-instance";
+    opt.owner_id = "owner-a";
+    opt.owner_process_name = "proc-a";
+    opt.owner_pid = 123;
+    opt.segment_max_bytes = 1024;
+    opt.segment_max_records = 128;
+    opt.max_bytes = 4096;
+    opt.max_records = 512;
+    opt.max_segments = 8;
+    opt.now_ms = 1000;
+    opt.lease_timeout_ms = 1000;
+    opt.heartbeat_interval_ms = 1;
+    opt.open_mode = VE_TLS_LEASE_OPEN_TAKEOVER_IF_STALE;
+    if (ve_tls_persistent_open(&persistent, &opt) != 0) {
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    cfg.platform.sleep_ms(5);
+    if (ve_tls_persistent_heartbeat_if_due(&persistent, 0) != 0 ||
+        ve_tls_lease_load(&cfg.platform, lease_path, &loaded) != 0 ||
+        loaded.last_heartbeat_ms <= loaded.acquire_time_ms) {
+        ve_tls_persistent_close(&persistent);
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    ve_tls_persistent_close(&persistent);
+    cleanup_persistent_dir(dir);
+    return 0;
+}
+
+static int test_persistent_takeover_invalidates_old_writer(void) {
+    char dir[PATH_MAX];
+    char lease_path[PATH_MAX];
+    ve_tls_persistent_options opt1;
+    ve_tls_persistent persistent1;
+    ve_tls_lease_options takeover;
+    ve_tls_lease_state current;
+    ve_tls_lease_state state2;
+    ve_tls_config cfg;
+    static const unsigned char payload[] = "abc";
+    if (make_temp_dir(dir, sizeof(dir)) != 0) {
+        return -1;
+    }
+    join_path(lease_path, sizeof(lease_path), dir, "lease");
+    ve_tls_config_init(&cfg);
+    memset(&opt1, 0, sizeof(opt1));
+    memset(&persistent1, 0, sizeof(persistent1));
+    memset(&takeover, 0, sizeof(takeover));
+    memset(&current, 0, sizeof(current));
+    memset(&state2, 0, sizeof(state2));
+    opt1.platform = &cfg.platform;
+    opt1.dir_path = dir;
+    opt1.instance_id = "test-instance";
+    opt1.owner_id = "owner-a";
+    opt1.owner_process_name = "proc-a";
+    opt1.owner_pid = 123;
+    opt1.segment_max_bytes = 1024;
+    opt1.segment_max_records = 128;
+    opt1.max_bytes = 4096;
+    opt1.max_records = 512;
+    opt1.max_segments = 8;
+    opt1.now_ms = 1000;
+    opt1.lease_timeout_ms = 100;
+    opt1.heartbeat_interval_ms = 1000;
+    opt1.open_mode = VE_TLS_LEASE_OPEN_TAKEOVER_IF_STALE;
+    if (ve_tls_persistent_open(&persistent1, &opt1) != 0 ||
+        ve_tls_persistent_append(&persistent1, 1, NULL, payload, sizeof(payload) - 1) != 0) {
+        ve_tls_persistent_close(&persistent1);
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    takeover.platform = &cfg.platform;
+    takeover.lease_path = lease_path;
+    takeover.owner_id = "owner-b";
+    takeover.owner_pid = 456;
+    takeover.owner_process_name = "proc-b";
+    if (ve_tls_lease_load(&cfg.platform, lease_path, &current) != 0) {
+        ve_tls_persistent_close(&persistent1);
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    takeover.now_ms = current.last_heartbeat_ms + 101;
+    takeover.lease_timeout_ms = 100;
+    takeover.mode = VE_TLS_LEASE_OPEN_TAKEOVER_IF_STALE;
+    int takeover_rc = ve_tls_lease_acquire(&takeover, &state2);
+    int second_append_rc = ve_tls_persistent_append(&persistent1, 2, NULL, payload, sizeof(payload) - 1);
+    if (takeover_rc != 0 ||
+        state2.fencing_token != persistent1.lease.fencing_token + 1 ||
+        second_append_rc == 0) {
+        ve_tls_persistent_close(&persistent1);
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    ve_tls_persistent_close(&persistent1);
+    cleanup_persistent_dir(dir);
+    return 0;
+}
+
+static int test_persistent_overflow_drop_newest_sample_uses_sample_rate(void) {
+    char dir[PATH_MAX];
+    ve_tls_config cfg;
+    ve_tls_producer * p = NULL;
+    if (make_temp_dir(dir, sizeof(dir)) != 0) {
+        return -1;
+    }
+    ve_tls_config_init(&cfg);
+    cfg.endpoint = "https://example.com";
+    cfg.region = "cn-beijing";
+    cfg.topic_id = "t";
+    cfg.access_key_id = "ak";
+    cfg.access_key_secret = "sk";
+    cfg.retry_policy.max_attempts = 1;
+    cfg.flush_interval_ms = 100000;
+    cfg.use_persistent = 1;
+    cfg.persistent_file_path = dir;
+    cfg.max_persistent_log_count = 64;
+    cfg.max_persistent_file_size = 1024;
+    cfg.max_persistent_file_count = 4;
+    cfg.persistent_max_records = 1;
+    cfg.persistent_overflow_policy = VE_TLS_POVERFLOW_DROP_NEWEST_SAMPLE;
+    cfg.persistent_sample_every_n = 2;
+    cfg.persistent_block_timeout_ms = 20;
+    p = ve_tls_producer_create(&cfg);
+    if (!p || !p->persistent) {
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    if (ve_tls_producer_add_log_raw(p, "{\"a\":1}", strlen("{\"a\":1}"), 0) != VE_TLS_OK ||
+        ve_tls_producer_add_log_raw(p, "{\"b\":2}", strlen("{\"b\":2}"), 0) != VE_TLS_TIMEOUT ||
+        ve_tls_producer_add_log_raw(p, "{\"c\":3}", strlen("{\"c\":3}"), 0) != VE_TLS_DROP_ERROR) {
+        ve_tls_producer_destroy(p);
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    ve_tls_producer_destroy(p);
+    cleanup_persistent_dir(dir);
+    return 0;
+}
+
+static int test_persistent_recover_repairs_truncated_tail_record(void) {
+    char dir[PATH_MAX];
+    char seg1[PATH_MAX];
+    ve_tls_config cfg;
+    ve_tls_producer * p1 = NULL;
+    ve_tls_producer * p2 = NULL;
+    ve_tls_file * f = NULL;
+    ve_tls_path_info info;
+    unsigned char * buf = NULL;
+    size_t size = 0;
+    uint32_t count = 0;
+    static const unsigned char payload1[] = "repair-a";
+    static const unsigned char payload2[] = "repair-b";
+    if (make_temp_dir(dir, sizeof(dir)) != 0) {
+        return -1;
+    }
+    join_path(seg1, sizeof(seg1), dir, "seg-000001.log");
+    ve_tls_config_init(&cfg);
+    cfg.endpoint = "https://example.com";
+    cfg.region = "cn-beijing";
+    cfg.topic_id = "t";
+    cfg.access_key_id = "ak";
+    cfg.access_key_secret = "sk";
+    cfg.retry_policy.max_attempts = 1;
+    cfg.flush_interval_ms = 100000;
+    cfg.use_persistent = 1;
+    cfg.persistent_file_path = dir;
+    cfg.max_persistent_log_count = 64;
+    cfg.max_persistent_file_size = 4096;
+    cfg.max_persistent_file_count = 4;
+    p1 = ve_tls_producer_create(&cfg);
+    if (!p1 || !p1->persistent) {
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    if (ve_tls_persistent_append(p1->persistent, 1, NULL, payload1, sizeof(payload1) - 1) != 0 ||
+        ve_tls_persistent_append(p1->persistent, 2, NULL, payload2, sizeof(payload2) - 1) != 0) {
+        ve_tls_producer_destroy(p1);
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    ve_tls_persistent_close(p1->persistent);
+    ve_tls_free(p1->persistent);
+    p1->persistent = NULL;
+    ve_tls_producer_destroy(p1);
+
+    if (cfg.platform.path_stat(seg1, &info) != 0 || !info.exists || info.size <= 8) {
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    f = cfg.platform.file_open(seg1, VE_TLS_FILE_OPEN_RDWR, 0644);
+    if (!f) {
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    if (cfg.platform.file_truncate(f, (int64_t)(info.size - 8)) != 0) {
+        cfg.platform.file_close(f);
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    cfg.platform.file_close(f);
+
+    p2 = ve_tls_producer_create(&cfg);
+    if (!p2) {
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    if (ve_tls_producer_recover(p2) != VE_TLS_OK) {
+        ve_tls_producer_destroy(p2);
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    if (ve_tls_producer_export_raw_buffer(p2, &buf, &size) != VE_TLS_OK) {
+        ve_tls_producer_destroy(p2);
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    if (exported_buffer_count_and_first_hash_key(buf, size, &count, NULL, 0) != 0 || count != 1) {
+        ve_tls_producer_free_raw_buffer(buf);
+        ve_tls_producer_destroy(p2);
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    ve_tls_producer_free_raw_buffer(buf);
+    ve_tls_producer_destroy(p2);
+    cleanup_persistent_dir(dir);
+    return 0;
+}
+
+static int test_producer_takeover_recovers_and_invalidates_old_writer(void) {
+    char dir[PATH_MAX];
+    ve_tls_config cfg;
+    ve_tls_producer * p1 = NULL;
+    ve_tls_producer * p2 = NULL;
+    unsigned char * buf = NULL;
+    size_t size = 0;
+    uint32_t count = 0;
+    if (make_temp_dir(dir, sizeof(dir)) != 0) {
+        return -1;
+    }
+    ve_tls_config_init(&cfg);
+    cfg.endpoint = "https://example.com";
+    cfg.region = "cn-beijing";
+    cfg.topic_id = "t";
+    cfg.access_key_id = "ak";
+    cfg.access_key_secret = "sk";
+    cfg.retry_policy.max_attempts = 1;
+    cfg.flush_interval_ms = 0;
+    cfg.agg_strategy = 0;
+    cfg.compress_type = "none";
+    cfg.use_persistent = 1;
+    cfg.persistent_file_path = dir;
+    cfg.max_persistent_log_count = 64;
+    cfg.max_persistent_file_size = 4096;
+    cfg.max_persistent_file_count = 4;
+    cfg.persistent_lease_timeout_ms = 50;
+    cfg.persistent_heartbeat_interval_ms = 1000;
+    cfg.persistent_open_mode = VE_TLS_POPEN_TAKEOVER_IF_STALE;
+    cfg.http_client.do_request = test_http_takeover_block_do;
+    cfg.http_client.free_response = test_http_sleep_free;
+
+    p1 = ve_tls_producer_create(&cfg);
+    if (!p1 || !p1->persistent) {
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    if (ve_tls_producer_add_log_raw(p1, "{\"a\":1}", strlen("{\"a\":1}"), 1) != VE_TLS_OK) {
+        ve_tls_producer_destroy(p1);
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    cfg.platform.sleep_ms(80);
+
+    p2 = ve_tls_producer_create(&cfg);
+    if (!p2 || !p2->persistent) {
+        ve_tls_producer_destroy(p1);
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    if (ve_tls_producer_recover(p2) != VE_TLS_OK) {
+        ve_tls_producer_destroy(p2);
+        ve_tls_producer_destroy(p1);
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    if (ve_tls_producer_export_raw_buffer(p2, &buf, &size) != VE_TLS_OK) {
+        ve_tls_producer_destroy(p2);
+        ve_tls_producer_destroy(p1);
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    if (exported_buffer_count_and_first_hash_key(buf, size, &count, NULL, 0) != 0 || count != 1) {
+        ve_tls_producer_free_raw_buffer(buf);
+        ve_tls_producer_destroy(p2);
+        ve_tls_producer_destroy(p1);
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    ve_tls_producer_free_raw_buffer(buf);
+    if (ve_tls_producer_add_log_raw(p1, "{\"b\":2}", strlen("{\"b\":2}"), 0) == VE_TLS_OK) {
+        ve_tls_producer_destroy(p2);
+        ve_tls_producer_destroy(p1);
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    ve_tls_producer_destroy(p2);
+    ve_tls_producer_destroy(p1);
+    cleanup_persistent_dir(dir);
+    return 0;
+}
+
 int main(void) {
     int rc = 0;
 #define RUN(code, fn) do { if ((fn) != 0) { rc = (code); goto end; } } while (0)
@@ -7323,6 +8555,8 @@ int main(void) {
     RUN(39, test_sender_small_payload_uses_none_compresstype());
     RUN(40, test_sender_small_payload_with_agg_strategy_uses_none_compresstype());
     RUN(41, test_sender_unsigned_headers_appended_after_authorization());
+    RUN(121, test_sender_putlogs_includes_content_md5_header());
+    RUN(122, test_sender_putlogs_includes_empty_hashkey_header());
     RUN(42, test_sign_repeated_call_allocation_reduced());
     RUN(43, test_sign_allocation_budget_tight());
     RUN(44, test_sign_allocation_budget_multi_query_tight());
@@ -7380,6 +8614,7 @@ int main(void) {
     RUN(14, test_rate_limit_rps_throttles());
     RUN(15, test_circuit_breaker_delays_second_send());
     RUN(16, test_sign());
+    RUN(123, test_sign_matches_go_reference_with_fixed_xdate());
     RUN(118, test_sign_cache_secret_change_same_pointer_effective());
     RUN(17, test_send_queue_blocking_push());
     {
@@ -7438,6 +8673,23 @@ int main(void) {
     RUN(122, test_template_add_values_value_count_mismatch_invalid());
     RUN(123, test_template_high_rate_submit_metrics());
     RUN(124, test_pipeline_v2_functional_matrix_raw_kv_template_and_runtime_updates());
+    RUN(125, test_platform_default_has_file_hooks());
+    RUN(126, test_persistent_record_roundtrip_hash_key());
+    RUN(127, test_segment_store_append_read_rotate_and_repair());
+    RUN(128, test_checkpoint_roundtrip_and_lease_takeover());
+    RUN(129, test_persistent_open_creates_metadata_files());
+    RUN(130, test_producer_create_with_persistent_adds_disk_record());
+    RUN(131, test_persistent_recover_requeues_hash_key_record());
+    RUN(132, test_persistent_sender_ack_updates_checkpoint_and_reclaims_closed_segment());
+    RUN(133, test_persistent_manager_drop_updates_checkpoint_and_reclaims_closed_segment());
+    RUN(134, test_persistent_overflow_reject_new_returns_drop_error());
+    RUN(135, test_persistent_overflow_block_times_out());
+    RUN(136, test_persistent_heartbeat_updates_lease());
+    RUN(137, test_persistent_takeover_invalidates_old_writer());
+    RUN(138, test_persistent_overflow_drop_newest_sample_uses_sample_rate());
+    RUN(139, test_add_log_with_id_returns_monotonic_ids());
+    RUN(140, test_persistent_recover_repairs_truncated_tail_record());
+    RUN(141, test_producer_takeover_recovers_and_invalidates_old_writer());
 #if defined(VE_TLS_HAVE_ZLIB)
     RUN(37, test_zlib_compress_roundtrip());
 #endif

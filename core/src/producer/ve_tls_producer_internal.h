@@ -24,6 +24,7 @@ typedef struct {
 } ve_tls_log_item;
 
 typedef struct ve_tls_log_group_builder ve_tls_log_group_builder;
+typedef struct ve_tls_persistent ve_tls_persistent;
 
 struct ve_tls_log_group_builder {
     char * norm_key;
@@ -194,6 +195,7 @@ struct ve_tls_producer {
     char * cfg_proxy;
     char * cfg_user_agent;
     char * cfg_persistent_file_path;
+    ve_tls_persistent * persistent;
     int64_t send_cfg_version;
     int64_t static_cred_version;
     _Atomic(ve_tls_runtime_snapshot *) runtime_snapshot;
@@ -226,6 +228,8 @@ void ve_tls_breaker_leave_half_open(ve_tls_producer * producer, int ok);
 void ve_tls_breaker_on_final_result(ve_tls_producer * producer, int ok);
 void ve_tls_metric_inc_u64(uint64_t * p, uint64_t v);
 uint64_t ve_tls_metric_load_u64(uint64_t * p);
+void ve_tls_persistent_on_final_result(ve_tls_producer * producer, ve_tls_result result, int64_t start_id, int64_t end_id);
+int ve_tls_persistent_heartbeat_if_due(ve_tls_persistent * persistent, int force);
 
 void ve_tls_queue_free_all(ve_tls_producer * producer);
 int ve_tls_queue_push(ve_tls_producer * producer, const unsigned char * data, size_t size, int64_t id, int64_t time_ms, uint32_t time_ns, int32_t has_time_ns, const char * hash_key);
