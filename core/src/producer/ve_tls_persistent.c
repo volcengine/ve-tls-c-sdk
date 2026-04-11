@@ -358,6 +358,23 @@ static int should_treat_as_sampled(ve_tls_persistent * persistent, int64_t log_i
     return (log_id % n) == 0 ? 1 : 0;
 }
 
+static unsigned char * persistent_get_append_buffer(ve_tls_persistent * persistent, size_t size) {
+    unsigned char * next;
+    if (!persistent || size == 0) {
+        return NULL;
+    }
+    if (persistent->append_buf_cap >= size) {
+        return persistent->append_buf;
+    }
+    next = (unsigned char *)ve_tls_realloc(persistent->append_buf, size);
+    if (!next) {
+        return NULL;
+    }
+    persistent->append_buf = next;
+    persistent->append_buf_cap = size;
+    return persistent->append_buf;
+}
+
 static int ensure_capacity_for_append(ve_tls_persistent * persistent, int64_t log_id, size_t record_size) {
     uint64_t next_bytes;
     uint64_t next_records;
@@ -505,6 +522,9 @@ void ve_tls_persistent_close(ve_tls_persistent * persistent) {
     ve_tls_free(persistent->segment_meta);
     persistent->segment_meta = NULL;
     persistent->segment_meta_cap = 0;
+    ve_tls_free(persistent->append_buf);
+    persistent->append_buf = NULL;
+    persistent->append_buf_cap = 0;
     if (persistent->lease_path[0] != 0 && validate_current_lease(persistent) == 0) {
         (void)ve_tls_lease_release(persistent->platform, persistent->lease_path);
     }
@@ -537,16 +557,13 @@ int ve_tls_persistent_append(ve_tls_persistent * persistent, int64_t log_id, con
         return -1;
     }
     if (record_size > sizeof(stack_buf)) {
-        record_buf = (unsigned char *)ve_tls_malloc(record_size);
+        record_buf = persistent_get_append_buffer(persistent, record_size);
         if (!record_buf) {
             return -1;
         }
     }
     rc = ensure_capacity_for_append(persistent, log_id, record_size);
     if (rc != 0) {
-        if (record_buf != stack_buf) {
-            ve_tls_free(record_buf);
-        }
         return rc;
     }
     {
@@ -554,9 +571,6 @@ int ve_tls_persistent_append(ve_tls_persistent * persistent, int64_t log_id, con
             ? (persistent->store.active_segment_id + 1)
             : persistent->store.active_segment_id;
         if (ensure_segment_meta_capacity(persistent, target_segment) != 0) {
-            if (record_buf != stack_buf) {
-                ve_tls_free(record_buf);
-            }
             return -1;
         }
     }
@@ -596,9 +610,6 @@ int ve_tls_persistent_append(ve_tls_persistent * persistent, int64_t log_id, con
                 (void)reclaim_acked_segments(persistent);
             }
         }
-    }
-    if (record_buf != stack_buf) {
-        ve_tls_free(record_buf);
     }
     return rc;
 }

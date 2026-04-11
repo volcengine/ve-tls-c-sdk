@@ -65,6 +65,8 @@ struct ve_tls_persistent {
     uint32_t current_segments;
     ve_tls_persistent_segment_meta * segment_meta;
     uint32_t segment_meta_cap;
+    unsigned char * append_buf;
+    size_t append_buf_cap;
 };
 
 typedef struct ve_tls_persistent ve_tls_persistent;

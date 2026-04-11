@@ -38,6 +38,10 @@
    - producer 维护已完成 range 的有序集合，只在 `[acked+1 ... N]` 连续完成时推进 checkpoint
    - 支持发送完成乱序，避免 `2-3` 先成功时错误删除 `1` 对应的持久化数据
    - `send_thread_count > 1` 可用于 persistent producer，真实收益取决于网络/HTTP 发送是否是瓶颈
+7. persistent append 大记录编码缓冲已复用：
+   - 小记录继续使用 512B 栈缓冲
+   - 大于 512B 的编码缓冲改为 persistent 实例级 scratch buffer
+   - 避免 `sls700/sls5120` 每条 append 都 malloc/free 临时 record buffer
 
 ### 0.2 刻意未落地项
 
@@ -94,13 +98,13 @@
   - `total_lps=9.6k`
   - `logs_dropped_total=0`
 - `kv + sls700 + 4 writers + persistent + 4 senders`：
-  - `produce_lps=23.8k`
-  - `total_lps=23.7k`
+  - `produce_lps=35.3k`
+  - `total_lps=35.2k`
   - `close_ms=7`
   - `logs_dropped_total=0`
 - `kv + sls5120 + 4 writers + persistent + 4 senders`：
-  - `produce_lps=12.5k`
-  - `total_lps=12.4k`
+  - `produce_lps=14.2k`
+  - `total_lps=14.0k`
   - `logs_dropped_total=0`
 
 说明：
@@ -109,6 +113,7 @@
 - `total_lps` 会包含 `close()` 排空时间，更适合判断端到端 drain 能力
 - 多 sender 对 mock HTTP 下的 `produce_lps` 提升不稳定，说明当前本地生产端仍主要受 durable append、序列化持久化写入和文件系统影响
 - 多 sender 对 close drain 更直接有效，真实环境下如果网络/服务端 RTT 是瓶颈，收益会比 mock HTTP 更明显
+- scratch buffer 复用减少了大 payload 的分配抖动，尤其对 producer persistent sls700/sls5120 本地链路更明显
 - 如果 `logs_dropped_total > 0`，说明压测混入了本地 buffer 容量限制，不能作为极限吞吐结论
 
 ### 0.4 真实环境 smoke 结果

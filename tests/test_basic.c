@@ -9168,6 +9168,64 @@ static int test_persistent_allows_multiple_sender_threads(void) {
     return 0;
 }
 
+static int test_persistent_append_reuses_large_record_scratch_buffer(void) {
+    char dir[PATH_MAX];
+    ve_tls_config cfg;
+    ve_tls_persistent persistent;
+    ve_tls_persistent_options opt;
+    ve_tls_alloc_hooks saved;
+    alloc_select_fail_state st;
+    unsigned char payload[1024];
+    int calls_after_first;
+    int calls_after_second;
+    int rc = -1;
+    if (make_temp_dir(dir, sizeof(dir)) != 0) {
+        return -1;
+    }
+    ve_tls_config_init(&cfg);
+    memset(&persistent, 0, sizeof(persistent));
+    memset(&opt, 0, sizeof(opt));
+    memset(payload, 'x', sizeof(payload));
+    opt.platform = &cfg.platform;
+    opt.dir_path = dir;
+    opt.instance_id = "test-instance";
+    opt.owner_id = "owner-a";
+    opt.owner_process_name = "proc-a";
+    opt.owner_pid = 123;
+    opt.segment_max_bytes = 4096;
+    opt.segment_max_records = 128;
+    opt.max_bytes = 1024 * 1024;
+    opt.max_records = 512;
+    opt.max_segments = 8;
+    opt.now_ms = 1000;
+    opt.lease_timeout_ms = 1000;
+    opt.heartbeat_interval_ms = 1000;
+    opt.open_mode = VE_TLS_LEASE_OPEN_TAKEOVER_IF_STALE;
+    if (ve_tls_persistent_open(&persistent, &opt) != 0) {
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    ve_tls_alloc_get_hooks(&saved);
+    set_alloc_select_fail(&st, 0, 0, 0, 0);
+    if (ve_tls_persistent_append(&persistent, 1, NULL, payload, sizeof(payload)) != 0) {
+        goto done;
+    }
+    calls_after_first = st.malloc_calls + st.calloc_calls + st.realloc_calls + st.strdup_calls;
+    if (ve_tls_persistent_append(&persistent, 2, NULL, payload, sizeof(payload)) != 0) {
+        goto done;
+    }
+    calls_after_second = st.malloc_calls + st.calloc_calls + st.realloc_calls + st.strdup_calls;
+    if (calls_after_second != calls_after_first) {
+        goto done;
+    }
+    rc = 0;
+done:
+    ve_tls_alloc_set_hooks(&saved);
+    ve_tls_persistent_close(&persistent);
+    cleanup_persistent_dir(dir);
+    return rc;
+}
+
 static int test_producer_takeover_recovers_and_invalidates_old_writer(void) {
     char dir[PATH_MAX];
     ve_tls_config cfg;
@@ -9415,6 +9473,7 @@ int main(void) {
     RUN(150, test_persistent_append_releases_producer_mutex_for_disk_write());
     RUN(151, test_persistent_out_of_order_ack_waits_for_contiguous_prefix());
     RUN(152, test_persistent_allows_multiple_sender_threads());
+    RUN(153, test_persistent_append_reuses_large_record_scratch_buffer());
 #if defined(VE_TLS_HAVE_ZLIB)
     RUN(37, test_zlib_compress_roundtrip());
 #endif
