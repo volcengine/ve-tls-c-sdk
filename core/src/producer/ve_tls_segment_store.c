@@ -13,7 +13,7 @@ static uint32_t read_u32_le_local(const unsigned char * p) {
            ((uint32_t)p[3] << 24);
 }
 
-static int scan_segment_file(ve_tls_platform * platform, const char * path, uint64_t * valid_end, uint64_t * record_count);
+static int scan_segment_file(ve_tls_platform * platform, const char * path, uint64_t * valid_end, uint64_t * record_count, int64_t * max_log_id);
 
 static int read_full(ve_tls_platform * platform, ve_tls_file * file, void * buf, size_t size) {
     size_t off = 0;
@@ -49,7 +49,7 @@ int ve_tls_segment_store_get_segment_path(const ve_tls_segment_store * store, ui
     return 0;
 }
 
-int ve_tls_segment_store_get_segment_stats(ve_tls_segment_store * store, uint32_t segment_id, uint64_t * out_valid_end, uint64_t * out_record_count) {
+int ve_tls_segment_store_scan_segment(ve_tls_segment_store * store, uint32_t segment_id, uint64_t * out_valid_end, uint64_t * out_record_count, int64_t * out_max_log_id) {
     char path[640];
     if (!store || !store->platform) {
         return -1;
@@ -57,14 +57,19 @@ int ve_tls_segment_store_get_segment_stats(ve_tls_segment_store * store, uint32_
     if (ve_tls_segment_store_get_segment_path(store, segment_id, path, sizeof(path)) != 0) {
         return -1;
     }
-    return scan_segment_file(store->platform, path, out_valid_end, out_record_count);
+    return scan_segment_file(store->platform, path, out_valid_end, out_record_count, out_max_log_id);
 }
 
-static int scan_segment_file(ve_tls_platform * platform, const char * path, uint64_t * valid_end, uint64_t * record_count) {
+int ve_tls_segment_store_get_segment_stats(ve_tls_segment_store * store, uint32_t segment_id, uint64_t * out_valid_end, uint64_t * out_record_count) {
+    return ve_tls_segment_store_scan_segment(store, segment_id, out_valid_end, out_record_count, NULL);
+}
+
+static int scan_segment_file(ve_tls_platform * platform, const char * path, uint64_t * valid_end, uint64_t * record_count, int64_t * max_log_id) {
     ve_tls_file * file;
     ve_tls_path_info info;
     uint64_t offset = 0;
     uint64_t count = 0;
+    int64_t max_id = 0;
     unsigned char header[VE_TLS_PERSISTENT_RECORD_HEADER_SIZE];
     if (platform->path_stat(path, &info) != 0) {
         return -1;
@@ -75,6 +80,9 @@ static int scan_segment_file(ve_tls_platform * platform, const char * path, uint
         }
         if (record_count) {
             *record_count = 0;
+        }
+        if (max_log_id) {
+            *max_log_id = 0;
         }
         return 0;
     }
@@ -115,6 +123,9 @@ static int scan_segment_file(ve_tls_platform * platform, const char * path, uint
                 ve_tls_free(record);
                 break;
             }
+            if (decoded.log_id > max_id) {
+                max_id = decoded.log_id;
+            }
             ve_tls_persistent_record_free(&decoded);
         }
         ve_tls_free(record);
@@ -128,6 +139,9 @@ static int scan_segment_file(ve_tls_platform * platform, const char * path, uint
     if (record_count) {
         *record_count = count;
     }
+    if (max_log_id) {
+        *max_log_id = max_id;
+    }
     return 0;
 }
 
@@ -139,7 +153,7 @@ static int open_active_segment(ve_tls_segment_store * store, uint32_t segment_id
     if (ve_tls_segment_store_get_segment_path(store, segment_id, path, sizeof(path)) != 0) {
         return -1;
     }
-    if (scan_segment_file(store->platform, path, &valid_end, &record_count) != 0) {
+    if (scan_segment_file(store->platform, path, &valid_end, &record_count, NULL) != 0) {
         return -1;
     }
     if (store->platform->path_stat(path, &info) != 0) {
@@ -297,13 +311,14 @@ int ve_tls_segment_store_repair_tail(ve_tls_segment_store * store, uint32_t segm
     char path[640];
     ve_tls_file * file;
     uint64_t valid_end = 0;
+    uint64_t record_count = 0;
     if (!store || !store->platform) {
         return -1;
     }
     if (ve_tls_segment_store_get_segment_path(store, segment_id, path, sizeof(path)) != 0) {
         return -1;
     }
-    if (scan_segment_file(store->platform, path, &valid_end, NULL) != 0) {
+    if (scan_segment_file(store->platform, path, &valid_end, &record_count, NULL) != 0) {
         return -1;
     }
     file = store->platform->file_open(path, VE_TLS_FILE_OPEN_RDWR, 0644);
@@ -320,9 +335,7 @@ int ve_tls_segment_store_repair_tail(ve_tls_segment_store * store, uint32_t segm
     }
     if (segment_id == store->active_segment_id) {
         store->active_size = valid_end;
-        if (scan_segment_file(store->platform, path, NULL, &store->active_records) != 0) {
-            return -1;
-        }
+        store->active_records = record_count;
     }
     return 0;
 }

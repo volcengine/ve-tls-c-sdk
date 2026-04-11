@@ -37,6 +37,7 @@ int ve_tls_segment_store_read(ve_tls_segment_store * store, uint32_t segment_id,
 void ve_tls_segment_store_read_free(unsigned char * record);
 int ve_tls_segment_store_repair_tail(ve_tls_segment_store * store, uint32_t segment_id, uint64_t * valid_end_offset);
 int ve_tls_segment_store_get_segment_path(const ve_tls_segment_store * store, uint32_t segment_id, char * out, size_t out_size);
+int ve_tls_segment_store_scan_segment(ve_tls_segment_store * store, uint32_t segment_id, uint64_t * out_valid_end, uint64_t * out_record_count, int64_t * out_max_log_id);
 int ve_tls_segment_store_get_segment_stats(ve_tls_segment_store * store, uint32_t segment_id, uint64_t * out_valid_end, uint64_t * out_record_count);
 
 #endif

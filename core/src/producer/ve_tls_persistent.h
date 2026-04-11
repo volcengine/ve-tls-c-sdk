@@ -30,6 +30,13 @@ typedef struct {
     int open_mode;
 } ve_tls_persistent_options;
 
+typedef struct {
+    uint64_t size;
+    uint64_t records;
+    int64_t max_log_id;
+    uint8_t exists;
+} ve_tls_persistent_segment_meta;
+
 struct ve_tls_persistent {
     ve_tls_platform * platform;
     char dir_path[512];
@@ -56,6 +63,8 @@ struct ve_tls_persistent {
     uint64_t current_bytes;
     uint64_t current_records;
     uint32_t current_segments;
+    ve_tls_persistent_segment_meta * segment_meta;
+    uint32_t segment_meta_cap;
 };
 
 typedef struct ve_tls_persistent ve_tls_persistent;

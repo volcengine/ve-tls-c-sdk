@@ -636,6 +636,12 @@ int ve_tls_ingress_task_merge_locked(ve_tls_producer * producer, const ve_tls_in
             wake_worker = 1;
         }
     }
+    if (!wake_worker &&
+        producer->config.flush_interval_ms > 0 &&
+        b &&
+        b->log_count == 1) {
+        wake_worker = 1;
+    }
     if (wake_worker) {
         producer->config.platform.cond_signal(producer->cond);
     }

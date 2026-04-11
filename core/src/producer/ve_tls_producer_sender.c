@@ -1,4 +1,5 @@
 #include "ve_tls_producer_internal.h"
+#include "ve_tls_persistent.h"
 #include "ve_tls_hash.h"
 #include "ve_tls_sign.h"
 #include "ve_tls_version.h"
@@ -1458,16 +1459,29 @@ next_task:
         producer->config.platform.mutex_lock(producer->mutex);
         for (;;) {
             int64_t now0 = producer->config.platform.time_ms ? producer->config.platform.time_ms() : 0;
+            int wait_sendq_ms = 0;
             ve_tls_delayed_promote_due(producer, now0);
             kq = ve_tls_ready_pop(producer);
             if (kq) {
                 (void)ve_tls_key_queue_pop_task(kq, &task);
                 break;
             }
+            if (!producer->delayed_head && !producer->stop) {
+                wait_sendq_ms = -1;
+                if (producer->persistent &&
+                    producer->persistent->heartbeat_interval_ms > 0 &&
+                    producer->persistent->next_heartbeat_ms > 0 &&
+                    now0 > 0) {
+                    wait_sendq_ms = (int)(producer->persistent->next_heartbeat_ms - now0);
+                    if (wait_sendq_ms < 1) {
+                        wait_sendq_ms = 1;
+                    }
+                }
+            }
             producer->config.platform.mutex_unlock(producer->mutex);
             ve_tls_send_task inbound;
             memset(&inbound, 0, sizeof(inbound));
-            if (ve_tls_send_queue_pop(&producer->send_queue, &inbound, 0) == 0) {
+            if (ve_tls_send_queue_pop(&producer->send_queue, &inbound, wait_sendq_ms) == 0) {
                 producer->config.platform.mutex_lock(producer->mutex);
                 const char * nk = ve_tls_normalize_hash_key(producer, inbound.hash_key);
                 if (ve_tls_key_queue_push_task(producer, nk, &inbound) != 0) {
@@ -1561,13 +1575,16 @@ next_task:
                 producer->idle_cleanup_next_ms = now1 + 1000;
                 ve_tls_idle_cleanup(producer);
             }
-            int64_t deadline = producer->delayed_head ? producer->delayed_head->next_ready_ms : (now1 + 100);
+            if (!producer->delayed_head) {
+                if (producer->stop) {
+                    (void)producer->config.platform.cond_timedwait_ms(producer->send_cond, producer->mutex, 100);
+                }
+                continue;
+            }
+            int64_t deadline = producer->delayed_head->next_ready_ms;
             int64_t wait_ms = deadline - now1;
             if (wait_ms < 1) {
                 wait_ms = 1;
-            }
-            if (wait_ms > 100) {
-                wait_ms = 100;
             }
             (void)producer->config.platform.cond_timedwait_ms(producer->send_cond, producer->mutex, wait_ms);
         }

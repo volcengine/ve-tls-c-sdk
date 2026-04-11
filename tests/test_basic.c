@@ -378,6 +378,62 @@ static int test_fake_cond_timedwait_ms(ve_tls_cond * c, ve_tls_mutex * m, int64_
     return 0;
 }
 
+static char g_track_dir[PATH_MAX];
+static int g_track_lease_opens = 0;
+static int g_track_segment_opens = 0;
+static int g_track_segment_stats = 0;
+
+static int test_path_in_tracked_dir(const char * path) {
+    size_t n;
+    if (!path || g_track_dir[0] == 0) {
+        return 0;
+    }
+    n = strlen(g_track_dir);
+    return strncmp(path, g_track_dir, n) == 0 ? 1 : 0;
+}
+
+static int test_path_is_tracked_lease(const char * path) {
+    size_t n;
+    static const char suffix[] = "/lease";
+    if (!test_path_in_tracked_dir(path)) {
+        return 0;
+    }
+    n = strlen(path);
+    return n >= sizeof(suffix) - 1 && strcmp(path + n - (sizeof(suffix) - 1), suffix) == 0;
+}
+
+static int test_path_is_tracked_segment(const char * path) {
+    return test_path_in_tracked_dir(path) && strstr(path, "/seg-") != NULL;
+}
+
+static void test_track_reset(const char * dir) {
+    g_track_lease_opens = 0;
+    g_track_segment_opens = 0;
+    g_track_segment_stats = 0;
+    if (!dir) {
+        g_track_dir[0] = 0;
+        return;
+    }
+    snprintf(g_track_dir, sizeof(g_track_dir), "%s", dir);
+}
+
+static ve_tls_file * test_track_file_open(const char * path, int flags, int mode) {
+    if (test_path_is_tracked_lease(path)) {
+        g_track_lease_opens++;
+    }
+    if (test_path_is_tracked_segment(path)) {
+        g_track_segment_opens++;
+    }
+    return g_real_platform.file_open(path, flags, mode);
+}
+
+static int test_track_path_stat(const char * path, ve_tls_path_info * info) {
+    if (test_path_is_tracked_segment(path)) {
+        g_track_segment_stats++;
+    }
+    return g_real_platform.path_stat(path, info);
+}
+
 static int test_http_do(ve_tls_http_client * client, const ve_tls_http_request * req, ve_tls_http_response * resp) {
     (void)client;
     (void)req;
@@ -1187,6 +1243,7 @@ static int test_sender_key_breaker_delays_same_key(void) {
 
     ve_tls_producer * p = ve_tls_producer_create(&cfg);
     if (!p) return -1;
+    g_real_platform.sleep_ms(20);
 
     ve_tls_kv kvs[1];
     kvs[0].key = "k";
@@ -1325,6 +1382,97 @@ static int test_sender_credentials_min_interval_fail_without_cached(void) {
     }
     if (g_sender_provider_calls != 1) {
         fprintf(stderr, "creds_min_int_fail_no_cached: provider_calls=%d\n", g_sender_provider_calls);
+        return -1;
+    }
+    return 0;
+}
+
+static int test_builder_flush_interval_respects_configured_deadline(void) {
+    memset(g_sender_time_t, 0, sizeof(g_sender_time_t));
+    g_sender_time_n = 0;
+
+    ve_tls_config cfg;
+    ve_tls_config_init(&cfg);
+    g_real_platform = cfg.platform;
+    g_fake_time = 5000;
+    cfg.platform.time_ms = test_fake_time_ms;
+    cfg.platform.sleep_ms = test_fake_sleep_ms;
+    cfg.platform.cond_timedwait_ms = test_fake_cond_timedwait_ms;
+
+    cfg.endpoint = "https://example.com";
+    cfg.region = "cn-beijing";
+    cfg.topic_id = "t";
+    cfg.access_key_id = "ak";
+    cfg.access_key_secret = "sk";
+    cfg.compress_type = "none";
+    cfg.flush_interval_ms = 10;
+    cfg.send_thread_count = 1;
+    cfg.ordered_send = 1;
+    cfg.log_count_per_package = 2;
+    cfg.retry_policy.max_attempts = 1;
+    cfg.http_client.do_request = test_http_sender_time_ok_do;
+    cfg.http_client.free_response = test_http_ok_free;
+
+    ve_tls_producer * p = ve_tls_producer_create(&cfg);
+    if (!p) return -1;
+
+    ve_tls_kv kvs[1];
+    kvs[0].key = "k";
+    kvs[0].value = "v";
+    if (ve_tls_producer_add_log_kv(p, 0, kvs, 1, 0) != VE_TLS_OK) {
+        ve_tls_producer_destroy(p);
+        return -1;
+    }
+    cfg.platform.mutex_lock(p->mutex);
+    cfg.platform.cond_signal(p->cond);
+    cfg.platform.mutex_unlock(p->mutex);
+    for (int i = 0; i < 2000; i++) {
+        g_real_platform.sleep_ms(1);
+        if (g_sender_time_n >= 1) break;
+    }
+    if (g_sender_time_n < 1) {
+        fprintf(stderr, "builder_flush_deadline: no send fake_now=%lld\n", (long long)g_fake_time);
+        ve_tls_producer_destroy(p);
+        return -1;
+    }
+    ve_tls_producer_destroy(p);
+    if (g_sender_time_t[0] - 5000 < 10 || g_sender_time_t[0] - 5000 > 20) {
+        fprintf(stderr, "builder_flush_deadline: send_at=%lld fake_now=%lld\n",
+            (long long)g_sender_time_t[0], (long long)g_fake_time);
+        return -1;
+    }
+    return 0;
+}
+
+static int test_sender_idle_wait_without_delayed_does_not_spin_timedwait(void) {
+    ve_tls_config cfg;
+    ve_tls_config_init(&cfg);
+    g_real_platform = cfg.platform;
+    g_fake_time = 7000;
+    cfg.platform.time_ms = test_fake_time_ms;
+    cfg.platform.sleep_ms = test_fake_sleep_ms;
+    cfg.platform.cond_timedwait_ms = test_fake_cond_timedwait_ms;
+
+    cfg.endpoint = "https://example.com";
+    cfg.region = "cn-beijing";
+    cfg.topic_id = "t";
+    cfg.access_key_id = "ak";
+    cfg.access_key_secret = "sk";
+    cfg.compress_type = "none";
+    cfg.flush_interval_ms = 10;
+    cfg.send_thread_count = 1;
+    cfg.ordered_send = 1;
+    cfg.retry_policy.max_attempts = 1;
+    cfg.http_client.do_request = test_http_sender_time_ok_do;
+    cfg.http_client.free_response = test_http_ok_free;
+
+    ve_tls_producer * p = ve_tls_producer_create(&cfg);
+    if (!p) return -1;
+    g_real_platform.sleep_ms(20);
+    int64_t after_wait = g_fake_time;
+    ve_tls_producer_destroy(p);
+    if (after_wait - 7000 > 20) {
+        fprintf(stderr, "sender_idle_wait_spun: fake_now=%lld\n", (long long)after_wait);
         return -1;
     }
     return 0;
@@ -7050,9 +7198,15 @@ static int test_rate_limit_rps_throttles(void) {
     }
     ve_tls_producer_destroy(p);
     if (g_rl_state.count < 2 || g_rl_state.t[0] == 0 || g_rl_state.t[1] == 0) {
+        fprintf(stderr, "rate_limit_rps: count=%d t0=%lld t1=%lld\n",
+            g_rl_state.count, (long long)g_rl_state.t[0], (long long)g_rl_state.t[1]);
         return -1;
     }
     int64_t dt = g_rl_state.t[1] - g_rl_state.t[0];
+    if (dt < 900) {
+        fprintf(stderr, "rate_limit_rps: dt=%lld t0=%lld t1=%lld\n",
+            (long long)dt, (long long)g_rl_state.t[0], (long long)g_rl_state.t[1]);
+    }
     return dt >= 900 ? 0 : -1;
 }
 
@@ -8342,6 +8496,53 @@ static int test_persistent_heartbeat_updates_lease(void) {
     return 0;
 }
 
+static int test_persistent_heartbeat_before_due_skips_lease_reload(void) {
+    char dir[PATH_MAX];
+    ve_tls_persistent_options opt;
+    ve_tls_persistent persistent;
+    ve_tls_config cfg;
+    if (make_temp_dir(dir, sizeof(dir)) != 0) {
+        return -1;
+    }
+    ve_tls_config_init(&cfg);
+    g_real_platform = cfg.platform;
+    g_fake_time = 1000;
+    cfg.platform.time_ms = test_fake_time_ms;
+    cfg.platform.sleep_ms = test_fake_sleep_ms;
+    cfg.platform.file_open = test_track_file_open;
+    memset(&opt, 0, sizeof(opt));
+    memset(&persistent, 0, sizeof(persistent));
+    test_track_reset(dir);
+    opt.platform = &cfg.platform;
+    opt.dir_path = dir;
+    opt.instance_id = "test-instance";
+    opt.owner_id = "owner-a";
+    opt.owner_process_name = "proc-a";
+    opt.owner_pid = 123;
+    opt.segment_max_bytes = 1024;
+    opt.segment_max_records = 128;
+    opt.max_bytes = 4096;
+    opt.max_records = 512;
+    opt.max_segments = 8;
+    opt.now_ms = 1000;
+    opt.lease_timeout_ms = 1000;
+    opt.heartbeat_interval_ms = 1000;
+    opt.open_mode = VE_TLS_LEASE_OPEN_TAKEOVER_IF_STALE;
+    if (ve_tls_persistent_open(&persistent, &opt) != 0) {
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    test_track_reset(dir);
+    if (ve_tls_persistent_heartbeat_if_due(&persistent, 0) != 0 || g_track_lease_opens != 0) {
+        ve_tls_persistent_close(&persistent);
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    ve_tls_persistent_close(&persistent);
+    cleanup_persistent_dir(dir);
+    return 0;
+}
+
 static int test_persistent_takeover_invalidates_old_writer(void) {
     char dir[PATH_MAX];
     char lease_path[PATH_MAX];
@@ -8406,6 +8607,70 @@ static int test_persistent_takeover_invalidates_old_writer(void) {
         return -1;
     }
     ve_tls_persistent_close(&persistent1);
+    cleanup_persistent_dir(dir);
+    return 0;
+}
+
+static int test_persistent_ack_range_reclaims_without_rescanning_segments(void) {
+    char dir[PATH_MAX];
+    char seg1[PATH_MAX];
+    char seg2[PATH_MAX];
+    ve_tls_config cfg;
+    ve_tls_persistent persistent;
+    ve_tls_persistent_options opt;
+    ve_tls_path_info info1;
+    ve_tls_path_info info2;
+    static const unsigned char payload[] = "123456789";
+    if (make_temp_dir(dir, sizeof(dir)) != 0) {
+        return -1;
+    }
+    join_path(seg1, sizeof(seg1), dir, "seg-000001.log");
+    join_path(seg2, sizeof(seg2), dir, "seg-000002.log");
+    ve_tls_config_init(&cfg);
+    g_real_platform = cfg.platform;
+    cfg.platform.file_open = test_track_file_open;
+    cfg.platform.path_stat = test_track_path_stat;
+    memset(&persistent, 0, sizeof(persistent));
+    memset(&opt, 0, sizeof(opt));
+    memset(&info1, 0, sizeof(info1));
+    memset(&info2, 0, sizeof(info2));
+    test_track_reset(dir);
+    opt.platform = &cfg.platform;
+    opt.dir_path = dir;
+    opt.instance_id = "test-instance";
+    opt.owner_id = "owner-a";
+    opt.owner_process_name = "proc-a";
+    opt.owner_pid = 123;
+    opt.segment_max_bytes = 40;
+    opt.segment_max_records = 128;
+    opt.max_bytes = 4096;
+    opt.max_records = 512;
+    opt.max_segments = 8;
+    opt.now_ms = 1000;
+    opt.lease_timeout_ms = 1000;
+    opt.heartbeat_interval_ms = 1000;
+    opt.open_mode = VE_TLS_LEASE_OPEN_TAKEOVER_IF_STALE;
+    if (ve_tls_persistent_open(&persistent, &opt) != 0 ||
+        ve_tls_persistent_append(&persistent, 1, NULL, payload, sizeof(payload) - 1) != 0 ||
+        ve_tls_persistent_append(&persistent, 2, NULL, payload, sizeof(payload) - 1) != 0 ||
+        persistent.store.active_segment_id != 2) {
+        ve_tls_persistent_close(&persistent);
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    test_track_reset(dir);
+    if (ve_tls_persistent_ack_range(&persistent, 1, 2) != 0 ||
+        g_track_segment_opens != 0 ||
+        g_track_segment_stats != 0 ||
+        g_real_platform.path_stat(seg1, &info1) != 0 ||
+        g_real_platform.path_stat(seg2, &info2) != 0 ||
+        info1.exists ||
+        !info2.exists) {
+        ve_tls_persistent_close(&persistent);
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    ve_tls_persistent_close(&persistent);
     cleanup_persistent_dir(dir);
     return 0;
 }
@@ -8902,6 +9167,8 @@ int main(void) {
     RUN(15, test_circuit_breaker_delays_second_send());
     RUN(16, test_sign());
     RUN(123, test_sign_matches_go_reference_with_fixed_xdate());
+    RUN(146, test_builder_flush_interval_respects_configured_deadline());
+    RUN(147, test_sender_idle_wait_without_delayed_does_not_spin_timedwait());
     RUN(118, test_sign_cache_secret_change_same_pointer_effective());
     RUN(17, test_send_queue_blocking_push());
     {
@@ -8973,7 +9240,9 @@ int main(void) {
     RUN(134, test_persistent_overflow_reject_new_returns_drop_error());
     RUN(135, test_persistent_overflow_block_times_out());
     RUN(136, test_persistent_heartbeat_updates_lease());
+    RUN(148, test_persistent_heartbeat_before_due_skips_lease_reload());
     RUN(137, test_persistent_takeover_invalidates_old_writer());
+    RUN(149, test_persistent_ack_range_reclaims_without_rescanning_segments());
     RUN(138, test_persistent_overflow_drop_newest_sample_uses_sample_rate());
     RUN(139, test_add_log_with_id_returns_monotonic_ids());
     RUN(140, test_persistent_recover_repairs_truncated_tail_record());

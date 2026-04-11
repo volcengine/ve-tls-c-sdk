@@ -262,8 +262,36 @@ static void * ve_tls_worker_main_builder(void * arg) {
                 }
             }
         }
-        if (!producer->stop && producer->queue_count == 0 && producer->ingress_queue_count == 0 && !producer->flush_requested && !producer->sealed_head && have_any_builder && producer->config.platform.cond_timedwait_ms) {
-            (void)producer->config.platform.cond_timedwait_ms(producer->cond, producer->mutex, 100);
+        if (!producer->stop && producer->queue_count == 0 && producer->ingress_queue_count == 0 && !producer->flush_requested && !producer->sealed_head && have_any_builder) {
+            int64_t now_wait = producer->config.platform.time_ms ? producer->config.platform.time_ms() : 0;
+            int64_t wait_ms = 0;
+            int have_deadline = 0;
+            int64_t pkg_timeout = producer->config.flush_interval_ms;
+            if (pkg_timeout > 0) {
+                if (producer->default_builder && producer->default_builder->log_count > 0 && producer->default_builder->first_append_ms > 0) {
+                    wait_ms = producer->default_builder->first_append_ms + pkg_timeout - now_wait;
+                    have_deadline = 1;
+                }
+                for (size_t i = 0; i < producer->key_bucket_count; i++) {
+                    for (ve_tls_key_queue * q = producer->key_buckets[i]; q; q = q->hnext) {
+                        if (!q->builder || q->builder->log_count == 0 || q->builder->first_append_ms <= 0) {
+                            continue;
+                        }
+                        int64_t key_wait_ms = q->builder->first_append_ms + pkg_timeout - now_wait;
+                        if (!have_deadline || key_wait_ms < wait_ms) {
+                            wait_ms = key_wait_ms;
+                            have_deadline = 1;
+                        }
+                    }
+                }
+            }
+            if (have_deadline) {
+                if (wait_ms > 0 && producer->config.platform.cond_timedwait_ms) {
+                    (void)producer->config.platform.cond_timedwait_ms(producer->cond, producer->mutex, wait_ms);
+                }
+            } else {
+                producer->config.platform.cond_wait(producer->cond, producer->mutex);
+            }
         }
         if (producer->stop && producer->queue_count == 0 && producer->ingress_queue_count == 0 && !producer->sealed_head && !have_any_builder && !have_ingress) {
             producer->config.platform.mutex_unlock(producer->mutex);
