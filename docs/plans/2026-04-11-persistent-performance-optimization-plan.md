@@ -45,6 +45,7 @@
    - 避免 `sls700/sls5120` 每条 append 都 malloc/free 临时 record buffer
 8. segment scan 已改为流式校验：
    - open / recover / repair / refresh usage 扫描 segment 时不再 malloc 整条 record
+   - 单次扫描同时重建 `valid_end / record_count / max_log_id`
    - 直接从 header 读取 `log_id`
    - payload CRC 通过 4KB 栈缓冲流式计算，保留损坏尾部检测能力
 
@@ -164,6 +165,7 @@
 - `persistent kv` 已经具备完整的 append / send / ack / reclaim / recover 闭环。
 - durable append 已经脱离 `producer->mutex`，但 persistent store 仍通过 `persistent_mutex` 串行化。
 - `reclaim` 的“扫文件”成本已经显著下降，但触发模型仍偏保守。
+- `ack_range()` 成功路径仍同步执行 checkpoint `write + fsync + close`，并继续在同一路径上做 segment 删除。
 - `recover/open` 的扫描分配开销已经下降，但冷启动本质仍是线性扫描。
 - SDK 默认保持 `single sender`；multi-sender 只保留为隐藏能力，不作为默认优化方向。
 
@@ -177,19 +179,27 @@
    - 当前即使不再重复扫文件，`append` 前的容量检查仍可能频繁进入 reclaim 逻辑。
    - 如果业务日志很碎、ack 推进频繁，这部分仍会形成稳定热成本。
 
-2. `open/recover` 仍然是 `O(total_bytes)`。
+2. checkpoint 持久化仍在 ack 热路径同步执行。
+   - 当前每次 `ack_range()` 推进 `acked_log_id` 都会同步执行 checkpoint `open + write + fsync + close`。
+   - 这部分发生在 sender 成功回调持有 `persistent_mutex` 的路径上，会直接拉长成功确认延迟。
+
+3. ack 后的 segment 删除仍在 sender 热路径执行。
+   - 当前 `reclaim_acked_segments()` 已不再重复扫文件，但仍会在 `ack_range()` 中同步执行 `path_remove()`。
+   - 当一次 ack 释放多个 closed segment 时，本地删除成本仍会阻塞 sender。
+
+4. `open/recover` 仍然是 `O(total_bytes)`。
    - 现在线性扫描已经更轻，但大目录冷启动、大量 segment 恢复仍然会受总数据量影响。
    - 对移动端和嵌入式场景，这比 steady state 吞吐更可能成为用户感知问题。
 
-3. lease 校验仍是关键正确性成本。
+5. lease 校验仍是关键正确性成本。
    - append / ack / recover 仍保留逐次校验。
    - 这保证了 takeover 语义，但也意味着 persistent steady append 热路径还有固定额外开销。
 
-4. `persistent raw` / `non-persistent raw` 仍是逐条消费。
+6. `persistent raw` / `non-persistent raw` 仍是逐条消费。
    - 如果后续业务大量走 raw，这会成为显性瓶颈。
    - 如果 raw 继续只是少数路径，这项优先级仍可以放后。
 
-5. key queue 结构优化仍然是条件性需求。
+7. key queue 结构优化仍然是条件性需求。
    - 只有高 `hash_key` 基数、ordered send、per-key breaker / rate limit 明显打开时才值得投入。
 
 ### 3.2 当前不再是主矛盾的点
@@ -218,7 +228,42 @@
 - 这是当前最值得继续做、风险也最低的性能项。
 - 预期收益主要体现在 `persistent kv` steady append 和 `ack_range()` 路径。
 
-### P2：冷启动 sidecar/meta 索引
+### P1.5：checkpoint 持久化合并 / 节流
+
+目标：
+- 降低 `ack_range()` 每次成功确认都同步 `fsync` checkpoint 的固定成本。
+
+建议方向：
+- 在内存中维护 `checkpoint_dirty` 和最近一次已推进的 `acked_log_id`。
+- 只在以下时机强制落盘：
+  - 距上次 durable checkpoint 超过固定窗口
+  - 累积 ack 次数或 ack 前进量达到阈值
+  - `close()` / lease 续约失败 / owner 释放 / takeover 前的关键时机
+- 默认语义仍保持 durable checkpoint，不应把 `fsync` 静默降级成 `fflush`。
+- 如果后续要支持弱持久模式，必须是显式配置，不应作为默认行为。
+
+价值：
+- 这是当前 sender 成功路径最明确的本地文件系统热点之一。
+- 收益主要体现在 `persistent kv` steady ack 和真实环境持续发送场景。
+
+### P2：ack 后回收异步化 / 延迟化
+
+目标：
+- 把 segment 删除从 sender 成功路径挪走，避免 `path_remove()` 直接阻塞 ack 成功确认。
+
+建议方向：
+- `ack_range()` 只推进 checkpoint 和“可回收上界”，不直接删除文件。
+- 删除动作延后到以下维护时机：
+  - append 前接近容量水位
+  - heartbeat / 后台 maintenance tick
+  - `close()` / `open()` / `recover()` 等需要收敛状态的时机
+- 即使延迟删除，也必须以已 durable 的 checkpoint 为前提，不能倒置删除与 checkpoint 的顺序。
+
+价值：
+- 这项和 checkpoint 节流一起，能直接压缩 sender 成功路径上的本地 I/O。
+- 比进一步大拆锁更聚焦，也更符合当前 persistent 默认单 sender 的优化方向。
+
+### P3：冷启动 sidecar/meta 索引
 
 目标：
 - 减少 `open/recover` 对全量 segment 线性扫描的依赖。
@@ -236,7 +281,7 @@
 - 这是面向移动端、嵌入式、断点恢复场景的高价值优化。
 - 重点收益不是 steady throughput，而是冷启动和恢复时间。
 
-### P3：更强 owner 原语后再压 lease 成本
+### P4：更强 owner 原语后再压 lease 成本
 
 目标：
 - 在不破坏 takeover 语义的前提下，减少 append / ack / recover 的 lease 校验成本。
@@ -252,7 +297,7 @@
 - 一旦做成，steady append 热路径还会有明显下降空间。
 - 但这是高收益高风险项，必须放在正确性验证之后。
 
-### P4：raw 路径批量 pop
+### P5：raw 路径批量 pop
 
 目标：
 - 降低 `raw` 路径逐条 pop / 逐条打包的固定开销。
@@ -264,7 +309,7 @@
 前提：
 - 只有在 raw 业务占比真实抬升后，这项才值得前移。
 
-### P5：key queue 结构优化
+### P6：key queue 结构优化
 
 目标：
 - 只在高 feature 配置下压低 key queue 维护开销。
@@ -279,18 +324,21 @@
 1. 不建议把 multi-sender 作为 persistent 默认能力。
 2. 不建议现在做四锁或更激进的大范围拆锁。
 3. 不建议在没有更强 owner 原语前，直接把 append 热路径 lease 校验降频。
-4. 不建议在没有业务证据前，优先投入 `raw` 路径深优化。
-5. 不建议在没有 benchmark 证据前，提前重构 key queue 数据结构。
+4. 不建议为了追求吞吐，把默认 checkpoint 持久语义从 `fsync` 静默降级到 `fflush`。
+5. 不建议在没有业务证据前，优先投入 `raw` 路径深优化。
+6. 不建议在没有 benchmark 证据前，提前重构 key queue 数据结构。
 
 ---
 
 ## 6. 推荐实施顺序
 
 1. 先做 `reclaim` 游标化 / 增量触发。
-2. 补“冷启动 / recover 耗时”专属 benchmark，并固化到文档。
-3. 基于 benchmark 再做 sidecar/meta 索引设计。
-4. 只有在跨平台 owner 原语可行时，再推进 lease 热路径进一步优化。
-5. 只有 raw 业务量抬升时，再做 `raw` 批量 pop。
+2. 再做 checkpoint 持久化合并 / 节流，但默认保持 durable 语义。
+3. 再把 ack 后回收从 sender 成功路径异步化 / 延迟化。
+4. 补“冷启动 / recover 耗时”专属 benchmark，并固化到文档。
+5. 基于 benchmark 再做 sidecar/meta 索引设计。
+6. 只有在跨平台 owner 原语可行时，再推进 lease 热路径进一步优化。
+7. 只有 raw 业务量抬升时，再做 `raw` 批量 pop。
 
 ---
 
@@ -326,7 +374,7 @@
 
 ## 8. 当前推荐结论
 
-1. 当前最值得继续做的优化，不是多 sender，也不是大拆锁，而是 `reclaim` 触发模型优化。
-2. 如果要面向移动端和嵌入式长期演进，第二优先级应是冷启动 sidecar/meta 索引。
+1. 当前最值得继续做的优化，不是多 sender，也不是大拆锁，而是 `reclaim` 触发模型优化，以及 ack 热路径上的 checkpoint/fsync 与删除成本收敛。
+2. 如果要面向移动端和嵌入式长期演进，冷启动 sidecar/meta 索引仍然是下一阶段高价值方向。
 3. lease 热路径继续优化必须建立在更强 owner 原语之上。
 4. `raw` 路径和 key queue 结构优化都应由 benchmark 和真实业务占比驱动，而不是预先投入。
