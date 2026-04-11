@@ -105,6 +105,23 @@ static const char * queue_full_policy_str(ve_tls_send_queue_full_policy p) {
     return "block";
 }
 
+static int parse_profile(const char * s, int32_t * message_bytes) {
+    if (!s || !message_bytes) return -1;
+    if (strcasecmp(s, "sls200") == 0) {
+        *message_bytes = 200;
+        return 0;
+    }
+    if (strcasecmp(s, "sls700") == 0) {
+        *message_bytes = 700;
+        return 0;
+    }
+    if (strcasecmp(s, "sls5120") == 0) {
+        *message_bytes = 5120;
+        return 0;
+    }
+    return -1;
+}
+
 static int32_t estimate_p99_upper_ms(const ve_tls_metrics * m) {
     if (!m) return 0;
     uint64_t total = 0;
@@ -128,7 +145,7 @@ static void usage(const char * argv0) {
     fprintf(stderr, "usage: %s [--duration-s S] [--rate-lps N] [--message-bytes N] [--writer-threads N] [--flush-every-n N] [--close-timeout-ms N] [--use-global-env 0|1] [--global-senders N]\n", argv0 ? argv0 : "ve_tls_bench");
     fprintf(stderr, "optional: [--write-mode raw|kv|template] [--template-mode on|off] [--send-thread-count N] [--compress-type none|lz4|zlib]\n");
     fprintf(stderr, "optional: [--queue-full-policy block|drop|drop_sampled] [--send-queue-block-timeout-ms N] [--max-buffer-bytes N] [--send-queue-size N] [--flush-interval-ms N] [--log-count-per-package N]\n");
-    fprintf(stderr, "optional: [--use-persistent 0|1] [--persistent-dir PATH]\n");
+    fprintf(stderr, "optional: [--use-persistent 0|1] [--persistent-dir PATH] [--profile sls200|sls700|sls5120]\n");
 }
 
 static uint64_t g_sent = 0;
@@ -211,6 +228,7 @@ int main(int argc, char ** argv) {
     int32_t use_persistent = 0;
     const char * persistent_dir_arg = NULL;
     char persistent_dir_buf[PATH_MAX];
+    const char * profile = "custom";
     write_mode_t write_mode = WRITE_MODE_KV;
     ve_tls_send_queue_full_policy queue_full_policy = VE_TLS_SEND_QUEUE_FULL_BLOCK;
     const char * compress_type = NULL;
@@ -232,6 +250,7 @@ int main(int argc, char ** argv) {
             if (parse_i32(v, &rate_lps) != 0 || rate_lps < 0) return 2;
         } else if (strcmp(k, "--message-bytes") == 0) {
             if (parse_i32(v, &message_bytes) != 0 || message_bytes < 1) return 2;
+            profile = "custom";
         } else if (strcmp(k, "--writer-threads") == 0) {
             if (parse_i32(v, &writer_threads) != 0 || writer_threads < 1) return 2;
         } else if (strcmp(k, "--use-global-env") == 0) {
@@ -273,6 +292,9 @@ int main(int argc, char ** argv) {
             if (parse_i32(v, &use_persistent) != 0) return 2;
         } else if (strcmp(k, "--persistent-dir") == 0) {
             persistent_dir_arg = v;
+        } else if (strcmp(k, "--profile") == 0) {
+            if (parse_profile(v, &message_bytes) != 0) return 2;
+            profile = v;
         } else if (strcmp(k, "--template-mode") == 0) {
             if (strcmp(v, "on") == 0) {
                 write_mode = WRITE_MODE_TEMPLATE;
@@ -403,10 +425,14 @@ int main(int argc, char ** argv) {
     for (int32_t i = 0; i < writer_threads; i++) {
         cfg.platform.thread_join(threads[i]);
     }
+    int64_t produce_end_ms = cfg.platform.time_ms();
+    uint64_t produced_sent = __atomic_load_n(&g_sent, __ATOMIC_RELAXED);
     free(threads);
     free(ctxs);
 
+    int64_t close_start_ms = cfg.platform.time_ms();
     ve_tls_result close_rc = ve_tls_producer_close(p, close_timeout_ms);
+    int64_t close_end_ms = cfg.platform.time_ms();
     ve_tls_metrics m;
     memset(&m, 0, sizeof(m));
     ve_tls_producer_get_metrics(p, &m);
@@ -417,17 +443,34 @@ int main(int argc, char ** argv) {
         (void)ve_tls_env_destroy(close_timeout_ms);
     }
 
-    int64_t dur_ms = cfg.platform.time_ms() - start_ms;
+    int64_t dur_ms = close_end_ms - start_ms;
     double dur_s = dur_ms > 0 ? (double)dur_ms / 1000.0 : 0.001;
-    fprintf(stderr, "bench config write_mode=%s persistent=%d queue_full_policy=%s compress_type=%s writers=%d senders=%d\n",
+    int64_t produce_ms = produce_end_ms - start_ms;
+    int64_t close_ms = close_end_ms - close_start_ms;
+    if (produce_ms < 0) produce_ms = 0;
+    if (close_ms < 0) close_ms = 0;
+    double produce_s = produce_ms > 0 ? (double)produce_ms / 1000.0 : 0.001;
+    double close_s = close_ms > 0 ? (double)close_ms / 1000.0 : 0.001;
+    uint64_t drained_logs = m.logs_enqueued_total > produced_sent ? (m.logs_enqueued_total - produced_sent) : 0;
+    fprintf(stderr, "bench config write_mode=%s persistent=%d profile=%s target_payload_bytes=%d queue_full_policy=%s compress_type=%s writers=%d senders=%d\n",
         write_mode_str(write_mode),
         use_persistent ? 1 : 0,
+        profile,
+        (int)message_bytes,
         queue_full_policy_str(queue_full_policy),
         (compress_type && compress_type[0] != 0) ? compress_type : (cfg.compress_type ? cfg.compress_type : "none"),
         (int)writer_threads,
         (int)cfg.send_thread_count
     );
     fprintf(stderr, "bench close_rc=%d duration_ms=%lld\n", (int)close_rc, (long long)dur_ms);
+    fprintf(stderr, "bench phases produce_ms=%lld close_ms=%lld total_ms=%lld produce_lps=%.2f close_drain_lps=%.2f total_lps=%.2f\n",
+        (long long)produce_ms,
+        (long long)close_ms,
+        (long long)dur_ms,
+        (double)produced_sent / produce_s,
+        (double)drained_logs / close_s,
+        dur_s > 0 ? (double)m.logs_enqueued_total / dur_s : 0.0
+    );
     uint64_t sent = __atomic_load_n(&g_sent, __ATOMIC_RELAXED);
     fprintf(stderr, "bench loops=%llu loops_per_s=%.2f\n", (unsigned long long)sent, dur_s > 0 ? (double)sent / dur_s : 0.0);
     fprintf(stderr, "metrics logs_enqueued_total=%llu logs_dropped_total=%llu bytes_enqueued_total=%llu bytes_dropped_total=%llu\n",

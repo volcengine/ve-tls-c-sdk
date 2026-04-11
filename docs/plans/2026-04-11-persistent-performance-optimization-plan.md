@@ -28,6 +28,11 @@
    - 新增 producer 级 `persistent_mutex` 串行化 append / ack / heartbeat，避免 persistent store 内部状态并发修改
    - `close()` drain 会等待正在进行的 durable append
    - public `ve_tls_persistent_*` API 不额外加内部锁，避免 direct persistent benchmark 和 recover 回调路径引入额外锁顺序风险
+5. P0 benchmark 可观测性已固化：
+   - `ve_tls_bench` 支持 `--profile sls200|sls700|sls5120`
+   - `bench config` 输出 `profile` 和 `target_payload_bytes`
+   - `bench phases` 输出 `produce_ms / close_ms / total_ms / produce_lps / close_drain_lps / total_lps`
+   - 生产阶段和 close 排空阶段分开统计，避免把 close drain 或网络排空误判为生产端瓶颈
 
 ### 0.2 刻意未落地项
 
@@ -70,14 +75,25 @@
 
 使用 `ve_tls_bench --use-persistent 1`，mock HTTP，排除网络时延：
 
-- `kv + message-bytes=700 + 4 writers + persistent + 1 sender`
-- `logs_enqueued_total=49388`
-- `throughput=15.5k logs/s`
-- `requests_failed_total=0`
+- 当前 producer 配置校验要求 persistent 模式 `send_thread_count <= 1`，因此该口径固定为 `1 sender`
+- `kv + sls200 + 4 writers + persistent + 1 sender`：
+  - `produce_lps=19.9k`
+  - `total_lps=19.9k`
+  - `logs_dropped_total=0`
+- `kv + sls700 + 4 writers + persistent + 1 sender`：
+  - `produce_lps=37.6k`
+  - `total_lps=30.5k`
+  - `logs_dropped_total=0`
+- `kv + sls5120 + 4 writers + persistent + 1 sender`：
+  - `produce_lps=9.7k`
+  - `total_lps=9.6k`
+  - `logs_dropped_total=0`
 
 说明：
 - 该数据衡量 producer 持久化写入、入内存队列、builder、sender mock 的完整本地链路
-- 当前仍会受 `max_buffer_bytes` 和 sender 单线程 drain 影响，后续可单独为持久化路径做更细的生产端/发送端拆分 benchmark
+- `produce_lps` 是生产线程完成写入的速率，更适合排查本地生产端瓶颈
+- `total_lps` 会包含 `close()` 排空时间，更适合判断端到端 drain 能力
+- 如果 `logs_dropped_total > 0`，说明压测混入了本地 buffer 容量限制，不能作为极限吞吐结论
 
 ### 0.4 真实环境 smoke 结果
 

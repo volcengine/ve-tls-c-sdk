@@ -115,6 +115,27 @@ if(VE_TLS_BUILD_TESTS)
     target_link_libraries(ve_tls_test_basic PRIVATE ve_tls_core)
     target_include_directories(ve_tls_test_basic PRIVATE core/src)
     add_test(NAME ve_tls_test_basic COMMAND ve_tls_test_basic)
+    if(TARGET ve_tls_bench)
+        add_test(NAME ve_tls_bench_help COMMAND ve_tls_bench --help)
+        set_tests_properties(ve_tls_bench_help PROPERTIES
+            PASS_REGULAR_EXPRESSION "--use-persistent 0\\|1.*--profile sls200\\|sls700\\|sls5120"
+        )
+        add_test(NAME ve_tls_bench_phase_metrics
+            COMMAND ve_tls_bench
+                --duration-s 1
+                --rate-lps 1
+                --message-bytes 200
+                --writer-threads 1
+                --write-mode kv
+                --use-persistent 1
+                --persistent-dir /tmp/ve_tls_bench_phase_metrics
+                --compress-type none
+                --close-timeout-ms 10000
+        )
+        set_tests_properties(ve_tls_bench_phase_metrics PROPERTIES
+            PASS_REGULAR_EXPRESSION "bench phases .*produce_ms=.*close_ms=.*produce_lps=.*"
+        )
+    endif()
     if(TARGET ve_tls_persistent_real_bench)
         add_test(NAME ve_tls_persistent_real_bench_help COMMAND ve_tls_persistent_real_bench --help)
         set_tests_properties(ve_tls_persistent_real_bench_help PROPERTIES
