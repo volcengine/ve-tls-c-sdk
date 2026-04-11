@@ -1431,6 +1431,19 @@ ve_tls_result ve_tls_producer_close(ve_tls_producer * producer, int32_t timeout_
             }
         }
     }
+    if (rc == VE_TLS_OK && producer->persistent) {
+        int flush_rc;
+        if (producer->persistent_mutex) {
+            producer->config.platform.mutex_lock(producer->persistent_mutex);
+        }
+        flush_rc = ve_tls_persistent_flush(producer->persistent);
+        if (producer->persistent_mutex) {
+            producer->config.platform.mutex_unlock(producer->persistent_mutex);
+        }
+        if (flush_rc != 0) {
+            rc = VE_TLS_DROP_ERROR;
+        }
+    }
     return rc;
 }
 

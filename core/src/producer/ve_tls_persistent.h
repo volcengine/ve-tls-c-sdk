@@ -63,8 +63,12 @@ struct ve_tls_persistent {
     uint64_t current_bytes;
     uint64_t current_records;
     uint32_t current_segments;
+    int64_t durable_checkpoint_acked_log_id;
+    int64_t last_checkpoint_save_ms;
+    int64_t checkpoint_dirty_since_ms;
     uint32_t next_reclaim_segment_id;
     int64_t last_reclaim_acked_log_id;
+    uint8_t checkpoint_dirty;
     uint8_t reclaim_pending;
     ve_tls_persistent_segment_meta * segment_meta;
     uint32_t segment_meta_cap;
@@ -80,5 +84,6 @@ int ve_tls_persistent_append(ve_tls_persistent * persistent, int64_t log_id, con
 int ve_tls_persistent_recover(ve_tls_persistent * persistent, int (*on_record)(int64_t log_id, const char * hash_key, const unsigned char * payload, size_t payload_size, void * user), void * user);
 int ve_tls_persistent_ack_range(ve_tls_persistent * persistent, int64_t start_id, int64_t end_id);
 int ve_tls_persistent_heartbeat_if_due(ve_tls_persistent * persistent, int force);
+int ve_tls_persistent_flush(ve_tls_persistent * persistent);
 
 #endif

@@ -52,6 +52,11 @@
    - persistent 维护 `next_reclaim_segment_id` 游标，从首个待检查 closed segment 继续推进
    - append 前不再无条件进入 reclaim，只有 `acked_log_id` 前进或接近容量水位时才触发
    - ack 推进后只增量删除已确认 closed segment，未新增 ack 时不会重复从头检查
+10. checkpoint 已完成持久化合并 / 节流：
+   - persistent 分离“内存 ack 进度”和“已 durable 的 checkpoint 进度”
+   - `ack_range()` 不再每次都同步 `open + write + fsync + close checkpoint`
+   - 达到时间窗口 / ack 前进阈值，或 `close()` 时，才强制补 durable checkpoint
+   - reclaim 只跟随 durable checkpoint 推进，避免先删 segment 再落 checkpoint
 
 ### 0.2 刻意未落地项
 
@@ -88,6 +93,9 @@
 - 2026-04-11 P1 (`reclaim` 游标化 / 增量触发) 验证样本：
   - `payload=256, records=20000`：append `49.6k logs/s`，recover `63.1k logs/s`，ack `4 ms`
   - `payload=5120, records=8000`：append `19.2k logs/s`，recover `22.1k logs/s`，ack `4 ms`
+- 2026-04-11 P1.5（checkpoint 持久化合并 / 节流）验证样本：
+  - `payload=256, records=20000`：append `39.1k logs/s`，recover `45.6k logs/s`，ack `6 ms`
+  - `payload=5120, records=8000`：append `14.7k logs/s`，recover `16.8k logs/s`，ack `2 ms`
 
 补充说明：
 - direct persistent benchmark 受本机文件系统波动影响较大，append 数值不能只看单次运行
@@ -173,7 +181,8 @@
 - durable append 已经脱离 `producer->mutex`，但 persistent store 仍通过 `persistent_mutex` 串行化。
 - `reclaim` 的“扫文件”成本已经显著下降，但触发模型仍偏保守。
 - `reclaim` 已改成游标化 / 增量触发，append 前不再无条件执行回收。
-- `ack_range()` 成功路径仍同步执行 checkpoint `write + fsync + close`，并继续在同一路径上做 segment 删除。
+- `ack_range()` 已改成内存推进 + 节流 durable checkpoint；`close()` 会强制补落盘。
+- ack 后的 segment 删除仍在 sender / flush 路径同步执行。
 - `recover/open` 的扫描分配开销已经下降，但冷启动本质仍是线性扫描。
 - SDK 默认保持 `single sender`；multi-sender 只保留为隐藏能力，不作为默认优化方向。
 
@@ -183,27 +192,23 @@
 
 ### 3.1 仍然值得关注的热点
 
-1. checkpoint 持久化仍在 ack 热路径同步执行。
-   - 当前每次 `ack_range()` 推进 `acked_log_id` 都会同步执行 checkpoint `open + write + fsync + close`。
-   - 这部分发生在 sender 成功回调持有 `persistent_mutex` 的路径上，会直接拉长成功确认延迟。
-
-2. ack 后的 segment 删除仍在 sender 热路径执行。
+1. ack 后的 segment 删除仍在 sender 热路径执行。
    - 当前 `reclaim_acked_segments()` 已不再重复扫文件，但仍会在 `ack_range()` 中同步执行 `path_remove()`。
    - 当一次 ack 释放多个 closed segment 时，本地删除成本仍会阻塞 sender。
 
-3. `open/recover` 仍然是 `O(total_bytes)`。
+2. `open/recover` 仍然是 `O(total_bytes)`。
    - 现在线性扫描已经更轻，但大目录冷启动、大量 segment 恢复仍然会受总数据量影响。
    - 对移动端和嵌入式场景，这比 steady state 吞吐更可能成为用户感知问题。
 
-4. lease 校验仍是关键正确性成本。
+3. lease 校验仍是关键正确性成本。
    - append / ack / recover 仍保留逐次校验。
    - 这保证了 takeover 语义，但也意味着 persistent steady append 热路径还有固定额外开销。
 
-5. `persistent raw` / `non-persistent raw` 仍是逐条消费。
+4. `persistent raw` / `non-persistent raw` 仍是逐条消费。
    - 如果后续业务大量走 raw，这会成为显性瓶颈。
    - 如果 raw 继续只是少数路径，这项优先级仍可以放后。
 
-6. key queue 结构优化仍然是条件性需求。
+5. key queue 结构优化仍然是条件性需求。
    - 只有高 `hash_key` 基数、ordered send、per-key breaker / rate limit 明显打开时才值得投入。
 
 ### 3.2 当前不再是主矛盾的点
@@ -223,23 +228,12 @@
 - 仅在 `acked_log_id` 前进或接近容量水位时触发 reclaim。
 - ack 推进后的 reclaim 只从游标位置继续，不再从头遍历 closed segment。
 
-### P1.5：checkpoint 持久化合并 / 节流
+### P1.5：checkpoint 持久化合并 / 节流（已完成）
 
-目标：
-- 降低 `ack_range()` 每次成功确认都同步 `fsync` checkpoint 的固定成本。
-
-建议方向：
-- 在内存中维护 `checkpoint_dirty` 和最近一次已推进的 `acked_log_id`。
-- 只在以下时机强制落盘：
-  - 距上次 durable checkpoint 超过固定窗口
-  - 累积 ack 次数或 ack 前进量达到阈值
-  - `close()` / lease 续约失败 / owner 释放 / takeover 前的关键时机
-- 默认语义仍保持 durable checkpoint，不应把 `fsync` 静默降级成 `fflush`。
-- 如果后续要支持弱持久模式，必须是显式配置，不应作为默认行为。
-
-价值：
-- 这是当前 sender 成功路径最明确的本地文件系统热点之一。
-- 收益主要体现在 `persistent kv` steady ack 和真实环境持续发送场景。
+已落地：
+- 在内存中维护最新 `acked_log_id`，并单独维护 durable checkpoint 进度。
+- 仅在时间窗口、ack 前进阈值或 `close()` 时写 checkpoint。
+- reclaim 仅基于 durable checkpoint 前进，保持“先 durable、后删除”的顺序。
 
 ### P2：ack 后回收异步化 / 延迟化
 

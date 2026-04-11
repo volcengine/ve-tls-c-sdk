@@ -11,6 +11,8 @@
 #define VE_TLS_PERSISTENT_OVERFLOW_BLOCK 1
 #define VE_TLS_PERSISTENT_OVERFLOW_DROP_OLDEST_UNACKED 2
 #define VE_TLS_PERSISTENT_OVERFLOW_DROP_NEWEST_SAMPLE 3
+#define VE_TLS_PERSISTENT_CHECKPOINT_SAVE_WINDOW_MS 100
+#define VE_TLS_PERSISTENT_CHECKPOINT_ACK_DELTA_THRESHOLD 64
 
 static int path_join(char * out, size_t out_size, const char * dir, const char * name) {
     if (!out || out_size == 0 || !dir || !name) {
@@ -257,9 +259,9 @@ static int reclaim_acked_segments(ve_tls_persistent * persistent, int force) {
     if (!force && !persistent->reclaim_pending) {
         return 0;
     }
-    if (persistent->checkpoint.acked_log_id <= 0) {
+    if (persistent->durable_checkpoint_acked_log_id <= 0) {
         persistent->reclaim_pending = 0;
-        persistent->last_reclaim_acked_log_id = persistent->checkpoint.acked_log_id;
+        persistent->last_reclaim_acked_log_id = persistent->durable_checkpoint_acked_log_id;
         return 0;
     }
     advance_reclaim_cursor(persistent);
@@ -280,7 +282,7 @@ static int reclaim_acked_segments(ve_tls_persistent * persistent, int force) {
             persistent->next_reclaim_segment_id = segment_id + 1;
             continue;
         }
-        if (meta->max_log_id > 0 && meta->max_log_id <= persistent->checkpoint.acked_log_id) {
+        if (meta->max_log_id > 0 && meta->max_log_id <= persistent->durable_checkpoint_acked_log_id) {
             if (persistent->platform->path_remove(path) != 0) {
                 return -1;
             }
@@ -305,7 +307,7 @@ static int reclaim_acked_segments(ve_tls_persistent * persistent, int force) {
     }
     advance_reclaim_cursor(persistent);
     persistent->reclaim_pending = 0;
-    persistent->last_reclaim_acked_log_id = persistent->checkpoint.acked_log_id;
+    persistent->last_reclaim_acked_log_id = persistent->durable_checkpoint_acked_log_id;
     return 0;
 }
 
@@ -314,6 +316,66 @@ static int save_checkpoint(ve_tls_persistent * persistent) {
         return -1;
     }
     return ve_tls_checkpoint_save(persistent->platform, persistent->checkpoint_path, &persistent->checkpoint);
+}
+
+static void mark_checkpoint_dirty(ve_tls_persistent * persistent) {
+    int64_t now_ms;
+    if (!persistent) {
+        return;
+    }
+    now_ms = persistent_now_ms(persistent);
+    if (!persistent->checkpoint_dirty) {
+        persistent->checkpoint_dirty = 1;
+        persistent->checkpoint_dirty_since_ms = now_ms;
+    } else if (persistent->checkpoint_dirty_since_ms <= 0 && now_ms > 0) {
+        persistent->checkpoint_dirty_since_ms = now_ms;
+    }
+}
+
+static int checkpoint_save_now(ve_tls_persistent * persistent) {
+    int64_t now_ms;
+    if (!persistent) {
+        return -1;
+    }
+    if (save_checkpoint(persistent) != 0) {
+        return -1;
+    }
+    now_ms = persistent_now_ms(persistent);
+    persistent->durable_checkpoint_acked_log_id = persistent->checkpoint.acked_log_id;
+    persistent->last_checkpoint_save_ms = now_ms;
+    persistent->checkpoint_dirty_since_ms = 0;
+    persistent->checkpoint_dirty = 0;
+    if (persistent->durable_checkpoint_acked_log_id > persistent->last_reclaim_acked_log_id) {
+        persistent->reclaim_pending = 1;
+    }
+    return 0;
+}
+
+static int checkpoint_should_save(ve_tls_persistent * persistent, int force) {
+    int64_t now_ms;
+    int64_t ack_delta;
+    if (!persistent || !persistent->checkpoint_dirty) {
+        return 0;
+    }
+    if (force) {
+        return 1;
+    }
+    ack_delta = persistent->checkpoint.acked_log_id - persistent->durable_checkpoint_acked_log_id;
+    if (ack_delta >= VE_TLS_PERSISTENT_CHECKPOINT_ACK_DELTA_THRESHOLD) {
+        return 1;
+    }
+    now_ms = persistent_now_ms(persistent);
+    if (now_ms <= 0 || persistent->checkpoint_dirty_since_ms <= 0) {
+        return 1;
+    }
+    return (now_ms - persistent->checkpoint_dirty_since_ms) >= VE_TLS_PERSISTENT_CHECKPOINT_SAVE_WINDOW_MS ? 1 : 0;
+}
+
+static int checkpoint_save_if_due(ve_tls_persistent * persistent, int force) {
+    if (!checkpoint_should_save(persistent, force)) {
+        return 0;
+    }
+    return checkpoint_save_now(persistent);
 }
 
 static int persist_drop_oldest_unacked(ve_tls_persistent * persistent) {
@@ -337,7 +399,7 @@ static int persist_drop_oldest_unacked(ve_tls_persistent * persistent) {
         if (meta->max_log_id > persistent->checkpoint.acked_log_id) {
             persistent->checkpoint.acked_log_id = meta->max_log_id;
             persistent->checkpoint.last_segment_id = persistent->store.active_segment_id;
-            if (save_checkpoint(persistent) != 0) {
+            if (checkpoint_save_now(persistent) != 0) {
                 return -1;
             }
         }
@@ -557,8 +619,12 @@ int ve_tls_persistent_open(ve_tls_persistent * persistent, const ve_tls_persiste
         ve_tls_persistent_close(persistent);
         return -1;
     }
+    persistent->durable_checkpoint_acked_log_id = persistent->checkpoint.acked_log_id;
+    persistent->last_checkpoint_save_ms = options->now_ms > 0 ? options->now_ms : persistent_now_ms(persistent);
+    persistent->checkpoint_dirty_since_ms = 0;
+    persistent->checkpoint_dirty = 0;
     persistent->next_reclaim_segment_id = 1;
-    persistent->last_reclaim_acked_log_id = persistent->checkpoint.acked_log_id;
+    persistent->last_reclaim_acked_log_id = persistent->durable_checkpoint_acked_log_id;
     persistent->reclaim_pending = 0;
     advance_reclaim_cursor(persistent);
     persistent->next_heartbeat_ms = options->now_ms > 0 && persistent->heartbeat_interval_ms > 0
@@ -571,6 +637,7 @@ void ve_tls_persistent_close(ve_tls_persistent * persistent) {
     if (!persistent || !persistent->platform) {
         return;
     }
+    (void)ve_tls_persistent_flush(persistent);
     ve_tls_segment_store_close(&persistent->store);
     ve_tls_free(persistent->segment_meta);
     persistent->segment_meta = NULL;
@@ -582,6 +649,23 @@ void ve_tls_persistent_close(ve_tls_persistent * persistent) {
         (void)ve_tls_lease_release(persistent->platform, persistent->lease_path);
     }
     memset(persistent, 0, sizeof(*persistent));
+}
+
+int ve_tls_persistent_flush(ve_tls_persistent * persistent) {
+    if (!persistent || !persistent->platform) {
+        return -1;
+    }
+    if (persistent->checkpoint_dirty) {
+        if (checkpoint_save_if_due(persistent, 1) != 0) {
+            return -1;
+        }
+    }
+    if (persistent->durable_checkpoint_acked_log_id > persistent->last_reclaim_acked_log_id) {
+        if (reclaim_acked_segments(persistent, 0) != 0) {
+            return -1;
+        }
+    }
+    return 0;
 }
 
 int ve_tls_persistent_append(ve_tls_persistent * persistent, int64_t log_id, const char * hash_key, const unsigned char * payload, size_t payload_size) {
@@ -753,13 +837,14 @@ int ve_tls_persistent_ack_range(ve_tls_persistent * persistent, int64_t start_id
     }
     if (end_id > persistent->checkpoint.acked_log_id) {
         persistent->checkpoint.acked_log_id = end_id;
-        if (persistent->checkpoint.acked_log_id > persistent->last_reclaim_acked_log_id) {
-            persistent->reclaim_pending = 1;
-        }
+        mark_checkpoint_dirty(persistent);
     }
     persistent->checkpoint.last_segment_id = persistent->store.active_segment_id;
-    if (save_checkpoint(persistent) != 0) {
+    if (checkpoint_save_if_due(persistent, 0) != 0) {
         return -1;
     }
-    return reclaim_acked_segments(persistent, 0);
+    if (persistent->durable_checkpoint_acked_log_id > persistent->last_reclaim_acked_log_id) {
+        return reclaim_acked_segments(persistent, 0);
+    }
+    return 0;
 }
