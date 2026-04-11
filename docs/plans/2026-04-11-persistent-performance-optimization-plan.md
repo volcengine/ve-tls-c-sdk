@@ -57,6 +57,10 @@
    - `ack_range()` 不再每次都同步 `open + write + fsync + close checkpoint`
    - 达到时间窗口 / ack 前进阈值，或 `close()` 时，才强制补 durable checkpoint
    - reclaim 只跟随 durable checkpoint 推进，避免先删 segment 再落 checkpoint
+11. ack 后回收已完成异步化 / 延迟化：
+   - `ack_range()` 只推进内存 ack 与 durable checkpoint，不再在成功回调里直接 `path_remove()`
+   - segment 删除延后到 `flush()/close()`、append 容量压力路径，以及 open 时的状态收敛
+   - sender 成功回调不再把 segment 删除成本直接串到 ack 成功确认路径上
 
 ### 0.2 刻意未落地项
 
@@ -96,6 +100,9 @@
 - 2026-04-11 P1.5（checkpoint 持久化合并 / 节流）验证样本：
   - `payload=256, records=20000`：append `39.1k logs/s`，recover `45.6k logs/s`，ack `6 ms`
   - `payload=5120, records=8000`：append `14.7k logs/s`，recover `16.8k logs/s`，ack `2 ms`
+- 2026-04-11 P2（ack 后回收延迟化）验证样本：
+  - `payload=256, records=20000`：append `38.5k logs/s`，recover `47.7k logs/s`，ack `5 ms`
+  - `payload=5120, records=8000`：append `14.4k logs/s`，recover `17.7k logs/s`，ack `3 ms`
 
 补充说明：
 - direct persistent benchmark 受本机文件系统波动影响较大，append 数值不能只看单次运行
@@ -182,7 +189,7 @@
 - `reclaim` 的“扫文件”成本已经显著下降，但触发模型仍偏保守。
 - `reclaim` 已改成游标化 / 增量触发，append 前不再无条件执行回收。
 - `ack_range()` 已改成内存推进 + 节流 durable checkpoint；`close()` 会强制补落盘。
-- ack 后的 segment 删除仍在 sender / flush 路径同步执行。
+- ack 后的 segment 删除已从 sender 成功路径移出，改为延后到 `flush()/close()/open` 或容量压力路径。
 - `recover/open` 的扫描分配开销已经下降，但冷启动本质仍是线性扫描。
 - SDK 默认保持 `single sender`；multi-sender 只保留为隐藏能力，不作为默认优化方向。
 
@@ -192,23 +199,19 @@
 
 ### 3.1 仍然值得关注的热点
 
-1. ack 后的 segment 删除仍在 sender 热路径执行。
-   - 当前 `reclaim_acked_segments()` 已不再重复扫文件，但仍会在 `ack_range()` 中同步执行 `path_remove()`。
-   - 当一次 ack 释放多个 closed segment 时，本地删除成本仍会阻塞 sender。
-
-2. `open/recover` 仍然是 `O(total_bytes)`。
+1. `open/recover` 仍然是 `O(total_bytes)`。
    - 现在线性扫描已经更轻，但大目录冷启动、大量 segment 恢复仍然会受总数据量影响。
    - 对移动端和嵌入式场景，这比 steady state 吞吐更可能成为用户感知问题。
 
-3. lease 校验仍是关键正确性成本。
+2. lease 校验仍是关键正确性成本。
    - append / ack / recover 仍保留逐次校验。
    - 这保证了 takeover 语义，但也意味着 persistent steady append 热路径还有固定额外开销。
 
-4. `persistent raw` / `non-persistent raw` 仍是逐条消费。
+3. `persistent raw` / `non-persistent raw` 仍是逐条消费。
    - 如果后续业务大量走 raw，这会成为显性瓶颈。
    - 如果 raw 继续只是少数路径，这项优先级仍可以放后。
 
-5. key queue 结构优化仍然是条件性需求。
+4. key queue 结构优化仍然是条件性需求。
    - 只有高 `hash_key` 基数、ordered send、per-key breaker / rate limit 明显打开时才值得投入。
 
 ### 3.2 当前不再是主矛盾的点
@@ -235,22 +238,12 @@
 - 仅在时间窗口、ack 前进阈值或 `close()` 时写 checkpoint。
 - reclaim 仅基于 durable checkpoint 前进，保持“先 durable、后删除”的顺序。
 
-### P2：ack 后回收异步化 / 延迟化
+### P2：ack 后回收异步化 / 延迟化（已完成）
 
-目标：
-- 把 segment 删除从 sender 成功路径挪走，避免 `path_remove()` 直接阻塞 ack 成功确认。
-
-建议方向：
-- `ack_range()` 只推进 checkpoint 和“可回收上界”，不直接删除文件。
-- 删除动作延后到以下维护时机：
-  - append 前接近容量水位
-  - heartbeat / 后台 maintenance tick
-  - `close()` / `open()` / `recover()` 等需要收敛状态的时机
-- 即使延迟删除，也必须以已 durable 的 checkpoint 为前提，不能倒置删除与 checkpoint 的顺序。
-
-价值：
-- 这项和 checkpoint 节流一起，能直接压缩 sender 成功路径上的本地 I/O。
-- 比进一步大拆锁更聚焦，也更符合当前 persistent 默认单 sender 的优化方向。
+已落地：
+- `ack_range()` 仅推进内存 ack 与 durable checkpoint，不直接删除 segment。
+- 删除动作延后到 `flush()/close()/open` 与 append 容量压力路径。
+- 仍保持“先 durable checkpoint、后删除 segment”的顺序。
 
 ### P3：冷启动 sidecar/meta 索引
 

@@ -624,9 +624,13 @@ int ve_tls_persistent_open(ve_tls_persistent * persistent, const ve_tls_persiste
     persistent->checkpoint_dirty_since_ms = 0;
     persistent->checkpoint_dirty = 0;
     persistent->next_reclaim_segment_id = 1;
-    persistent->last_reclaim_acked_log_id = persistent->durable_checkpoint_acked_log_id;
-    persistent->reclaim_pending = 0;
+    persistent->last_reclaim_acked_log_id = 0;
+    persistent->reclaim_pending = persistent->durable_checkpoint_acked_log_id > 0 ? 1 : 0;
     advance_reclaim_cursor(persistent);
+    if (persistent->reclaim_pending && reclaim_acked_segments(persistent, 1) != 0) {
+        ve_tls_persistent_close(persistent);
+        return -1;
+    }
     persistent->next_heartbeat_ms = options->now_ms > 0 && persistent->heartbeat_interval_ms > 0
         ? options->now_ms + persistent->heartbeat_interval_ms
         : options->now_ms;
@@ -842,9 +846,6 @@ int ve_tls_persistent_ack_range(ve_tls_persistent * persistent, int64_t start_id
     persistent->checkpoint.last_segment_id = persistent->store.active_segment_id;
     if (checkpoint_save_if_due(persistent, 0) != 0) {
         return -1;
-    }
-    if (persistent->durable_checkpoint_acked_log_id > persistent->last_reclaim_acked_log_id) {
-        return reclaim_acked_segments(persistent, 0);
     }
     return 0;
 }
