@@ -139,15 +139,85 @@ ve_tls_producer_destroy(p2);
 ### 真实环境 Demo
 
 - 可执行 demo：`tools/real_demo.c`
+- 可执行真实环境 persistent benchmark：`tools/persistent_real_bench.c`
 - 支持通过环境变量或配置文件注入参数：`tools/real_demo.env`
+- persistent 真实环境完整性验证脚本：`tools/persistent_real_validation.sh`
+- 服务端结果查询脚本：`tools/tls_search_logs.go`（依赖本地 `volc-sdk-golang` checkout）
 
 示例：
 
-```
+``` 
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DVE_TLS_ENABLE_CURL=ON
 cmake --build build
 ./build/ve_tls_demo_real --config tools/real_demo.env --duration-s 60 --wait-ms 3000
+./build/ve_tls_persistent_real_bench --config tools/real_demo.env --mode steady --write-mode kv --profile sls700 --duration-s 30 --rate-lps 0 --report-interval-s 1 --wait-ms 120000
 ```
+
+其中 `ve_tls_persistent_real_bench` 是适合直接部署到真实环境机器上跑的单个二进制：
+
+- `--mode steady`：真实环境直发，测 persistent 开启后的 steady-state 吞吐
+- `--mode recover`：对已有 persistent 路径做 recover 回灌，测 backlog drain 吞吐
+- `--write-mode kv|raw`：`kv` 更贴近真实业务，`raw` 在这个二进制里走单字段模板快路径，更适合测 producer/persistent 极限
+- `--profile sls200|sls700|sls5120|custom`：固定日志模板；`custom` 时可配 `--message-bytes`
+- `--rate-lps 0`：表示不做节流，直接压满发送路径
+- `--report-interval-s 1`：每秒输出一次实时速率与 backlog
+- persistent 模式下会强制 `send_thread_count=1`；如果配置文件里写了更大的值，二进制会打印收敛结果
+- 输出包括：
+  - `PERSISTENT_REAL_PROGRESS ...`：实时窗口速率与 backlog，包含 `phase=steady|recover|drain`、窗口 `enqueue_lps/success_lps`、累计 `enqueue_lps_avg/success_lps_avg`、`buffered_bytes`、`acked_log_id`、`active_segment_id`、`current_segments/current_records/current_bytes`
+  - `PERSISTENT_REAL_BENCH ...`：最终汇总结果
+
+判断瓶颈时可直接看：
+
+- `enqueue_lps` 低，且 `buffered_bytes` 不增长：更像 producer/persistent 本地链路先卡住
+- `enqueue_lps` 高、`success_lps` 低，且 `buffered_bytes` 持续增长：更像网络或服务端吞吐先卡住
+- `phase=drain` 持续输出，但 `acked_log_id` 不前进：说明 close 后仍在排空，但服务端 ack 没回来
+- `current_segments/current_bytes` 长时间不下降且 `acked_log_id` 落后很多：说明还没 ack 到可回收区间，`seg` 不会被删
+
+持久化/断点续传真实环境验证：
+
+```
+export GO_SDK_ROOT=/path/to/volc-sdk-golang
+/bin/zsh tools/persistent_real_validation.sh
+```
+
+真实环境 benchmark：
+
+```
+export GO_SDK_ROOT=/path/to/volc-sdk-golang
+/bin/zsh tools/persistent_real_bench.sh --mode steady --rates 1000,2000,5000 --duration-s 15
+/bin/zsh tools/persistent_real_bench.sh --mode recover --recover-records 5000,20000
+```
+
+默认会编排这些场景：
+
+- baseline：正常发送与重复 recover 不重放
+- crash_before_send：入盘后、发送前崩溃，重启 recover 后补齐
+- partial_send_then_crash：部分发送成功后崩溃，重启 recover 后补齐
+- timeout_then_recover：网络失败/超时后崩溃，重启 recover 后补齐
+- terminal_auth_drop：鉴权终态失败后不重放
+- quota_reject_new：用 persistent quota 打满模拟本地持久化空间耗尽，验证 `reject_new` 后只恢复已落盘日志
+- checkpoint_corruption：人为破坏 `checkpoint` 文件后重启 recover，验证损坏恢复路径
+- stale_takeover：同一路径第二个进程在 owner 存活时被拒绝，owner stale 后允许 takeover 并恢复数据
+
+说明：
+
+- `quota_reject_new` 当前覆盖的是 SDK 自身 quota 打满，不等同于真实文件系统 `ENOSPC`
+- `checkpoint_corruption` 当前修复策略是将损坏的 checkpoint 重置为零 checkpoint 后继续 recover；这能优先保证完整性，但在“已有部分 ack 且 checkpoint 丢失”的更复杂场景下，语义会退化为可能重复发送
+- `stale_takeover` 的结果判断以 `unique_seq` 完整性为准；若服务端在重试歧义下出现重复写入，会在查询结果里用 `duplicates=` 显式体现
+- `tools/persistent_real_bench.sh` 会把每轮 benchmark 的 stdout/stderr 和查询结果归档到 `build-persistent-real/bench-results/<timestamp>/`
+- benchmark 当前支持两类模式：steady-state rate sweep 和 recover drain throughput
+
+`tools/real_demo.c` 现在也支持通过环境变量直接驱动 persistent 验证，例如：
+
+- `VE_TLS_USE_PERSISTENT=1`
+- `VE_TLS_PERSISTENT_FILE_PATH=/tmp/ve-tls-demo-persistent`
+- `VE_TLS_DEMO_RUN_ID=...`
+- `VE_TLS_DEMO_SCENARIO=...`
+- `VE_TLS_DEMO_RECOVER=1`
+- `VE_TLS_DEMO_EXIT_AFTER_ENQUEUE=1`
+- `VE_TLS_DEMO_EXIT_AFTER_SUCCESS=10`
+- `VE_TLS_PERSISTENT_MAX_RECORDS=5`
+- `VE_TLS_PERSISTENT_OVERFLOW_POLICY=reject_new`
 
 ## 退出语义
 

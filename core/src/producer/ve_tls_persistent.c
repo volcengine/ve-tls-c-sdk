@@ -451,8 +451,11 @@ int ve_tls_persistent_open(ve_tls_persistent * persistent, const ve_tls_persiste
             return -1;
         }
     } else if (ve_tls_checkpoint_load(persistent->platform, persistent->checkpoint_path, &persistent->checkpoint) != 0) {
-        ve_tls_persistent_close(persistent);
-        return -1;
+        memset(&persistent->checkpoint, 0, sizeof(persistent->checkpoint));
+        if (ve_tls_checkpoint_save(persistent->platform, persistent->checkpoint_path, &persistent->checkpoint) != 0) {
+            ve_tls_persistent_close(persistent);
+            return -1;
+        }
     }
     memset(&lease_options, 0, sizeof(lease_options));
     lease_options.platform = persistent->platform;

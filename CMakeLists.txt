@@ -103,6 +103,10 @@ if(VE_TLS_BUILD_TOOLS AND NOT ANDROID)
     add_executable(ve_tls_persistent_bench tools/persistent_bench.c)
     target_link_libraries(ve_tls_persistent_bench PRIVATE ve_tls_core)
     target_include_directories(ve_tls_persistent_bench PRIVATE core/src)
+
+    add_executable(ve_tls_persistent_real_bench tools/persistent_real_bench.c)
+    target_link_libraries(ve_tls_persistent_real_bench PRIVATE ve_tls_core)
+    target_include_directories(ve_tls_persistent_real_bench PRIVATE core/src)
 endif()
 
 if(VE_TLS_BUILD_TESTS)
@@ -111,6 +115,12 @@ if(VE_TLS_BUILD_TESTS)
     target_link_libraries(ve_tls_test_basic PRIVATE ve_tls_core)
     target_include_directories(ve_tls_test_basic PRIVATE core/src)
     add_test(NAME ve_tls_test_basic COMMAND ve_tls_test_basic)
+    if(TARGET ve_tls_persistent_real_bench)
+        add_test(NAME ve_tls_persistent_real_bench_help COMMAND ve_tls_persistent_real_bench --help)
+        set_tests_properties(ve_tls_persistent_real_bench_help PROPERTIES
+            PASS_REGULAR_EXPRESSION "--write-mode;--profile;--report-interval-s"
+        )
+    endif()
 endif()
 
 if(VE_TLS_ENABLE_ASAN OR VE_TLS_ENABLE_UBSAN)
