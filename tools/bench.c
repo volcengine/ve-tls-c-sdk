@@ -7,6 +7,7 @@
 #include <strings.h>
 #include <stdint.h>
 #include <limits.h>
+#include <unistd.h>
 
 static int http_ok_do(ve_tls_http_client * client, const ve_tls_http_request * req, ve_tls_http_response * resp) {
     (void)client;
@@ -127,6 +128,7 @@ static void usage(const char * argv0) {
     fprintf(stderr, "usage: %s [--duration-s S] [--rate-lps N] [--message-bytes N] [--writer-threads N] [--flush-every-n N] [--close-timeout-ms N] [--use-global-env 0|1] [--global-senders N]\n", argv0 ? argv0 : "ve_tls_bench");
     fprintf(stderr, "optional: [--write-mode raw|kv|template] [--template-mode on|off] [--send-thread-count N] [--compress-type none|lz4|zlib]\n");
     fprintf(stderr, "optional: [--queue-full-policy block|drop|drop_sampled] [--send-queue-block-timeout-ms N] [--max-buffer-bytes N] [--send-queue-size N] [--flush-interval-ms N] [--log-count-per-package N]\n");
+    fprintf(stderr, "optional: [--use-persistent 0|1] [--persistent-dir PATH]\n");
 }
 
 static uint64_t g_sent = 0;
@@ -206,6 +208,9 @@ int main(int argc, char ** argv) {
     int32_t log_count_per_package = 0;
     int32_t send_thread_count = 0;
     int32_t send_queue_block_timeout_ms = 5000;
+    int32_t use_persistent = 0;
+    const char * persistent_dir_arg = NULL;
+    char persistent_dir_buf[PATH_MAX];
     write_mode_t write_mode = WRITE_MODE_KV;
     ve_tls_send_queue_full_policy queue_full_policy = VE_TLS_SEND_QUEUE_FULL_BLOCK;
     const char * compress_type = NULL;
@@ -264,6 +269,10 @@ int main(int argc, char ** argv) {
             if (parse_i32(v, &flush_interval_ms) != 0 || flush_interval_ms < 0) return 2;
         } else if (strcmp(k, "--log-count-per-package") == 0) {
             if (parse_i32(v, &log_count_per_package) != 0 || log_count_per_package < 0) return 2;
+        } else if (strcmp(k, "--use-persistent") == 0) {
+            if (parse_i32(v, &use_persistent) != 0) return 2;
+        } else if (strcmp(k, "--persistent-dir") == 0) {
+            persistent_dir_arg = v;
         } else if (strcmp(k, "--template-mode") == 0) {
             if (strcmp(v, "on") == 0) {
                 write_mode = WRITE_MODE_TEMPLATE;
@@ -306,6 +315,21 @@ int main(int argc, char ** argv) {
     if (send_queue_size > 0) cfg.send_queue_size = send_queue_size;
     if (flush_interval_ms > 0) cfg.flush_interval_ms = flush_interval_ms;
     if (log_count_per_package > 0) cfg.log_count_per_package = log_count_per_package;
+    if (use_persistent) {
+        if (!persistent_dir_arg || persistent_dir_arg[0] == 0) {
+            snprintf(persistent_dir_buf, sizeof(persistent_dir_buf), "/tmp/ve_tls_bench_persistent_%ld", (long)getpid());
+            persistent_dir_arg = persistent_dir_buf;
+        }
+        cfg.use_persistent = 1;
+        cfg.persistent_file_path = persistent_dir_arg;
+        cfg.max_persistent_file_size = 8 * 1024 * 1024;
+        cfg.max_persistent_file_count = 64;
+        cfg.max_persistent_log_count = 10000000;
+        cfg.persistent_max_bytes = 512 * 1024 * 1024;
+        cfg.persistent_max_records = 10000000;
+        cfg.persistent_max_segments = 64;
+        cfg.send_thread_count = 1;
+    }
 
     if (use_global_env) {
         if (ve_tls_env_init(global_senders) != VE_TLS_OK) {
@@ -395,8 +419,9 @@ int main(int argc, char ** argv) {
 
     int64_t dur_ms = cfg.platform.time_ms() - start_ms;
     double dur_s = dur_ms > 0 ? (double)dur_ms / 1000.0 : 0.001;
-    fprintf(stderr, "bench config write_mode=%s queue_full_policy=%s compress_type=%s writers=%d senders=%d\n",
+    fprintf(stderr, "bench config write_mode=%s persistent=%d queue_full_policy=%s compress_type=%s writers=%d senders=%d\n",
         write_mode_str(write_mode),
+        use_persistent ? 1 : 0,
         queue_full_policy_str(queue_full_policy),
         (compress_type && compress_type[0] != 0) ? compress_type : (cfg.compress_type ? cfg.compress_type : "none"),
         (int)writer_threads,

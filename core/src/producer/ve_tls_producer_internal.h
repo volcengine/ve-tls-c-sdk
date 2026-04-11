@@ -126,6 +126,7 @@ struct ve_tls_producer {
     ve_tls_mutex * mutex;
     ve_tls_cond * cond;
     ve_tls_cond * send_cond;
+    ve_tls_mutex * persistent_mutex;
     ve_tls_thread ** workers;
     int32_t worker_count;
     ve_tls_thread ** senders;
@@ -146,6 +147,7 @@ struct ve_tls_producer {
     int accepting;
     int closing;
     int32_t worker_flushing_count;
+    int32_t active_persistent_appends;
     int64_t next_id;
     ve_tls_log_item * queue;
     size_t queue_cap;

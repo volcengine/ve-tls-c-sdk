@@ -23,6 +23,11 @@
    - reclaim 去掉 append/ack 热路径上的重复全段扫描
    - `repair_tail` 由双扫描改成单扫描
 3. `persistent` 的 `heartbeat_if_due()` 已完成“到点前直接跳过”优化，但 append/ack/recover 仍保留每次 lease 校验。
+4. `persistent` 已完成 P2 的低风险版本：
+   - durable append 期间释放 `producer->mutex`
+   - 新增 producer 级 `persistent_mutex` 串行化 append / ack / heartbeat，避免 persistent store 内部状态并发修改
+   - `close()` drain 会等待正在进行的 durable append
+   - public `ve_tls_persistent_*` API 不额外加内部锁，避免 direct persistent benchmark 和 recover 回调路径引入额外锁顺序风险
 
 ### 0.2 刻意未落地项
 
@@ -31,9 +36,9 @@
    - 当前多进程正确性依赖 append/ack 前读取 lease 文件并比对 fencing token
    - 一旦把 append 侧 lease 校验降频，旧 owner 在 takeover 之后仍可能继续写 segment
    - 现有 UT `test_persistent_takeover_invalidates_old_writer` 已验证这一点
-2. **未拆 `producer->mutex`。**
+2. **未做大范围拆锁。**
    原因：
-   - 当前优先级更高的是先把 reclaim 热路径收掉，并保证 non-persistent 共享路径不回退
+   - 本轮只把 durable append 从 `producer->mutex` 临界区移出
    - 大拆锁会同时影响 `feat_improve_sdk_more` 和 `persistent` 的行为面，风险更高
 
 ### 0.3 本地无网络 benchmark 结果
@@ -41,7 +46,7 @@
 #### A. Non-Persistent `kv`（`message-bytes=700`，4 writers，4 senders，3s）
 
 - `feat_improve_sdk_more` 当前：`3.79M logs/s`，`744.6 MB/s`
-- `persistent` 当前非持久化路径：`4.28M logs/s`，`748.9 MB/s`
+- `persistent` 当前非持久化路径：`4.11M logs/s`，`750.9 MB/s`
 - 对比本轮实施前基线：
   - `feat_improve_sdk_more`：约 `2.52M -> 3.79M logs/s`
   - `persistent` 非持久化：约 `2.87M -> 4.28M logs/s`
@@ -49,24 +54,37 @@
 #### B. Persistent 本地 benchmark
 
 - `payload=256`：
-  - append：`208.3k logs/s`
-  - recover：`61.9k logs/s`
-  - ack：`5 ms`
+  - append：`53.9k logs/s`
+  - recover：`66.4k logs/s`
+  - ack：`6 ms`
 - `payload=5120`：
-  - append：`27.1k logs/s`
-  - recover：`21.7k logs/s`
-  - ack：`9 ms`
+  - append：`20.0k logs/s`
+  - recover：`21.6k logs/s`
+  - ack：`4 ms`
 - 对比本轮实施前基线：
-  - `payload=256` append：约 `51.7k -> 208.3k logs/s`
-  - `payload=5120` append：约 `18.5k -> 27.1k logs/s`
+  - `payload=256` append：约 `51.7k -> 53.9k logs/s`
+  - `payload=5120` append：约 `18.5k -> 20.0k logs/s`
   - `ack` 从数百毫秒降到个位数毫秒，收益主要来自 reclaim 不再重复扫描 segment
+
+#### C. Producer Persistent 本地 benchmark
+
+使用 `ve_tls_bench --use-persistent 1`，mock HTTP，排除网络时延：
+
+- `kv + message-bytes=700 + 4 writers + persistent + 1 sender`
+- `logs_enqueued_total=49388`
+- `throughput=15.5k logs/s`
+- `requests_failed_total=0`
+
+说明：
+- 该数据衡量 producer 持久化写入、入内存队列、builder、sender mock 的完整本地链路
+- 当前仍会受 `max_buffer_bytes` 和 sender 单线程 drain 影响，后续可单独为持久化路径做更细的生产端/发送端拆分 benchmark
 
 ### 0.4 真实环境 smoke 结果
 
 使用 `ve_tls_persistent_real_bench` 跑 `kv + sls700 + persistent + steady 3s`：
 
-- `add_ok=56`
-- `success=56`
+- `add_ok=51`
+- `success=51`
 - `requests=3`
 - `requests_failed=0`
 - `close_rc=0`

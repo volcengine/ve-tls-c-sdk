@@ -382,6 +382,9 @@ static char g_track_dir[PATH_MAX];
 static int g_track_lease_opens = 0;
 static int g_track_segment_opens = 0;
 static int g_track_segment_stats = 0;
+static ve_tls_mutex * g_track_producer_mutex = NULL;
+static _Thread_local int g_track_producer_mutex_depth = 0;
+static int g_track_file_write_saw_producer_mutex = 0;
 
 static int test_path_in_tracked_dir(const char * path) {
     size_t n;
@@ -432,6 +435,35 @@ static int test_track_path_stat(const char * path, ve_tls_path_info * info) {
         g_track_segment_stats++;
     }
     return g_real_platform.path_stat(path, info);
+}
+
+static ve_tls_mutex * test_track_mutex_create(void) {
+    return g_real_platform.mutex_create();
+}
+
+static void test_track_mutex_destroy(ve_tls_mutex * m) {
+    g_real_platform.mutex_destroy(m);
+}
+
+static void test_track_mutex_lock(ve_tls_mutex * m) {
+    g_real_platform.mutex_lock(m);
+    if (m == g_track_producer_mutex) {
+        g_track_producer_mutex_depth++;
+    }
+}
+
+static void test_track_mutex_unlock(ve_tls_mutex * m) {
+    if (m == g_track_producer_mutex && g_track_producer_mutex_depth > 0) {
+        g_track_producer_mutex_depth--;
+    }
+    g_real_platform.mutex_unlock(m);
+}
+
+static int64_t test_track_file_write(ve_tls_file * f, const void * buf, size_t size) {
+    if (g_track_producer_mutex_depth > 0) {
+        g_track_file_write_saw_producer_mutex = 1;
+    }
+    return g_real_platform.file_write(f, buf, size);
 }
 
 static int test_http_do(ve_tls_http_client * client, const ve_tls_http_request * req, ve_tls_http_response * resp) {
@@ -8138,9 +8170,6 @@ static int test_persistent_recover_requeues_hash_key_record(void) {
         return -1;
     }
     ve_tls_log_builder_free(builder);
-    ve_tls_persistent_close(p1->persistent);
-    ve_tls_free(p1->persistent);
-    p1->persistent = NULL;
     ve_tls_producer_destroy(p1);
 
     p2 = ve_tls_producer_create(&cfg);
@@ -8810,9 +8839,6 @@ static int test_persistent_recover_repairs_truncated_tail_record(void) {
         cleanup_persistent_dir(dir);
         return -1;
     }
-    ve_tls_persistent_close(p1->persistent);
-    ve_tls_free(p1->persistent);
-    p1->persistent = NULL;
     ve_tls_producer_destroy(p1);
 
     if (cfg.platform.path_stat(seg1, &info) != 0 || !info.exists || info.size <= 8) {
@@ -9003,6 +9029,58 @@ static int test_persistent_kv_path_batches_multiple_logs_into_single_request(voi
     }
     ve_tls_producer_destroy(p);
     cleanup_persistent_dir(dir);
+    return 0;
+}
+
+static int test_persistent_append_releases_producer_mutex_for_disk_write(void) {
+    char dir[PATH_MAX];
+    ve_tls_config cfg;
+    ve_tls_producer * p = NULL;
+    ve_tls_kv kvs[1];
+    int rc;
+    if (make_temp_dir(dir, sizeof(dir)) != 0) {
+        return -1;
+    }
+    ve_tls_config_init(&cfg);
+    g_real_platform = cfg.platform;
+    cfg.platform.mutex_create = test_track_mutex_create;
+    cfg.platform.mutex_destroy = test_track_mutex_destroy;
+    cfg.platform.mutex_lock = test_track_mutex_lock;
+    cfg.platform.mutex_unlock = test_track_mutex_unlock;
+    cfg.platform.file_write = test_track_file_write;
+    cfg.endpoint = "https://example.com";
+    cfg.region = "cn-beijing";
+    cfg.topic_id = "t";
+    cfg.access_key_id = "ak";
+    cfg.access_key_secret = "sk";
+    cfg.retry_policy.max_attempts = 1;
+    cfg.flush_interval_ms = 100000;
+    cfg.compress_type = "none";
+    cfg.http_client.do_request = test_http_ok_do;
+    cfg.http_client.free_response = test_http_ok_free;
+    cfg.use_persistent = 1;
+    cfg.persistent_file_path = dir;
+    cfg.max_persistent_log_count = 128;
+    cfg.max_persistent_file_size = 4096;
+    cfg.max_persistent_file_count = 4;
+    p = ve_tls_producer_create(&cfg);
+    if (!p || !p->persistent) {
+        g_track_producer_mutex = NULL;
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    g_track_producer_mutex = p->mutex;
+    g_track_file_write_saw_producer_mutex = 0;
+    g_track_producer_mutex_depth = 0;
+    kvs[0].key = "message";
+    kvs[0].value = "persistent-mutex";
+    rc = ve_tls_producer_add_log_kv_hashkey(p, 0, NULL, kvs, 1, 0);
+    ve_tls_producer_destroy(p);
+    g_track_producer_mutex = NULL;
+    cleanup_persistent_dir(dir);
+    if (rc != VE_TLS_OK || g_track_file_write_saw_producer_mutex) {
+        return -1;
+    }
     return 0;
 }
 
@@ -9250,6 +9328,7 @@ int main(void) {
     RUN(142, test_persistent_recover_repairs_corrupted_checkpoint_file());
     RUN(143, test_persistent_overflow_reject_new_kv_does_not_double_free());
     RUN(144, test_persistent_kv_path_batches_multiple_logs_into_single_request());
+    RUN(150, test_persistent_append_releases_producer_mutex_for_disk_write());
 #if defined(VE_TLS_HAVE_ZLIB)
     RUN(37, test_zlib_compress_roundtrip());
 #endif

@@ -32,7 +32,13 @@ static void ve_tls_secure_free_str(char ** ps) {
 
 static void ve_tls_sender_heartbeat_persistent(ve_tls_producer * producer) {
     if (producer && producer->persistent) {
+        if (producer->persistent_mutex) {
+            producer->config.platform.mutex_lock(producer->persistent_mutex);
+        }
         (void)ve_tls_persistent_heartbeat_if_due(producer->persistent, 0);
+        if (producer->persistent_mutex) {
+            producer->config.platform.mutex_unlock(producer->persistent_mutex);
+        }
     }
 }
 

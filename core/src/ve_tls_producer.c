@@ -165,7 +165,24 @@ static ve_tls_result ve_tls_persistent_append_with_retry_locked(
         start_ms = producer->config.platform.time_ms();
     }
     for (;;) {
+        producer->active_persistent_appends++;
+        producer->config.platform.mutex_unlock(producer->mutex);
+        if (producer->persistent_mutex) {
+            producer->config.platform.mutex_lock(producer->persistent_mutex);
+        }
         int prc = ve_tls_persistent_append(producer->persistent, id, hash_key, data, size);
+        if (producer->persistent_mutex) {
+            producer->config.platform.mutex_unlock(producer->persistent_mutex);
+        }
+        if (prc == -3) {
+            producer->config.platform.sleep_ms(5);
+        }
+        producer->config.platform.mutex_lock(producer->mutex);
+        producer->active_persistent_appends--;
+        producer->config.platform.cond_broadcast(producer->cond);
+        if (producer->stop || !producer->accepting) {
+            return VE_TLS_CLOSED;
+        }
         if (prc == 0) {
             return VE_TLS_OK;
         }
@@ -177,12 +194,6 @@ static ve_tls_result ve_tls_persistent_append_with_retry_locked(
             if (start_ms > 0 && now_ms - start_ms >= timeout_ms) {
                 return ve_tls_map_persistent_append_error(producer, -3, size);
             }
-        }
-        producer->config.platform.mutex_unlock(producer->mutex);
-        producer->config.platform.sleep_ms(5);
-        producer->config.platform.mutex_lock(producer->mutex);
-        if (producer->stop || !producer->accepting) {
-            return VE_TLS_CLOSED;
         }
     }
 }
@@ -485,7 +496,13 @@ void ve_tls_persistent_on_final_result(ve_tls_producer * producer, ve_tls_result
     if (start_id <= 0 || end_id <= 0 || end_id < start_id) {
         return;
     }
+    if (producer->persistent_mutex) {
+        producer->config.platform.mutex_lock(producer->persistent_mutex);
+    }
     (void)ve_tls_persistent_ack_range(producer->persistent, start_id, end_id);
+    if (producer->persistent_mutex) {
+        producer->config.platform.mutex_unlock(producer->persistent_mutex);
+    }
 }
 
 static void ve_tls_drop_one_with_error(ve_tls_send_callbacks cbs, size_t bytes, int64_t id, const char * code, const char * message) {
@@ -871,7 +888,7 @@ int ve_tls_producer_is_drained_locked(ve_tls_producer * producer) {
     if (!producer) {
         return 1;
     }
-    if (producer->queue_count != 0 || producer->ingress_queue_count != 0 || producer->worker_flushing_count > 0 || producer->sealed_head) {
+    if (producer->queue_count != 0 || producer->ingress_queue_count != 0 || producer->worker_flushing_count > 0 || producer->active_persistent_appends > 0 || producer->sealed_head) {
         return 0;
     }
     if (producer->send_queue.mutex) {
@@ -991,6 +1008,11 @@ ve_tls_producer * ve_tls_producer_create(const ve_tls_config * config) {
     producer->accepting = 1;
     if (producer->config.use_persistent) {
         ve_tls_persistent_options popt;
+        producer->persistent_mutex = producer->config.platform.mutex_create();
+        if (!producer->persistent_mutex) {
+            ve_tls_producer_destroy(producer);
+            return NULL;
+        }
         producer->persistent = (ve_tls_persistent *)ve_tls_calloc(1, sizeof(ve_tls_persistent));
         if (!producer->persistent) {
             ve_tls_producer_destroy(producer);
@@ -1448,6 +1470,10 @@ void ve_tls_producer_destroy(ve_tls_producer * producer) {
         ve_tls_persistent_close(producer->persistent);
         ve_tls_free(producer->persistent);
         producer->persistent = NULL;
+    }
+    if (producer->persistent_mutex) {
+        producer->config.platform.mutex_destroy(producer->persistent_mutex);
+        producer->persistent_mutex = NULL;
     }
     if (producer->cond) {
         producer->config.platform.cond_destroy(producer->cond);

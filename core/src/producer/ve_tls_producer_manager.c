@@ -29,7 +29,13 @@ static ve_tls_send_callbacks ve_tls_capture_callbacks(ve_tls_producer * producer
 
 static void ve_tls_manager_heartbeat_persistent(ve_tls_producer * producer) {
     if (producer && producer->persistent) {
+        if (producer->persistent_mutex) {
+            producer->config.platform.mutex_lock(producer->persistent_mutex);
+        }
         (void)ve_tls_persistent_heartbeat_if_due(producer->persistent, 0);
+        if (producer->persistent_mutex) {
+            producer->config.platform.mutex_unlock(producer->persistent_mutex);
+        }
     }
 }
 
