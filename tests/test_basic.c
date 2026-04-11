@@ -8704,6 +8704,79 @@ static int test_persistent_ack_range_reclaims_without_rescanning_segments(void) 
     return 0;
 }
 
+static int test_persistent_reclaim_cursor_advances_with_ack_progress(void) {
+    char dir[PATH_MAX];
+    char seg1[PATH_MAX];
+    char seg2[PATH_MAX];
+    ve_tls_config cfg;
+    ve_tls_persistent persistent;
+    ve_tls_persistent_options opt;
+    ve_tls_path_info info1;
+    ve_tls_path_info info2;
+    static const unsigned char payload[] = "123456789";
+    if (make_temp_dir(dir, sizeof(dir)) != 0) {
+        return -1;
+    }
+    join_path(seg1, sizeof(seg1), dir, "seg-000001.log");
+    join_path(seg2, sizeof(seg2), dir, "seg-000002.log");
+    ve_tls_config_init(&cfg);
+    memset(&persistent, 0, sizeof(persistent));
+    memset(&opt, 0, sizeof(opt));
+    memset(&info1, 0, sizeof(info1));
+    memset(&info2, 0, sizeof(info2));
+    opt.platform = &cfg.platform;
+    opt.dir_path = dir;
+    opt.instance_id = "test-instance";
+    opt.owner_id = "owner-a";
+    opt.owner_process_name = "proc-a";
+    opt.owner_pid = 123;
+    opt.segment_max_bytes = 40;
+    opt.segment_max_records = 128;
+    opt.max_bytes = 4096;
+    opt.max_records = 512;
+    opt.max_segments = 8;
+    opt.now_ms = 1000;
+    opt.lease_timeout_ms = 1000;
+    opt.heartbeat_interval_ms = 1000;
+    opt.open_mode = VE_TLS_LEASE_OPEN_TAKEOVER_IF_STALE;
+    if (ve_tls_persistent_open(&persistent, &opt) != 0 ||
+        ve_tls_persistent_append(&persistent, 1, NULL, payload, sizeof(payload) - 1) != 0 ||
+        ve_tls_persistent_append(&persistent, 2, NULL, payload, sizeof(payload) - 1) != 0 ||
+        persistent.store.active_segment_id != 2 ||
+        persistent.next_reclaim_segment_id != 1) {
+        ve_tls_persistent_close(&persistent);
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    if (ve_tls_persistent_ack_range(&persistent, 1, 1) != 0 ||
+        persistent.next_reclaim_segment_id != 2 ||
+        cfg.platform.path_stat(seg1, &info1) != 0 ||
+        cfg.platform.path_stat(seg2, &info2) != 0 ||
+        info1.exists ||
+        !info2.exists) {
+        ve_tls_persistent_close(&persistent);
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    if (ve_tls_persistent_append(&persistent, 3, NULL, payload, sizeof(payload) - 1) != 0 ||
+        persistent.next_reclaim_segment_id != 2) {
+        ve_tls_persistent_close(&persistent);
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    if (ve_tls_persistent_ack_range(&persistent, 2, 2) != 0 ||
+        persistent.next_reclaim_segment_id != persistent.store.active_segment_id ||
+        cfg.platform.path_stat(seg2, &info2) != 0 ||
+        info2.exists) {
+        ve_tls_persistent_close(&persistent);
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    ve_tls_persistent_close(&persistent);
+    cleanup_persistent_dir(dir);
+    return 0;
+}
+
 static int test_persistent_overflow_drop_newest_sample_uses_sample_rate(void) {
     char dir[PATH_MAX];
     ve_tls_config cfg;
@@ -9522,6 +9595,7 @@ int main(void) {
     RUN(148, test_persistent_heartbeat_before_due_skips_lease_reload());
     RUN(137, test_persistent_takeover_invalidates_old_writer());
     RUN(149, test_persistent_ack_range_reclaims_without_rescanning_segments());
+    RUN(155, test_persistent_reclaim_cursor_advances_with_ack_progress());
     RUN(138, test_persistent_overflow_drop_newest_sample_uses_sample_rate());
     RUN(139, test_add_log_with_id_returns_monotonic_ids());
     RUN(140, test_persistent_recover_repairs_truncated_tail_record());

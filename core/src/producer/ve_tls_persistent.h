@@ -63,6 +63,9 @@ struct ve_tls_persistent {
     uint64_t current_bytes;
     uint64_t current_records;
     uint32_t current_segments;
+    uint32_t next_reclaim_segment_id;
+    int64_t last_reclaim_acked_log_id;
+    uint8_t reclaim_pending;
     ve_tls_persistent_segment_meta * segment_meta;
     uint32_t segment_meta_cap;
     unsigned char * append_buf;

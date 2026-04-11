@@ -48,6 +48,10 @@
    - 单次扫描同时重建 `valid_end / record_count / max_log_id`
    - 直接从 header 读取 `log_id`
    - payload CRC 通过 4KB 栈缓冲流式计算，保留损坏尾部检测能力
+9. `reclaim` 已完成游标化 / 增量触发：
+   - persistent 维护 `next_reclaim_segment_id` 游标，从首个待检查 closed segment 继续推进
+   - append 前不再无条件进入 reclaim，只有 `acked_log_id` 前进或接近容量水位时才触发
+   - ack 推进后只增量删除已确认 closed segment，未新增 ack 时不会重复从头检查
 
 ### 0.2 刻意未落地项
 
@@ -81,6 +85,9 @@
   - append：`15.5k logs/s`
   - recover：`19.6k logs/s`
   - ack：`4 ms`
+- 2026-04-11 P1 (`reclaim` 游标化 / 增量触发) 验证样本：
+  - `payload=256, records=20000`：append `49.6k logs/s`，recover `63.1k logs/s`，ack `4 ms`
+  - `payload=5120, records=8000`：append `19.2k logs/s`，recover `22.1k logs/s`，ack `4 ms`
 
 补充说明：
 - direct persistent benchmark 受本机文件系统波动影响较大，append 数值不能只看单次运行
@@ -165,6 +172,7 @@
 - `persistent kv` 已经具备完整的 append / send / ack / reclaim / recover 闭环。
 - durable append 已经脱离 `producer->mutex`，但 persistent store 仍通过 `persistent_mutex` 串行化。
 - `reclaim` 的“扫文件”成本已经显著下降，但触发模型仍偏保守。
+- `reclaim` 已改成游标化 / 增量触发，append 前不再无条件执行回收。
 - `ack_range()` 成功路径仍同步执行 checkpoint `write + fsync + close`，并继续在同一路径上做 segment 删除。
 - `recover/open` 的扫描分配开销已经下降，但冷启动本质仍是线性扫描。
 - SDK 默认保持 `single sender`；multi-sender 只保留为隐藏能力，不作为默认优化方向。
@@ -175,31 +183,27 @@
 
 ### 3.1 仍然值得关注的热点
 
-1. `reclaim` 触发频率仍偏高。
-   - 当前即使不再重复扫文件，`append` 前的容量检查仍可能频繁进入 reclaim 逻辑。
-   - 如果业务日志很碎、ack 推进频繁，这部分仍会形成稳定热成本。
-
-2. checkpoint 持久化仍在 ack 热路径同步执行。
+1. checkpoint 持久化仍在 ack 热路径同步执行。
    - 当前每次 `ack_range()` 推进 `acked_log_id` 都会同步执行 checkpoint `open + write + fsync + close`。
    - 这部分发生在 sender 成功回调持有 `persistent_mutex` 的路径上，会直接拉长成功确认延迟。
 
-3. ack 后的 segment 删除仍在 sender 热路径执行。
+2. ack 后的 segment 删除仍在 sender 热路径执行。
    - 当前 `reclaim_acked_segments()` 已不再重复扫文件，但仍会在 `ack_range()` 中同步执行 `path_remove()`。
    - 当一次 ack 释放多个 closed segment 时，本地删除成本仍会阻塞 sender。
 
-4. `open/recover` 仍然是 `O(total_bytes)`。
+3. `open/recover` 仍然是 `O(total_bytes)`。
    - 现在线性扫描已经更轻，但大目录冷启动、大量 segment 恢复仍然会受总数据量影响。
    - 对移动端和嵌入式场景，这比 steady state 吞吐更可能成为用户感知问题。
 
-5. lease 校验仍是关键正确性成本。
+4. lease 校验仍是关键正确性成本。
    - append / ack / recover 仍保留逐次校验。
    - 这保证了 takeover 语义，但也意味着 persistent steady append 热路径还有固定额外开销。
 
-6. `persistent raw` / `non-persistent raw` 仍是逐条消费。
+5. `persistent raw` / `non-persistent raw` 仍是逐条消费。
    - 如果后续业务大量走 raw，这会成为显性瓶颈。
    - 如果 raw 继续只是少数路径，这项优先级仍可以放后。
 
-7. key queue 结构优化仍然是条件性需求。
+6. key queue 结构优化仍然是条件性需求。
    - 只有高 `hash_key` 基数、ordered send、per-key breaker / rate limit 明显打开时才值得投入。
 
 ### 3.2 当前不再是主矛盾的点
@@ -212,21 +216,12 @@
 
 ## 4. 剩余优化优先级
 
-### P1：`reclaim` 游标化 / 增量触发
+### P1：`reclaim` 游标化 / 增量触发（已完成）
 
-目标：
-- 让 reclaim 从“频繁检查”改成“只在 ack 前进或接近水位线时处理”。
-
-建议方向：
-- 维护 `next_reclaim_segment_id` 或等价游标。
-- 只有以下事件触发 reclaim：
-  - `acked_log_id` 前进
-  - `current_bytes/current_records/current_segments` 接近高水位
-  - `close/recover/open` 等明确需要收敛状态的时机
-
-价值：
-- 这是当前最值得继续做、风险也最低的性能项。
-- 预期收益主要体现在 `persistent kv` steady append 和 `ack_range()` 路径。
+已落地：
+- 维护 `next_reclaim_segment_id` 游标。
+- 仅在 `acked_log_id` 前进或接近容量水位时触发 reclaim。
+- ack 推进后的 reclaim 只从游标位置继续，不再从头遍历 closed segment。
 
 ### P1.5：checkpoint 持久化合并 / 节流
 
