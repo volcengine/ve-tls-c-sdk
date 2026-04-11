@@ -33,6 +33,11 @@
    - `bench config` 输出 `profile` 和 `target_payload_bytes`
    - `bench phases` 输出 `produce_ms / close_ms / total_ms / produce_lps / close_drain_lps / total_lps`
    - 生产阶段和 close 排空阶段分开统计，避免把 close drain 或网络排空误判为生产端瓶颈
+6. persistent 多 sender 已完成安全放开：
+   - checkpoint 不再按单个成功 range 直接推进
+   - producer 维护已完成 range 的有序集合，只在 `[acked+1 ... N]` 连续完成时推进 checkpoint
+   - 支持发送完成乱序，避免 `2-3` 先成功时错误删除 `1` 对应的持久化数据
+   - `send_thread_count > 1` 可用于 persistent producer，真实收益取决于网络/HTTP 发送是否是瓶颈
 
 ### 0.2 刻意未落地项
 
@@ -75,7 +80,7 @@
 
 使用 `ve_tls_bench --use-persistent 1`，mock HTTP，排除网络时延：
 
-- 当前 producer 配置校验要求 persistent 模式 `send_thread_count <= 1`，因此该口径固定为 `1 sender`
+- 当前 producer 已允许 persistent 模式配置多个 sender；如需验证纯生产端瓶颈，可以固定 `--send-thread-count 1`，如需验证发送排空能力，可以提高 sender 数
 - `kv + sls200 + 4 writers + persistent + 1 sender`：
   - `produce_lps=19.9k`
   - `total_lps=19.9k`
@@ -88,11 +93,22 @@
   - `produce_lps=9.7k`
   - `total_lps=9.6k`
   - `logs_dropped_total=0`
+- `kv + sls700 + 4 writers + persistent + 4 senders`：
+  - `produce_lps=23.8k`
+  - `total_lps=23.7k`
+  - `close_ms=7`
+  - `logs_dropped_total=0`
+- `kv + sls5120 + 4 writers + persistent + 4 senders`：
+  - `produce_lps=12.5k`
+  - `total_lps=12.4k`
+  - `logs_dropped_total=0`
 
 说明：
 - 该数据衡量 producer 持久化写入、入内存队列、builder、sender mock 的完整本地链路
 - `produce_lps` 是生产线程完成写入的速率，更适合排查本地生产端瓶颈
 - `total_lps` 会包含 `close()` 排空时间，更适合判断端到端 drain 能力
+- 多 sender 对 mock HTTP 下的 `produce_lps` 提升不稳定，说明当前本地生产端仍主要受 durable append、序列化持久化写入和文件系统影响
+- 多 sender 对 close drain 更直接有效，真实环境下如果网络/服务端 RTT 是瓶颈，收益会比 mock HTTP 更明显
 - 如果 `logs_dropped_total > 0`，说明压测混入了本地 buffer 容量限制，不能作为极限吞吐结论
 
 ### 0.4 真实环境 smoke 结果

@@ -82,6 +82,7 @@ typedef struct {
 } ve_tls_ingress_task;
 
 typedef struct ve_tls_key_queue ve_tls_key_queue;
+typedef struct ve_tls_completed_ack_range ve_tls_completed_ack_range;
 
 struct ve_tls_key_queue {
     char * key;
@@ -110,6 +111,12 @@ struct ve_tls_key_queue {
     ve_tls_key_queue * dprev;
     ve_tls_key_queue * dnext;
     ve_tls_log_group_builder * builder;
+};
+
+struct ve_tls_completed_ack_range {
+    int64_t start_id;
+    int64_t end_id;
+    ve_tls_completed_ack_range * next;
 };
 
 struct ve_tls_producer {
@@ -148,6 +155,7 @@ struct ve_tls_producer {
     int closing;
     int32_t worker_flushing_count;
     int32_t active_persistent_appends;
+    ve_tls_completed_ack_range * persistent_ack_head;
     int64_t next_id;
     ve_tls_log_item * queue;
     size_t queue_cap;

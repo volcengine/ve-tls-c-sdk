@@ -350,7 +350,6 @@ int main(int argc, char ** argv) {
         cfg.persistent_max_bytes = 512 * 1024 * 1024;
         cfg.persistent_max_records = 10000000;
         cfg.persistent_max_segments = 64;
-        cfg.send_thread_count = 1;
     }
 
     if (use_global_env) {

@@ -107,7 +107,6 @@ static int ve_tls_config_is_valid_for_create(const ve_tls_config * cfg) {
     if (cfg->use_persistent) {
         if (ve_tls_str_empty(cfg->persistent_file_path)) return 0;
         if (cfg->max_persistent_log_count <= 0 || cfg->max_persistent_file_size <= 0 || cfg->max_persistent_file_count <= 0) return 0;
-        if (cfg->send_thread_count > 1) return 0;
     }
     return 1;
 }
@@ -486,7 +485,96 @@ static int ve_tls_recover_record_to_queue(int64_t log_id, const char * hash_key,
     return 0;
 }
 
+static void ve_tls_persistent_free_ack_ranges(ve_tls_producer * producer) {
+    ve_tls_completed_ack_range * cur;
+    if (!producer) {
+        return;
+    }
+    cur = producer->persistent_ack_head;
+    while (cur) {
+        ve_tls_completed_ack_range * next = cur->next;
+        ve_tls_free(cur);
+        cur = next;
+    }
+    producer->persistent_ack_head = NULL;
+}
+
+static int64_t ve_tls_persistent_record_completed_range_locked(ve_tls_producer * producer, int64_t start_id, int64_t end_id) {
+    int64_t acked;
+    int64_t advance_to;
+    ve_tls_completed_ack_range * prev;
+    ve_tls_completed_ack_range * cur;
+    if (!producer || !producer->persistent || start_id <= 0 || end_id < start_id) {
+        return 0;
+    }
+    acked = producer->persistent->checkpoint.acked_log_id;
+    if (end_id <= acked) {
+        return 0;
+    }
+    if (start_id <= acked) {
+        start_id = acked + 1;
+    }
+    if (start_id > acked + 1) {
+        ve_tls_completed_ack_range * node;
+        prev = NULL;
+        cur = producer->persistent_ack_head;
+        while (cur && cur->end_id < start_id - 1) {
+            prev = cur;
+            cur = cur->next;
+        }
+        while (cur && cur->start_id <= end_id + 1) {
+            ve_tls_completed_ack_range * next = cur->next;
+            if (cur->start_id < start_id) {
+                start_id = cur->start_id;
+            }
+            if (cur->end_id > end_id) {
+                end_id = cur->end_id;
+            }
+            if (prev) {
+                prev->next = next;
+            } else {
+                producer->persistent_ack_head = next;
+            }
+            ve_tls_free(cur);
+            cur = next;
+        }
+        node = (ve_tls_completed_ack_range *)ve_tls_calloc(1, sizeof(*node));
+        if (!node) {
+            return 0;
+        }
+        node->start_id = start_id;
+        node->end_id = end_id;
+        if (prev) {
+            node->next = prev->next;
+            prev->next = node;
+        } else {
+            node->next = producer->persistent_ack_head;
+            producer->persistent_ack_head = node;
+        }
+        return 0;
+    }
+
+    advance_to = end_id;
+    prev = NULL;
+    cur = producer->persistent_ack_head;
+    while (cur && cur->start_id <= advance_to + 1) {
+        ve_tls_completed_ack_range * next = cur->next;
+        if (cur->end_id > advance_to) {
+            advance_to = cur->end_id;
+        }
+        if (prev) {
+            prev->next = next;
+        } else {
+            producer->persistent_ack_head = next;
+        }
+        ve_tls_free(cur);
+        cur = next;
+    }
+    return advance_to > acked ? advance_to : 0;
+}
+
 void ve_tls_persistent_on_final_result(ve_tls_producer * producer, ve_tls_result result, int64_t start_id, int64_t end_id) {
+    int64_t ack_to = 0;
     if (!ve_tls_persistent_enabled(producer)) {
         return;
     }
@@ -499,7 +587,10 @@ void ve_tls_persistent_on_final_result(ve_tls_producer * producer, ve_tls_result
     if (producer->persistent_mutex) {
         producer->config.platform.mutex_lock(producer->persistent_mutex);
     }
-    (void)ve_tls_persistent_ack_range(producer->persistent, start_id, end_id);
+    ack_to = ve_tls_persistent_record_completed_range_locked(producer, start_id, end_id);
+    if (ack_to > 0) {
+        (void)ve_tls_persistent_ack_range(producer->persistent, 1, ack_to);
+    }
     if (producer->persistent_mutex) {
         producer->config.platform.mutex_unlock(producer->persistent_mutex);
     }
@@ -1471,6 +1562,7 @@ void ve_tls_producer_destroy(ve_tls_producer * producer) {
         ve_tls_free(producer->persistent);
         producer->persistent = NULL;
     }
+    ve_tls_persistent_free_ack_ranges(producer);
     if (producer->persistent_mutex) {
         producer->config.platform.mutex_destroy(producer->persistent_mutex);
         producer->persistent_mutex = NULL;
