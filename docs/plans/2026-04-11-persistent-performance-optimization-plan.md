@@ -42,6 +42,10 @@
    - 小记录继续使用 512B 栈缓冲
    - 大于 512B 的编码缓冲改为 persistent 实例级 scratch buffer
    - 避免 `sls700/sls5120` 每条 append 都 malloc/free 临时 record buffer
+8. segment scan 已改为流式校验：
+   - open / recover / repair / refresh usage 扫描 segment 时不再 malloc 整条 record
+   - 直接从 header 读取 `log_id`
+   - payload CRC 通过 4KB 栈缓冲流式计算，保留损坏尾部检测能力
 
 ### 0.2 刻意未落地项
 
@@ -68,17 +72,21 @@
 #### B. Persistent 本地 benchmark
 
 - `payload=256`：
-  - append：`53.9k logs/s`
-  - recover：`66.4k logs/s`
-  - ack：`6 ms`
+  - append：`42.1k logs/s`
+  - recover：`54.2k logs/s`
+  - ack：`10 ms`
 - `payload=5120`：
-  - append：`20.0k logs/s`
-  - recover：`21.6k logs/s`
+  - append：`15.5k logs/s`
+  - recover：`19.6k logs/s`
   - ack：`4 ms`
 - 对比本轮实施前基线：
   - `payload=256` append：约 `51.7k -> 53.9k logs/s`
   - `payload=5120` append：约 `18.5k -> 20.0k logs/s`
   - `ack` 从数百毫秒降到个位数毫秒，收益主要来自 reclaim 不再重复扫描 segment
+
+补充说明：
+- direct persistent benchmark 受本机文件系统波动影响较大，append 数值不能只看单次运行
+- segment scan 流式化后，recover/open 扫描不再发生每条记录 heap decode，降低了大 segment 恢复期的内存抖动
 
 #### C. Producer Persistent 本地 benchmark
 

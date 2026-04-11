@@ -13,6 +13,75 @@ static uint32_t read_u32_le_local(const unsigned char * p) {
            ((uint32_t)p[3] << 24);
 }
 
+static uint16_t read_u16_le_local(const unsigned char * p) {
+    return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+}
+
+static int read_full(ve_tls_platform * platform, ve_tls_file * file, void * buf, size_t size);
+
+static uint64_t read_u64_le_local(const unsigned char * p) {
+    uint64_t v = 0;
+    for (int i = 0; i < 8; i++) {
+        v |= ((uint64_t)p[i] << (8 * i));
+    }
+    return v;
+}
+
+static uint32_t crc32_update_local(uint32_t crc, unsigned char b) {
+    crc ^= (uint32_t)b;
+    for (int i = 0; i < 8; i++) {
+        crc = (crc & 1u) ? ((crc >> 1) ^ 0xEDB88320u) : (crc >> 1);
+    }
+    return crc;
+}
+
+static int read_payload_crc(ve_tls_platform * platform, ve_tls_file * file, uint64_t payload_size, uint32_t * out_crc) {
+    unsigned char buf[4096];
+    uint64_t remain = payload_size;
+    uint32_t crc = 0xFFFFFFFFu;
+    if (!platform || !file || !out_crc || payload_size == 0) {
+        return -1;
+    }
+    while (remain > 0) {
+        size_t want = remain > sizeof(buf) ? sizeof(buf) : (size_t)remain;
+        if (read_full(platform, file, buf, want) != 0) {
+            return -1;
+        }
+        for (size_t i = 0; i < want; i++) {
+            crc = crc32_update_local(crc, buf[i]);
+        }
+        remain -= (uint64_t)want;
+    }
+    *out_crc = crc ^ 0xFFFFFFFFu;
+    return 0;
+}
+
+static int validate_ext_stream(const unsigned char * ext, uint32_t ext_len) {
+    uint32_t pos = 0;
+    int has_hash_key = 0;
+    while (pos < ext_len) {
+        uint8_t type;
+        uint16_t len;
+        if (ext_len - pos < 4) {
+            return -1;
+        }
+        type = ext[pos];
+        len = read_u16_le_local(ext + pos + 2);
+        pos += 4;
+        if ((uint32_t)len > ext_len - pos) {
+            return -1;
+        }
+        if (type == VE_TLS_PERSISTENT_EXT_TYPE_HASH_KEY) {
+            if (has_hash_key || len == 0 || len > VE_TLS_PERSISTENT_RECORD_HASH_KEY_MAX) {
+                return -1;
+            }
+            has_hash_key = 1;
+        }
+        pos += (uint32_t)len;
+    }
+    return pos == ext_len ? 0 : -1;
+}
+
 static int scan_segment_file(ve_tls_platform * platform, const char * path, uint64_t * valid_end, uint64_t * record_count, int64_t * max_log_id);
 
 static int read_full(ve_tls_platform * platform, ve_tls_file * file, void * buf, size_t size) {
@@ -92,7 +161,11 @@ static int scan_segment_file(ve_tls_platform * platform, const char * path, uint
     }
     while (offset + VE_TLS_PERSISTENT_RECORD_HEADER_SIZE <= info.size) {
         uint32_t total_len;
-        unsigned char * record;
+        uint32_t payload_crc;
+        uint32_t ext_len;
+        uint64_t payload_size;
+        uint32_t actual_crc;
+        unsigned char ext_buf[VE_TLS_PERSISTENT_RECORD_EXT_MAX];
         if (platform->file_seek(file, (int64_t)offset, VE_TLS_FILE_SEEK_SET) < 0) {
             platform->file_close(file);
             return -1;
@@ -101,34 +174,30 @@ static int scan_segment_file(ve_tls_platform * platform, const char * path, uint
             break;
         }
         total_len = read_u32_le_local(header + 4);
+        payload_crc = read_u32_le_local(header + 20);
+        ext_len = read_u32_le_local(header + 24);
         if (read_u32_le_local(header) != VE_TLS_PERSISTENT_RECORD_MAGIC ||
             total_len < VE_TLS_PERSISTENT_RECORD_HEADER_SIZE ||
+            ext_len > VE_TLS_PERSISTENT_RECORD_EXT_MAX ||
+            (uint64_t)VE_TLS_PERSISTENT_RECORD_HEADER_SIZE + (uint64_t)ext_len >= (uint64_t)total_len ||
             offset + total_len > info.size) {
             break;
         }
-        record = (unsigned char *)ve_tls_malloc(total_len);
-        if (!record) {
-            platform->file_close(file);
-            return -1;
+        payload_size = (uint64_t)total_len - (uint64_t)VE_TLS_PERSISTENT_RECORD_HEADER_SIZE - (uint64_t)ext_len;
+        if (ext_len > 0) {
+            if (read_full(platform, file, ext_buf, ext_len) != 0 || validate_ext_stream(ext_buf, ext_len) != 0) {
+                break;
+            }
         }
-        memcpy(record, header, sizeof(header));
-        if (total_len > sizeof(header) &&
-            read_full(platform, file, record + sizeof(header), total_len - sizeof(header)) != 0) {
-            ve_tls_free(record);
+        if (read_payload_crc(platform, file, payload_size, &actual_crc) != 0 || actual_crc != payload_crc) {
             break;
         }
         {
-            ve_tls_persistent_record decoded;
-            if (ve_tls_persistent_record_decode(record, total_len, &decoded) != 0) {
-                ve_tls_free(record);
-                break;
+            int64_t log_id = (int64_t)read_u64_le_local(header + 8);
+            if (log_id > max_id) {
+                max_id = log_id;
             }
-            if (decoded.log_id > max_id) {
-                max_id = decoded.log_id;
-            }
-            ve_tls_persistent_record_free(&decoded);
         }
-        ve_tls_free(record);
         offset += total_len;
         count++;
     }
