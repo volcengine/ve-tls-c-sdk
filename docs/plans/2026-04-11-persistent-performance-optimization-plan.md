@@ -68,7 +68,7 @@
 - `persistent` 当前非持久化路径：`4.11M logs/s`，`750.9 MB/s`
 - 对比本轮实施前基线：
   - `feat_improve_sdk_more`：约 `2.52M -> 3.79M logs/s`
-  - `persistent` 非持久化：约 `2.87M -> 4.28M logs/s`
+  - `persistent` 非持久化：约 `2.87M -> 4.11M logs/s`
 
 #### B. Persistent 本地 benchmark
 
@@ -80,14 +80,11 @@
   - append：`15.5k logs/s`
   - recover：`19.6k logs/s`
   - ack：`4 ms`
-- 对比本轮实施前基线：
-  - `payload=256` append：约 `51.7k -> 53.9k logs/s`
-  - `payload=5120` append：约 `18.5k -> 20.0k logs/s`
-  - `ack` 从数百毫秒降到个位数毫秒，收益主要来自 reclaim 不再重复扫描 segment
 
 补充说明：
 - direct persistent benchmark 受本机文件系统波动影响较大，append 数值不能只看单次运行
-- segment scan 流式化后，recover/open 扫描不再发生每条记录 heap decode，降低了大 segment 恢复期的内存抖动
+- `reclaim` 去重复扫描、append scratch buffer 复用、segment scan 流式化后，recover/open/ack 路径的收益更稳定
+- append 单次样本受本机文件系统波动影响较大，因此不再维护“单次跑数对历史单次跑数”的硬对比口径
 
 #### C. Producer Persistent 本地 benchmark
 
@@ -106,22 +103,11 @@
   - `produce_lps=9.7k`
   - `total_lps=9.6k`
   - `logs_dropped_total=0`
-- `kv + sls700 + 4 writers + persistent + 4 senders`：
-  - `produce_lps=35.3k`
-  - `total_lps=35.2k`
-  - `close_ms=7`
-  - `logs_dropped_total=0`
-- `kv + sls5120 + 4 writers + persistent + 4 senders`：
-  - `produce_lps=14.2k`
-  - `total_lps=14.0k`
-  - `logs_dropped_total=0`
 
 说明：
 - 该数据衡量 producer 持久化写入、入内存队列、builder、sender mock 的完整本地链路
 - `produce_lps` 是生产线程完成写入的速率，更适合排查本地生产端瓶颈
 - `total_lps` 会包含 `close()` 排空时间，更适合判断端到端 drain 能力
-- 多 sender 对 mock HTTP 下的 `produce_lps` 提升不稳定，说明当前本地生产端仍主要受 durable append、序列化持久化写入和文件系统影响
-- 多 sender 对 close drain 更直接有效，真实环境下如果网络/服务端 RTT 是瓶颈，收益会比 mock HTTP 更明显
 - scratch buffer 复用减少了大 payload 的分配抖动，尤其对 producer persistent sls700/sls5120 本地链路更明显
 - 如果 `logs_dropped_total > 0`，说明压测混入了本地 buffer 容量限制，不能作为极限吞吐结论
 
@@ -165,436 +151,182 @@
 
 ---
 
-## 2. 当前路径模型
+## 2. 当前实现状态
 
-### 2.1 Non-Persistent 路径
+### 2.1 Non-Persistent
 
-#### A. `kv/template` 默认快路径
+- `kv/template` 默认快路径已经与 `feat_improve_sdk_more` 的现有优化基线对齐。
+- `raw` 仍然是慢路径，仍走独立 raw queue 和 worker 消费。
+- 当前没有证据表明 non-persistent 默认路径需要继续做高风险结构性改造。
 
-- 入口：`ve_tls_producer_add_log_kv_*`
-- 特征：
-  - 默认命中 thread-local TLS batching
-  - 默认命中 `fast_builder=1`
-  - 默认命中 `fast_send=1`
-- 结果：
-  - 这是当前非持久化主业务路径
-  - 应尽量保持与 `feat_improve_sdk_more` 一致
+### 2.2 Persistent
 
-#### B. `raw` 路径
-
-- 入口：`ve_tls_producer_add_log_raw_*`
-- 特征：
-  - 仍走 `producer->mutex + raw queue`
-  - worker 逐条 `queue_pop`
-- 结果：
-  - 不是默认主路径
-  - 性能优化优先级低于 `kv/template`
-
-### 2.2 Persistent 路径
-
-#### A. `persistent kv`
-
-- 当前模型：
-  - `producer->mutex`
-  - `persistent append`
-  - `ingress queue`
-  - `builder merge`
-  - `send`
-- 现状：
-  - 已经修正了“逐条直接发”的问题
-  - 但仍存在 durable append 与 reclaim 的热点
-
-#### B. `persistent raw`
-
-- 当前模型：
-  - `producer->mutex`
-  - `persistent append`
-  - `raw queue`
-  - worker 逐条 `queue_pop`
-- 现状：
-  - 相对 `persistent kv` 更偏慢路径
-  - 但业务优先级低
-
-#### C. `persistent recover`
-
-- 当前模型：
-  - recover 从磁盘读取 raw record
-  - 重新进入 ingress 聚合链路
-  - 走正常发送/ack/reclaim
-- 现状：
-  - 语义已闭环
-  - 仍受 reclaim 和 lease 校验影响
+- `persistent kv` 已经具备完整的 append / send / ack / reclaim / recover 闭环。
+- durable append 已经脱离 `producer->mutex`，但 persistent store 仍通过 `persistent_mutex` 串行化。
+- `reclaim` 的“扫文件”成本已经显著下降，但触发模型仍偏保守。
+- `recover/open` 的扫描分配开销已经下降，但冷启动本质仍是线性扫描。
+- SDK 默认保持 `single sender`；multi-sender 只保留为隐藏能力，不作为默认优化方向。
 
 ---
 
-## 3. 性能热点重新定性
+## 3. 剩余瓶颈
 
-### 3.1 跨路径共性问题
+### 3.1 仍然值得关注的热点
 
-#### 问题 1：`producer->mutex` 全局大锁
+1. `reclaim` 触发频率仍偏高。
+   - 当前即使不再重复扫文件，`append` 前的容量检查仍可能频繁进入 reclaim 逻辑。
+   - 如果业务日志很碎、ack 推进频繁，这部分仍会形成稳定热成本。
 
-成立，但影响程度分路径不同。
+2. `open/recover` 仍然是 `O(total_bytes)`。
+   - 现在线性扫描已经更轻，但大目录冷启动、大量 segment 恢复仍然会受总数据量影响。
+   - 对移动端和嵌入式场景，这比 steady state 吞吐更可能成为用户感知问题。
 
-- 对 `persistent kv/raw`：影响大，因为每条日志都要在持锁状态下做 durable append。
-- 对 `non-persistent raw`：影响中等，因为仍走 raw queue。
-- 对 `non-persistent kv/template`：影响相对小，因为 thread-local batching 先吸收了大部分写入。
+3. lease 校验仍是关键正确性成本。
+   - append / ack / recover 仍保留逐次校验。
+   - 这保证了 takeover 语义，但也意味着 persistent steady append 热路径还有固定额外开销。
 
-结论：
-- 这是整体结构性问题。
-- 但不是第一步就要做“大拆锁”。
+4. `persistent raw` / `non-persistent raw` 仍是逐条消费。
+   - 如果后续业务大量走 raw，这会成为显性瓶颈。
+   - 如果 raw 继续只是少数路径，这项优先级仍可以放后。
 
-#### 问题 2：worker 逐条 pop raw queue
+5. key queue 结构优化仍然是条件性需求。
+   - 只有高 `hash_key` 基数、ordered send、per-key breaker / rate limit 明显打开时才值得投入。
 
-成立，但主要影响：
+### 3.2 当前不再是主矛盾的点
 
-- `non-persistent raw`
-- `persistent raw`
-
-对 `persistent kv` 和 `non-persistent kv/template` 不是主热点，因为它们主要走 ingress/builder。
-
-#### 问题 3：sender 慢路径等待模型
-
-只在 `non-fast sender` 下成立。
-
-- `fast_send` 路径已经是阻塞 `send_queue_pop(..., -1)`
-- 非 `fast_send` 路径才有 `send_queue_pop(..., 0)` 加 `cond_timedwait_ms(<=100ms)` 的轮询模型
-
-结论：
-- 这是慢路径和 feature-rich 路径的问题
-- 不是默认 persistent benchmark 的第一主因
-
-#### 问题 4：key queue/ready/delayed/idle 结构维护
-
-存在，但要分场景。
-
-- 无 `hash_key`、无 ordered/per-key 限流时，多数默认快路径会绕过大部分 key queue 热点
-- 有 `hash_key`、ordered、key breaker、key rate limit 时，这部分会变重
-
-结论：
-- 这是 feature 开关敏感的问题
-- 不是默认 persistent 单 key/无 key benchmark 的头号瓶颈
-
-### 3.2 Persistent 专属问题
-
-#### 问题 5：`reclaim_acked_segments()` 热路径过重
-
-这是当前最重的 persistent 问题。
-
-- `append` 前会触发 `ensure_capacity_for_append()`
-- `ack_range()` 后还会再次触发 reclaim
-- 每次 reclaim 会遍历旧 segment
-- 每个 segment 当前会：
-  - `path_stat`
-  - 扫文件拿 `valid_end/record_count`
-  - 再扫文件拿 `max_log_id`
-
-结论：
-- 这是 persistent 版本相对 `feat_improve_sdk_more` 真正新增的核心热路径问题
-- 优先级最高
-
-#### 问题 6：`lease` 校验粒度过细
-
-当前 `ve_tls_persistent_heartbeat_if_due()` 在判断是否需要 heartbeat 之前，先读 lease 文件做 `validate_current_lease()`。
-
-结论：
-- 这对正确性有帮助
-- 但在单 writer 持续 append 场景下偏重
-- 不能直接在 append/ack 热路径降频，否则会破坏 takeover 后旧 writer 立刻失效的语义
-- 后续若要继续优化，前提是引入更强的 owner 原语，例如文件锁或更便宜的 fencing 机制
-
-#### 问题 7：persistent 写入持有 `producer->mutex`
-
-当前 durable append 是在 `producer->mutex` 持锁区内完成。
-
-结论：
-- 这是 persistent 写路径相对 `feat_improve_sdk_more` 变重的主要结构性原因
-- 优先级仅次于 reclaim
+- multi-sender 不是当前 persistent 默认路径的主收益来源。
+- 大范围拆锁不是当前最合适的投入方向。
+- sender 慢路径等待模型不是 persistent 默认链路的主瓶颈。
 
 ---
 
-## 4. 推荐优化路线
+## 4. 剩余优化优先级
 
-### 4.1 第一阶段：先保住 Non-Persistent 基线
+### P1：`reclaim` 游标化 / 增量触发
 
-这部分优先在 `feat_improve_sdk_more` 上实施，再同步到 `persistent`。
+目标：
+- 让 reclaim 从“频繁检查”改成“只在 ack 前进或接近水位线时处理”。
 
-#### 优先做
+建议方向：
+- 维护 `next_reclaim_segment_id` 或等价游标。
+- 只有以下事件触发 reclaim：
+  - `acked_log_id` 前进
+  - `current_bytes/current_records/current_segments` 接近高水位
+  - `close/recover/open` 等明确需要收敛状态的时机
 
-1. 明确 benchmark 口径，分别测：
-   - `non-persistent kv/template`
-   - `non-persistent raw`
-   - `persistent kv`
-   - `persistent recover`
-2. 保证 `non-persistent kv/template` 的快路径不被 persistent 改动破坏。
-3. 对非 fast sender 做阻塞等待优化，减少 `send_queue_pop(..., 0)` 的轮询开销。
-4. 把 worker 的固定 `100ms` partial builder 等待改成动态 deadline。
+价值：
+- 这是当前最值得继续做、风险也最低的性能项。
+- 预期收益主要体现在 `persistent kv` steady append 和 `ack_range()` 路径。
 
-#### 暂不做
+### P2：冷启动 sidecar/meta 索引
 
-1. 不在这一阶段拆 producer 全局锁。
-2. 不在这一阶段重构 key queue 数据结构。
-3. 不优先处理 `non-persistent raw` 的细致优化。
+目标：
+- 减少 `open/recover` 对全量 segment 线性扫描的依赖。
 
-### 4.2 第二阶段：Persistent 内部热路径优化
-
-这部分只在 `persistent` 分支实施。
-
-#### P0：segment 元数据缓存化
-
-目标：让 reclaim 不再重复扫描 segment 文件。
-
-建议设计：
-
-- 在 `persistent` 内部维护 `segment_meta[]`
-- 每个 segment 维护：
-  - `segment_id`
+建议方向：
+- 为 closed segment 持久化 sidecar/meta/footer。
+- 记录至少这些信息：
   - `valid_end`
   - `record_count`
   - `max_log_id`
-  - `closed`
-- `open/recover` 时一次性重建
-- `append` 时增量更新 active segment
-- `rotate` 时固化 closed segment 元数据
-- `ack/reclaim` 时只查内存元数据，不再扫文件
+  - 校验/version 信息
+- 启动时优先读 sidecar，异常或损坏时回退到现有扫描修复。
 
-收益：
+价值：
+- 这是面向移动端、嵌入式、断点恢复场景的高价值优化。
+- 重点收益不是 steady throughput，而是冷启动和恢复时间。
 
-- 去掉 `append` 和 `ack_range` 上的双重全段扫描
-- 这是当前收益最高、风险最低的优化
+### P3：更强 owner 原语后再压 lease 成本
 
-#### P1：lease 校验优化改为“只优化 heartbeat，不优化写前 fencing”
+目标：
+- 在不破坏 takeover 语义的前提下，减少 append / ack / recover 的 lease 校验成本。
 
-目标：在不破坏多进程 takeover 正确性的前提下，减少重复 lease 读取。
+建议方向：
+- 先研究跨 Android / 嵌入式可用的 owner 原语。
+- 可选方向包括：
+  - 文件锁
+  - 更轻量的 fencing epoch
+  - 本地 owner state + 低频校验组合
 
-当前实施结论：
+价值：
+- 一旦做成，steady append 热路径还会有明显下降空间。
+- 但这是高收益高风险项，必须放在正确性验证之后。
 
-1. `heartbeat_if_due()` 在未到 heartbeat 时间前直接返回，不再做无意义 lease reload。
-2. append / ack / recover 仍保留写前或关键路径上的 lease 校验。
-3. append 热路径如果要继续降频，必须先引入文件锁或其他强 owner 原语，否则会让旧 writer 在 takeover 后继续写入。
+### P4：raw 路径批量 pop
 
-收益：
-
-- 去掉 heartbeat 未到期时的重复 lease reload
-- 保住 takeover 语义，不引入写时一致性回退
-
-#### P2：persistent append 脱离 `producer->mutex`
-
-目标：降低 persistent 写线程之间的串行化。
-
-建议设计：
-
-1. `next_id` 改原子递增
-2. `persistent` 自己持有内部锁
-3. producer 主锁只负责：
-   - queue/ingress
-   - flush signal
-   - builder 状态
-4. durable append 完成后再回到 producer 主锁推进内存队列
-
-收益：
-
-- 明显降低 `persistent kv/raw` 的写侧竞争
-- 风险远低于一次性拆成四把锁
-
-### 4.3 第三阶段：慢路径和结构性优化
-
-#### P3：raw 路径批量 pop
+目标：
+- 降低 `raw` 路径逐条 pop / 逐条打包的固定开销。
 
 适用路径：
-
 - `non-persistent raw`
 - `persistent raw`
 
-方法：
+前提：
+- 只有在 raw 业务占比真实抬升后，这项才值得前移。
 
-- worker 一次拿出 `N` 条 raw item，再批量处理
+### P5：key queue 结构优化
 
-#### P4：慢路径 sender 阻塞化
+目标：
+- 只在高 feature 配置下压低 key queue 维护开销。
 
-适用路径：
-
-- `non-fast sender`
-- 有 ordered/per-key 限流/熔断功能的路径
-
-方法：
-
-- 减少 `send_queue_pop(..., 0)` 轮询
-- 用更明确的条件驱动等待
-
-#### P5：key queue 数据结构再优化
-
-只在这些场景证明已成为热点后再做：
-
-- 高 `hash_key` 基数
-- ordered send
-- per-key breaker / rate limit
+前提：
+- 必须先有 benchmark 证明它已成为热点。
 
 ---
 
-## 5. 分支实施策略
+## 5. 当前明确不建议做的事
 
-### 5.1 先落 `feat_improve_sdk_more`
-
-以下改动优先在 `feat_improve_sdk_more` 做：
-
-1. `non-persistent kv/template` 的 benchmark 与回归基线固化
-2. non-fast sender 阻塞等待优化
-3. worker partial builder 的 `100ms` 等待优化
-4. 如果需要，对 `non-persistent raw` 做批量 pop，但优先级较低
-
-### 5.2 只落 `persistent`
-
-以下改动只在 `persistent` 分支做：
-
-1. segment 元数据缓存化
-2. reclaim 逻辑改造
-3. `heartbeat_if_due()` 级别的 lease 优化
-4. persistent append 从 `producer->mutex` 中拆出
-5. recover / ack / reclaim 的专属 benchmark 与真实环境验证
-
-### 5.3 两边同步原则
-
-1. 如果某个优化只改善 non-persistent 路径，就不要直接先改 `persistent`。
-2. 如果某个优化对两条路径都有收益，优先在 `feat_improve_sdk_more` 落地，再同步。
-3. `persistent` 分支永远不应该退化 non-persistent 默认路径。
+1. 不建议把 multi-sender 作为 persistent 默认能力。
+2. 不建议现在做四锁或更激进的大范围拆锁。
+3. 不建议在没有更强 owner 原语前，直接把 append 热路径 lease 校验降频。
+4. 不建议在没有业务证据前，优先投入 `raw` 路径深优化。
+5. 不建议在没有 benchmark 证据前，提前重构 key queue 数据结构。
 
 ---
 
-## 6. 验证矩阵
+## 6. 推荐实施顺序
 
-### 6.1 必须分开的 benchmark 维度
+1. 先做 `reclaim` 游标化 / 增量触发。
+2. 补“冷启动 / recover 耗时”专属 benchmark，并固化到文档。
+3. 基于 benchmark 再做 sidecar/meta 索引设计。
+4. 只有在跨平台 owner 原语可行时，再推进 lease 热路径进一步优化。
+5. 只有 raw 业务量抬升时，再做 `raw` 批量 pop。
+
+---
+
+## 7. 验证口径
+
+### 7.1 必须分开的 benchmark 维度
 
 1. `non-persistent kv/template`
-2. `non-persistent raw`
-3. `persistent kv`
-4. `persistent raw`
-5. `persistent recover`
+2. `persistent kv steady`
+3. `persistent recover`
+4. `persistent open/cold start`
+5. `persistent raw`（仅当 raw 成为重点路径）
 
-### 6.2 日志模板
+### 7.2 推荐保留的指标
 
-统一使用：
+1. `produce_lps`
+2. `total_lps`
+3. `recover_lps`
+4. `acked_log_id`
+5. `active_segment_id`
+6. `current_segments/current_records/current_bytes`
+7. `close_ms`
+8. `logs_dropped_total`
 
-1. `sls200`
-2. `sls700`
-3. `sls5120`
+### 7.3 评审时的判断规则
 
-### 6.3 输出指标
-
-统一要求输出：
-
-1. `enqueue_lps`
-2. `enqueue_lps_avg`
-3. `success_lps`
-4. `success_lps_avg`
-5. `enqueue_bytes_ps`
-6. `send_bytes_ps`
-7. `buffered_bytes`
-8. `acked_log_id`
-9. `active_segment_id`
-10. `current_segments/current_records/current_bytes`
-
-### 6.4 验证结论写法
-
-评审时必须区分：
-
-1. steady 生产速率
-2. drain 排空速率
-3. recover 回灌速率
-4. 是否因 ack 未推进导致 segment 暂不删除
+1. steady 生产速率和 drain 排空速率必须分开看。
+2. direct persistent benchmark 更适合看 append / recover / ack 的代码路径变化，不适合拿单次跑数做绝对结论。
+3. 真实环境 benchmark 只有在服务端成功响应稳定时，才可用于结论判断。
+4. 默认单 sender 是稳定性策略，不应被临时压测数据轻易推翻。
 
 ---
 
-## 7. 实施任务拆分
+## 8. 当前推荐结论
 
-### Task 1: 固化整体性能设计与分支策略
-
-**Files:**
-- Create: `docs/plans/2026-04-11-persistent-performance-optimization-plan.md`
-
-**Step 1: 固化路径分类**
-
-- `non-persistent kv/template`
-- `non-persistent raw`
-- `persistent kv`
-- `persistent raw`
-- `persistent recover`
-
-**Step 2: 固化分支策略**
-
-- non-persistent 优化先落 `feat_improve_sdk_more`
-- persistent 专属优化只落 `persistent`
-
-### Task 2: 先做 non-persistent 基线优化
-
-**Branch:**
-- First: `feat_improve_sdk_more`
-- Then: `persistent`
-
-**Focus:**
-
-1. 慢路径 sender 阻塞等待
-2. worker partial builder 等待模型优化
-3. 非持久化 benchmark 固化
-
-### Task 3: 再做 persistent P0/P1
-
-**Branch:**
-- `persistent`
-
-**Focus:**
-
-1. segment 元数据缓存化
-2. reclaim 去文件重复扫描
-3. lease 校验降频
-
-### Task 4: persistent P2
-
-**Branch:**
-- `persistent`
-
-**Focus:**
-
-1. `next_id` 原子化
-2. persistent 内部锁
-3. durable append 与 producer 主锁解耦
-
-### Task 5: 最后补慢路径优化
-
-**Branch:**
-- `feat_improve_sdk_more` for non-persistent shared path
-- `persistent` for persistent-only path
-
-**Focus:**
-
-1. raw queue 批量 pop
-2. key queue 结构优化（仅当 benchmark 证明需要）
-
----
-
-## 8. 推荐实施顺序
-
-1. 文档确认
-2. `feat_improve_sdk_more`：
-   - non-fast sender 等待优化
-   - worker `100ms` 等待优化
-   - non-persistent benchmark 固化
-3. 同步上述 non-persistent 优化到 `persistent`
-4. `persistent`：
-   - segment 元数据缓存化
-   - reclaim 改造
-   - `heartbeat_if_due()` 级别的 lease 优化
-5. `persistent`：
-   - append 脱离 `producer->mutex`
-6. 重新跑真实环境 benchmark 与 recover 验证
-
----
-
-## 9. 当前推荐结论
-
-1. 不建议第一步就全面拆成 `write_mutex/builder_mutex/send_mutex/persistent mutex` 四锁架构。
-2. 第一优先级不是 sender，也不是 key queue，而是 `persistent reclaim + lease validate`。
-3. `non-persistent raw` 不是默认业务路径，优先级应低于：
-   - `non-persistent kv/template`
-   - `persistent kv`
-   - `persistent recover`
-4. 所有 non-persistent 共享优化，优先落 `feat_improve_sdk_more`，再同步到 `persistent`。
+1. 当前最值得继续做的优化，不是多 sender，也不是大拆锁，而是 `reclaim` 触发模型优化。
+2. 如果要面向移动端和嵌入式长期演进，第二优先级应是冷启动 sidecar/meta 索引。
+3. lease 热路径继续优化必须建立在更强 owner 原语之上。
+4. `raw` 路径和 key queue 结构优化都应由 benchmark 和真实业务占比驱动，而不是预先投入。
