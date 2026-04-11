@@ -37,8 +37,8 @@
    - checkpoint 不再按单个成功 range 直接推进
    - producer 维护已完成 range 的有序集合，只在 `[acked+1 ... N]` 连续完成时推进 checkpoint
    - 支持发送完成乱序，避免 `2-3` 先成功时错误删除 `1` 对应的持久化数据
-   - `send_thread_count > 1` 可用于 persistent producer，真实收益取决于网络/HTTP 发送是否是瓶颈
-   - `ve_tls_persistent_real_bench` 已支持 `--send-thread-count N`，不再把真实 persistent benchmark 强制降到单 sender
+   - SDK 默认仍保持单 sender
+   - 多 sender 只作为隐藏能力保留，用于内部压测或特殊场景，不作为默认对外能力
 7. persistent append 大记录编码缓冲已复用：
    - 小记录继续使用 512B 栈缓冲
    - 大于 512B 的编码缓冲改为 persistent 实例级 scratch buffer
@@ -93,7 +93,7 @@
 
 使用 `ve_tls_bench --use-persistent 1`，mock HTTP，排除网络时延：
 
-- 当前 producer 已允许 persistent 模式配置多个 sender；如需验证纯生产端瓶颈，可以固定 `--send-thread-count 1`，如需验证发送排空能力，可以提高 sender 数
+- 当前 persistent 默认 benchmark 口径仍使用 `1 sender`
 - `kv + sls200 + 4 writers + persistent + 1 sender`：
   - `produce_lps=19.9k`
   - `total_lps=19.9k`
@@ -143,6 +143,7 @@
 - 2026-04-11 使用 `--send-thread-count 4` 做多 sender 短测时，`add_ok=29`、`success=0`、`fail=29`、`close_rc=0`
 - 失败错误为 `http request failed`，未进入服务端成功响应，不能作为 persistent 多 sender 正确性结论
 - 该失败更可能来自当前测试环境网络、endpoint 或真实配置，不影响本地 mock HTTP 与 UT 对多 sender checkpoint 语义的验证
+- 因此当前策略定为：默认单 sender，多 sender 仅保留为隐藏能力
 
 ---
 

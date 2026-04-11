@@ -135,11 +135,26 @@ if(VE_TLS_BUILD_TESTS)
         set_tests_properties(ve_tls_bench_phase_metrics PROPERTIES
             PASS_REGULAR_EXPRESSION "bench phases .*produce_ms=.*close_ms=.*produce_lps=.*"
         )
+        add_test(NAME ve_tls_bench_persistent_default_sender
+            COMMAND ve_tls_bench
+                --duration-s 1
+                --rate-lps 1
+                --message-bytes 200
+                --writer-threads 1
+                --write-mode kv
+                --use-persistent 1
+                --persistent-dir /tmp/ve_tls_bench_default_sender
+                --compress-type none
+                --close-timeout-ms 10000
+        )
+        set_tests_properties(ve_tls_bench_persistent_default_sender PROPERTIES
+            PASS_REGULAR_EXPRESSION "bench config .*persistent=1.*senders=1"
+        )
     endif()
     if(TARGET ve_tls_persistent_real_bench)
         add_test(NAME ve_tls_persistent_real_bench_help COMMAND ve_tls_persistent_real_bench --help)
         set_tests_properties(ve_tls_persistent_real_bench_help PROPERTIES
-            PASS_REGULAR_EXPRESSION "--write-mode;--profile;--report-interval-s;--send-thread-count"
+            PASS_REGULAR_EXPRESSION "--write-mode;--profile;--report-interval-s"
         )
     endif()
 endif()

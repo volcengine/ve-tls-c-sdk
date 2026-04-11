@@ -350,7 +350,7 @@ static void usage(const char * argv0) {
     fprintf(stderr,
         "       [--duration-s N] [--count N] [--rate-lps N] [--wait-ms N] [--close-timeout-ms N] [--message-bytes N]\n");
     fprintf(stderr,
-        "       [--persistent-dir DIR] [--run-id ID] [--recover-expect N] [--report-interval-s N] [--send-thread-count N]\n");
+        "       [--persistent-dir DIR] [--run-id ID] [--recover-expect N] [--report-interval-s N]\n");
     fprintf(stderr,
         "env fallback uses VE_TLS_ENDPOINT/REGION/TOPIC_ID/ACCESS_KEY_ID/ACCESS_KEY_SECRET and persistent settings\n");
 }
