@@ -38,6 +38,7 @@
    - producer 维护已完成 range 的有序集合，只在 `[acked+1 ... N]` 连续完成时推进 checkpoint
    - 支持发送完成乱序，避免 `2-3` 先成功时错误删除 `1` 对应的持久化数据
    - `send_thread_count > 1` 可用于 persistent producer，真实收益取决于网络/HTTP 发送是否是瓶颈
+   - `ve_tls_persistent_real_bench` 已支持 `--send-thread-count N`，不再把真实 persistent benchmark 强制降到单 sender
 7. persistent append 大记录编码缓冲已复用：
    - 小记录继续使用 512B 栈缓冲
    - 大于 512B 的编码缓冲改为 persistent 实例级 scratch buffer
@@ -137,6 +138,11 @@
 结论：
 - 这批优化没有打坏真实链路
 - 真实环境吞吐仍明显受网络与服务端窗口影响，不能用于判断本地代码路径极限
+
+补充记录：
+- 2026-04-11 使用 `--send-thread-count 4` 做多 sender 短测时，`add_ok=29`、`success=0`、`fail=29`、`close_rc=0`
+- 失败错误为 `http request failed`，未进入服务端成功响应，不能作为 persistent 多 sender 正确性结论
+- 该失败更可能来自当前测试环境网络、endpoint 或真实配置，不影响本地 mock HTTP 与 UT 对多 sender checkpoint 语义的验证
 
 ---
 

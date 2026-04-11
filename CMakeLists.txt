@@ -139,7 +139,7 @@ if(VE_TLS_BUILD_TESTS)
     if(TARGET ve_tls_persistent_real_bench)
         add_test(NAME ve_tls_persistent_real_bench_help COMMAND ve_tls_persistent_real_bench --help)
         set_tests_properties(ve_tls_persistent_real_bench_help PROPERTIES
-            PASS_REGULAR_EXPRESSION "--write-mode;--profile;--report-interval-s"
+            PASS_REGULAR_EXPRESSION "--write-mode;--profile;--report-interval-s;--send-thread-count"
         )
     endif()
 endif()

@@ -226,16 +226,6 @@ static void * close_thread_main(void * arg) {
     return NULL;
 }
 
-static int32_t effective_persistent_send_thread_count(int32_t configured) {
-    if (configured <= 0) {
-        return 1;
-    }
-    if (configured > 1) {
-        return 1;
-    }
-    return configured;
-}
-
 static int32_t target_profile_bytes(bench_profile profile, int32_t custom_bytes) {
     if (profile == BENCH_PROFILE_SLS200) return 200;
     if (profile == BENCH_PROFILE_SLS700) return 700;
@@ -360,7 +350,7 @@ static void usage(const char * argv0) {
     fprintf(stderr,
         "       [--duration-s N] [--count N] [--rate-lps N] [--wait-ms N] [--close-timeout-ms N] [--message-bytes N]\n");
     fprintf(stderr,
-        "       [--persistent-dir DIR] [--run-id ID] [--recover-expect N] [--report-interval-s N]\n");
+        "       [--persistent-dir DIR] [--run-id ID] [--recover-expect N] [--report-interval-s N] [--send-thread-count N]\n");
     fprintf(stderr,
         "env fallback uses VE_TLS_ENDPOINT/REGION/TOPIC_ID/ACCESS_KEY_ID/ACCESS_KEY_SECRET and persistent settings\n");
 }
@@ -540,6 +530,8 @@ int main(int argc, char ** argv) {
             recover_expect = (int32_t)atoi(argv[++i]);
         } else if (strcmp(argv[i], "--report-interval-s") == 0) {
             report_interval_s = (int32_t)atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--send-thread-count") == 0) {
+            send_thread_count = (int32_t)atoi(argv[++i]);
         } else {
             usage(argv[0]);
             conf_free(&conf);
@@ -574,7 +566,7 @@ int main(int argc, char ** argv) {
     cfg.security_token = get_str(&conf, "VE_TLS_SECURITY_TOKEN", NULL);
     cfg.compress_type = get_str(&conf, "VE_TLS_COMPRESS_TYPE", "lz4");
     cfg.hash_key = hash_key;
-    cfg.send_thread_count = effective_persistent_send_thread_count(send_thread_count);
+    cfg.send_thread_count = send_thread_count > 0 ? send_thread_count : 1;
     cfg.flush_interval_ms = flush_interval_ms;
     cfg.log_count_per_package = log_count_per_package;
     cfg.request_timeout_ms = get_i32(&conf, "VE_TLS_REQUEST_TIMEOUT_MS", 10000);
@@ -591,13 +583,6 @@ int main(int argc, char ** argv) {
     cfg.persistent_heartbeat_interval_ms = get_i32(&conf, "VE_TLS_PERSISTENT_HEARTBEAT_INTERVAL_MS", cfg.persistent_heartbeat_interval_ms);
     cfg.use_persistent = 1;
     cfg.persistent_file_path = persistent_dir;
-
-    if (cfg.send_thread_count != send_thread_count) {
-        fprintf(stderr,
-            "persistent benchmark forces send_thread_count=%d (configured=%d)\n",
-            (int)cfg.send_thread_count,
-            (int)send_thread_count);
-    }
 
     if (!cfg.endpoint || !cfg.region || !cfg.topic_id || !cfg.access_key_id || !cfg.access_key_secret) {
         fprintf(stderr, "missing required config: endpoint/region/topic_id/access_key_id/access_key_secret\n");
