@@ -36,9 +36,9 @@ typedef enum {
 
 typedef enum {
     BENCH_PROFILE_CUSTOM = 0,
-    BENCH_PROFILE_SLS200 = 1,
-    BENCH_PROFILE_SLS700 = 2,
-    BENCH_PROFILE_SLS5120 = 3
+    BENCH_PROFILE_TLS200 = 1,
+    BENCH_PROFILE_TLS700 = 2,
+    BENCH_PROFILE_TLS5120 = 3
 } bench_profile;
 
 static bench_state g_state;
@@ -61,7 +61,7 @@ typedef struct {
     volatile int done;
 } close_thread_ctx;
 
-static const char * k_sls_700_vals[] = {
+static const char * k_tls_700_vals[] = {
     "1abcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()_+abcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()_+abcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()_+",
     "2abcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()_+",
     "3abcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()_+",
@@ -74,7 +74,7 @@ static const char * k_sls_700_vals[] = {
     "0"
 };
 
-static const ve_tls_kv k_sls_200_base[] = {
+static const ve_tls_kv k_tls_200_base[] = {
     {"LogHub", "Real-time log collection and consumption"},
     {"Search/Analytics", "Query and real-time analysis"},
     {"Visualized", "dashboard and report functions"},
@@ -203,16 +203,16 @@ static const char * write_mode_str(bench_write_mode mode) {
 
 static bench_profile parse_profile(const char * s) {
     if (!s || s[0] == 0 || str_ieq(s, "custom")) return BENCH_PROFILE_CUSTOM;
-    if (str_ieq(s, "sls200")) return BENCH_PROFILE_SLS200;
-    if (str_ieq(s, "sls700")) return BENCH_PROFILE_SLS700;
-    if (str_ieq(s, "sls5120")) return BENCH_PROFILE_SLS5120;
+    if (str_ieq(s, "tls200")) return BENCH_PROFILE_TLS200;
+    if (str_ieq(s, "tls700")) return BENCH_PROFILE_TLS700;
+    if (str_ieq(s, "tls5120")) return BENCH_PROFILE_TLS5120;
     return BENCH_PROFILE_CUSTOM;
 }
 
 static const char * profile_str(bench_profile profile) {
-    if (profile == BENCH_PROFILE_SLS200) return "sls200";
-    if (profile == BENCH_PROFILE_SLS700) return "sls700";
-    if (profile == BENCH_PROFILE_SLS5120) return "sls5120";
+    if (profile == BENCH_PROFILE_TLS200) return "tls200";
+    if (profile == BENCH_PROFILE_TLS700) return "tls700";
+    if (profile == BENCH_PROFILE_TLS5120) return "tls5120";
     return "custom";
 }
 
@@ -227,9 +227,9 @@ static void * close_thread_main(void * arg) {
 }
 
 static int32_t target_profile_bytes(bench_profile profile, int32_t custom_bytes) {
-    if (profile == BENCH_PROFILE_SLS200) return 200;
-    if (profile == BENCH_PROFILE_SLS700) return 700;
-    if (profile == BENCH_PROFILE_SLS5120) return 5120;
+    if (profile == BENCH_PROFILE_TLS200) return 200;
+    if (profile == BENCH_PROFILE_TLS700) return 700;
+    if (profile == BENCH_PROFILE_TLS5120) return 5120;
     return custom_bytes > 0 ? custom_bytes : 256;
 }
 
@@ -247,7 +247,7 @@ static char * alloc_fill_bytes(size_t size, char seed) {
     return p;
 }
 
-static void build_sls700_kvs(ve_tls_kv * out, int * out_count, const char * run_id, const char * seq_str) {
+static void build_tls700_kvs(ve_tls_kv * out, int * out_count, const char * run_id, const char * seq_str) {
     int i;
     for (i = 0; i < 9; i++) {
         out[i].key = (i == 0) ? "content_key_1"
@@ -259,7 +259,7 @@ static void build_sls700_kvs(ve_tls_kv * out, int * out_count, const char * run_
             : (i == 6) ? "content_key_7"
             : (i == 7) ? "content_key_8"
             : "content_key_9";
-        out[i].value = k_sls_700_vals[i];
+        out[i].value = k_tls_700_vals[i];
     }
     out[9].key = "index";
     out[9].value = seq_str;
@@ -270,10 +270,10 @@ static void build_sls700_kvs(ve_tls_kv * out, int * out_count, const char * run_
     *out_count = 12;
 }
 
-static void build_sls200_kvs(ve_tls_kv * out, int * out_count, const char * run_id, const char * seq_str) {
+static void build_tls200_kvs(ve_tls_kv * out, int * out_count, const char * run_id, const char * seq_str) {
     int i;
     for (i = 0; i < 4; i++) {
-        out[i] = k_sls_200_base[i];
+        out[i] = k_tls_200_base[i];
     }
     out[4].key = "run_id";
     out[4].value = run_id;
@@ -292,7 +292,7 @@ static void build_custom_kvs(ve_tls_kv * out, int * out_count, const char * mess
     *out_count = 3;
 }
 
-static void build_sls5120_kvs(ve_tls_kv * out, int * out_count, const char * large_value, const char * run_id, const char * seq_str) {
+static void build_tls5120_kvs(ve_tls_kv * out, int * out_count, const char * large_value, const char * run_id, const char * seq_str) {
     out[0].key = "app";
     out[0].value = "ve-tls-persistent-bench";
     out[1].key = "level";
@@ -345,7 +345,7 @@ static void on_send_done_v2(
 
 static void usage(const char * argv0) {
     fprintf(stderr,
-        "usage: %s [--config FILE] [--mode steady|recover] [--write-mode kv|raw] [--profile custom|sls200|sls700|sls5120]\n",
+        "usage: %s [--config FILE] [--mode steady|recover] [--write-mode kv|raw] [--profile custom|tls200|tls700|tls5120]\n",
         argv0 ? argv0 : "ve_tls_persistent_real_bench");
     fprintf(stderr,
         "       [--duration-s N] [--count N] [--rate-lps N] [--wait-ms N] [--close-timeout-ms N] [--message-bytes N]\n");
@@ -448,7 +448,7 @@ int main(int argc, char ** argv) {
     ve_tls_kv kvs[16];
     char * message = NULL;
     ve_tls_log_template * raw_tpl = NULL;
-    char * sls5120_value = NULL;
+    char * tls5120_value = NULL;
     char seq_buf[32];
     int32_t duration_s = 10;
     int32_t count = 0;
@@ -601,10 +601,10 @@ int main(int argc, char ** argv) {
     }
 
     message = alloc_fill_bytes((size_t)message_bytes, 'x');
-    sls5120_value = alloc_fill_bytes((size_t)(message_bytes > 64 ? message_bytes - 64 : message_bytes), 's');
-    if (!message || !sls5120_value) {
+    tls5120_value = alloc_fill_bytes((size_t)(message_bytes > 64 ? message_bytes - 64 : message_bytes), 's');
+    if (!message || !tls5120_value) {
         free(message);
-        free(sls5120_value);
+        free(tls5120_value);
         conf_free(&conf);
         return 3;
     }
@@ -613,7 +613,7 @@ int main(int argc, char ** argv) {
     if (!producer) {
         fprintf(stderr, "ve_tls_producer_create failed\n");
         free(message);
-        free(sls5120_value);
+        free(tls5120_value);
         conf_free(&conf);
         return 4;
     }
@@ -626,7 +626,7 @@ int main(int argc, char ** argv) {
             fprintf(stderr, "ve_tls_template_create failed for raw mode\n");
             ve_tls_producer_destroy(producer);
             free(message);
-            free(sls5120_value);
+            free(tls5120_value);
             conf_free(&conf);
             return 4;
         }
@@ -643,7 +643,7 @@ int main(int argc, char ** argv) {
             if (raw_tpl) ve_tls_template_destroy(raw_tpl);
             ve_tls_producer_destroy(producer);
             free(message);
-            free(sls5120_value);
+            free(tls5120_value);
             conf_free(&conf);
             return 5;
         }
@@ -676,12 +676,12 @@ int main(int argc, char ** argv) {
                 raw_values[0] = message;
                 rc = ve_tls_template_add_values(raw_tpl, 0, 0, 0, raw_values, raw_value_lens, 1, 0);
             } else {
-                if (profile == BENCH_PROFILE_SLS200) {
-                    build_sls200_kvs(kvs, &kv_count, run_id, seq_buf);
-                } else if (profile == BENCH_PROFILE_SLS700) {
-                    build_sls700_kvs(kvs, &kv_count, run_id, seq_buf);
-                } else if (profile == BENCH_PROFILE_SLS5120) {
-                    build_sls5120_kvs(kvs, &kv_count, sls5120_value, run_id, seq_buf);
+                if (profile == BENCH_PROFILE_TLS200) {
+                    build_tls200_kvs(kvs, &kv_count, run_id, seq_buf);
+                } else if (profile == BENCH_PROFILE_TLS700) {
+                    build_tls700_kvs(kvs, &kv_count, run_id, seq_buf);
+                } else if (profile == BENCH_PROFILE_TLS5120) {
+                    build_tls5120_kvs(kvs, &kv_count, tls5120_value, run_id, seq_buf);
                 } else {
                     build_custom_kvs(kvs, &kv_count, message, run_id, seq_buf);
                 }
@@ -767,7 +767,7 @@ int main(int argc, char ** argv) {
         ve_tls_template_destroy(raw_tpl);
     }
     free(message);
-    free(sls5120_value);
+    free(tls5120_value);
     conf_free(&conf);
     return rc == VE_TLS_OK ? 0 : 6;
 }

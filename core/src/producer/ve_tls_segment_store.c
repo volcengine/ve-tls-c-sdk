@@ -108,6 +108,85 @@ static int write_full(ve_tls_platform * platform, ve_tls_file * file, const void
     return 0;
 }
 
+static int read_record_from_current_position(
+    ve_tls_platform * platform,
+    ve_tls_file * file,
+    uint64_t offset,
+    uint64_t limit,
+    unsigned char ** out_record,
+    size_t * out_size,
+    uint64_t * next_offset
+) {
+    unsigned char header[VE_TLS_PERSISTENT_RECORD_HEADER_SIZE];
+    uint32_t total_len;
+    unsigned char * record;
+    if (!platform || !file || !out_record || !out_size) {
+        return -1;
+    }
+    *out_record = NULL;
+    *out_size = 0;
+    if (limit != UINT64_MAX) {
+        if (offset > limit || limit - offset < VE_TLS_PERSISTENT_RECORD_HEADER_SIZE) {
+            return -1;
+        }
+    }
+    if (read_full(platform, file, header, sizeof(header)) != 0) {
+        return -1;
+    }
+    total_len = read_u32_le_local(header + 4);
+    if (total_len < VE_TLS_PERSISTENT_RECORD_HEADER_SIZE) {
+        return -1;
+    }
+    if (limit != UINT64_MAX && (uint64_t)total_len > limit - offset) {
+        return -1;
+    }
+    record = (unsigned char *)ve_tls_malloc(total_len);
+    if (!record) {
+        return -1;
+    }
+    memcpy(record, header, sizeof(header));
+    if (total_len > sizeof(header) &&
+        read_full(platform, file, record + sizeof(header), total_len - sizeof(header)) != 0) {
+        ve_tls_free(record);
+        return -1;
+    }
+    *out_record = record;
+    *out_size = total_len;
+    if (next_offset) {
+        *next_offset = offset + total_len;
+    }
+    return 0;
+}
+
+static int find_last_existing_segment(ve_tls_segment_store * store, uint32_t start_segment_id, uint32_t * out_segment_id) {
+    ve_tls_path_info info;
+    uint32_t segment_id;
+    uint32_t last_existing = 0;
+    char path[640];
+    if (!store || !store->platform || !out_segment_id || start_segment_id == 0) {
+        return -1;
+    }
+    segment_id = start_segment_id;
+    while (1) {
+        if (ve_tls_segment_store_get_segment_path(store, segment_id, path, sizeof(path)) != 0) {
+            return -1;
+        }
+        if (store->platform->path_stat(path, &info) != 0) {
+            return -1;
+        }
+        if (!info.exists) {
+            break;
+        }
+        last_existing = segment_id;
+        if (segment_id == UINT32_MAX) {
+            break;
+        }
+        segment_id++;
+    }
+    *out_segment_id = last_existing;
+    return 0;
+}
+
 int ve_tls_segment_store_get_segment_path(const ve_tls_segment_store * store, uint32_t segment_id, char * out, size_t out_size) {
     if (!store || !out || out_size == 0 || store->dir_path[0] == 0 || segment_id == 0) {
         return -1;
@@ -252,9 +331,7 @@ static int rotate_segment(ve_tls_segment_store * store) {
 }
 
 int ve_tls_segment_store_open(ve_tls_segment_store * store, const ve_tls_segment_store_options * options) {
-    ve_tls_path_info info;
-    uint32_t segment_id = 1;
-    char path[640];
+    uint32_t segment_id = 0;
     if (!store || !options || !options->platform || !options->dir_path || options->dir_path[0] == 0) {
         return -1;
     }
@@ -269,20 +346,18 @@ int ve_tls_segment_store_open(ve_tls_segment_store * store, const ve_tls_segment
     if (store->platform->path_mkdirs(store->dir_path, 0700) != 0) {
         return -1;
     }
-    while (1) {
-        if (ve_tls_segment_store_get_segment_path(store, segment_id, path, sizeof(path)) != 0) {
+    if (options->resume_segment_id > 0) {
+        if (find_last_existing_segment(store, options->resume_segment_id, &segment_id) != 0) {
             return -1;
         }
-        if (store->platform->path_stat(path, &info) != 0) {
-            return -1;
-        }
-        if (!info.exists) {
-            break;
-        }
-        segment_id++;
     }
-    if (segment_id > 1) {
-        segment_id--;
+    if (segment_id == 0) {
+        if (find_last_existing_segment(store, 1, &segment_id) != 0) {
+            return -1;
+        }
+    }
+    if (segment_id == 0) {
+        segment_id = 1;
     }
     return open_active_segment(store, segment_id);
 }
@@ -326,9 +401,6 @@ int ve_tls_segment_store_append(ve_tls_segment_store * store, const unsigned cha
 int ve_tls_segment_store_read(ve_tls_segment_store * store, uint32_t segment_id, uint64_t offset, unsigned char ** out_record, size_t * out_size, uint64_t * next_offset) {
     char path[640];
     ve_tls_file * file;
-    unsigned char header[VE_TLS_PERSISTENT_RECORD_HEADER_SIZE];
-    uint32_t total_len;
-    unsigned char * record;
     if (!store || !store->platform || !out_record || !out_size) {
         return -1;
     }
@@ -342,38 +414,62 @@ int ve_tls_segment_store_read(ve_tls_segment_store * store, uint32_t segment_id,
         return -1;
     }
     if (store->platform->file_seek(file, (int64_t)offset, VE_TLS_FILE_SEEK_SET) < 0 ||
-        read_full(store->platform, file, header, sizeof(header)) != 0) {
+        read_record_from_current_position(store->platform, file, offset, UINT64_MAX, out_record, out_size, next_offset) != 0) {
         store->platform->file_close(file);
-        return -1;
-    }
-    total_len = read_u32_le_local(header + 4);
-    if (total_len < VE_TLS_PERSISTENT_RECORD_HEADER_SIZE) {
-        store->platform->file_close(file);
-        return -1;
-    }
-    record = (unsigned char *)ve_tls_malloc(total_len);
-    if (!record) {
-        store->platform->file_close(file);
-        return -1;
-    }
-    memcpy(record, header, sizeof(header));
-    if (total_len > sizeof(header) &&
-        read_full(store->platform, file, record + sizeof(header), total_len - sizeof(header)) != 0) {
-        store->platform->file_close(file);
-        ve_tls_free(record);
         return -1;
     }
     store->platform->file_close(file);
-    *out_record = record;
-    *out_size = total_len;
-    if (next_offset) {
-        *next_offset = offset + total_len;
-    }
     return 0;
 }
 
 void ve_tls_segment_store_read_free(unsigned char * record) {
     ve_tls_free(record);
+}
+
+int ve_tls_segment_store_reader_open(ve_tls_segment_store * store, uint32_t segment_id, uint64_t segment_size, ve_tls_segment_reader * reader) {
+    char path[640];
+    if (!store || !store->platform || !reader) {
+        return -1;
+    }
+    memset(reader, 0, sizeof(*reader));
+    if (ve_tls_segment_store_get_segment_path(store, segment_id, path, sizeof(path)) != 0) {
+        return -1;
+    }
+    reader->file = store->platform->file_open(path, VE_TLS_FILE_OPEN_RDONLY, 0);
+    if (!reader->file) {
+        return -1;
+    }
+    reader->size = segment_size;
+    reader->offset = 0;
+    return 0;
+}
+
+int ve_tls_segment_store_reader_next(ve_tls_segment_store * store, ve_tls_segment_reader * reader, unsigned char ** out_record, size_t * out_size) {
+    uint64_t next_offset;
+    if (!store || !store->platform || !reader || !reader->file || !out_record || !out_size) {
+        return -1;
+    }
+    *out_record = NULL;
+    *out_size = 0;
+    if (reader->offset >= reader->size) {
+        return 0;
+    }
+    next_offset = reader->offset;
+    if (read_record_from_current_position(store->platform, reader->file, reader->offset, reader->size, out_record, out_size, &next_offset) != 0) {
+        return -1;
+    }
+    reader->offset = next_offset;
+    return 1;
+}
+
+void ve_tls_segment_store_reader_close(ve_tls_segment_store * store, ve_tls_segment_reader * reader) {
+    if (!store || !store->platform || !reader) {
+        return;
+    }
+    if (reader->file) {
+        store->platform->file_close(reader->file);
+    }
+    memset(reader, 0, sizeof(*reader));
 }
 
 int ve_tls_segment_store_repair_tail(ve_tls_segment_store * store, uint32_t segment_id, uint64_t * valid_end_offset) {

@@ -150,7 +150,7 @@ ve_tls_producer_destroy(p2);
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DVE_TLS_ENABLE_CURL=ON
 cmake --build build
 ./build/ve_tls_demo_real --config tools/real_demo.env --duration-s 60 --wait-ms 3000
-./build/ve_tls_persistent_real_bench --config tools/real_demo.env --mode steady --write-mode kv --profile sls700 --duration-s 30 --rate-lps 0 --report-interval-s 1 --wait-ms 120000
+./build/ve_tls_persistent_real_bench --config tools/real_demo.env --mode steady --write-mode kv --profile tls700 --duration-s 30 --rate-lps 0 --report-interval-s 1 --wait-ms 120000
 ```
 
 其中 `ve_tls_persistent_real_bench` 是适合直接部署到真实环境机器上跑的单个二进制：
@@ -158,7 +158,7 @@ cmake --build build
 - `--mode steady`：真实环境直发，测 persistent 开启后的 steady-state 吞吐
 - `--mode recover`：对已有 persistent 路径做 recover 回灌，测 backlog drain 吞吐
 - `--write-mode kv|raw`：`kv` 更贴近真实业务，`raw` 在这个二进制里走单字段模板快路径，更适合测 producer/persistent 极限
-- `--profile sls200|sls700|sls5120|custom`：固定日志模板；`custom` 时可配 `--message-bytes`
+- `--profile tls200|tls700|tls5120|custom`：固定日志模板；`custom` 时可配 `--message-bytes`
 - `--rate-lps 0`：表示不做节流，直接压满发送路径
 - `--report-interval-s 1`：每秒输出一次实时速率与 backlog
 - persistent 模式下会强制 `send_thread_count=1`；如果配置文件里写了更大的值，二进制会打印收敛结果

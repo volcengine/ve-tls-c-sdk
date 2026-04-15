@@ -8296,6 +8296,93 @@ static int test_persistent_recover_batches_multiple_logs_into_single_request(voi
     return 0;
 }
 
+typedef struct {
+    int count;
+    int64_t last_log_id;
+    size_t total_payload_size;
+} test_persistent_recover_counter;
+
+static int test_persistent_recover_count_record(
+    int64_t log_id,
+    const char * hash_key,
+    const unsigned char * payload,
+    size_t payload_size,
+    void * user
+) {
+    test_persistent_recover_counter * counter = (test_persistent_recover_counter *)user;
+    static const unsigned char expected_payload[] = "recover-stream";
+    if (!counter || !payload || payload_size != sizeof(expected_payload) - 1 ||
+        memcmp(payload, expected_payload, sizeof(expected_payload) - 1) != 0) {
+        return -1;
+    }
+    if (hash_key && hash_key[0] != 0) {
+        return -1;
+    }
+    counter->count++;
+    counter->last_log_id = log_id;
+    counter->total_payload_size += payload_size;
+    return 0;
+}
+
+static int test_persistent_recover_streams_single_segment_with_one_open(void) {
+    char dir[PATH_MAX];
+    ve_tls_config cfg;
+    ve_tls_persistent persistent;
+    ve_tls_persistent_options opt;
+    test_persistent_recover_counter counter;
+    static const unsigned char payload[] = "recover-stream";
+    if (make_temp_dir(dir, sizeof(dir)) != 0) {
+        return -1;
+    }
+    ve_tls_config_init(&cfg);
+    g_real_platform = cfg.platform;
+    g_fake_time = 1000;
+    cfg.platform.time_ms = test_fake_time_ms;
+    cfg.platform.sleep_ms = test_fake_sleep_ms;
+    cfg.platform.file_open = test_track_file_open;
+    memset(&persistent, 0, sizeof(persistent));
+    memset(&opt, 0, sizeof(opt));
+    memset(&counter, 0, sizeof(counter));
+    test_track_reset(dir);
+    opt.platform = &cfg.platform;
+    opt.dir_path = dir;
+    opt.instance_id = "test-instance";
+    opt.owner_id = "owner-a";
+    opt.owner_process_name = "proc-a";
+    opt.owner_pid = 123;
+    opt.segment_max_bytes = 4096;
+    opt.segment_max_records = 128;
+    opt.max_bytes = 8192;
+    opt.max_records = 512;
+    opt.max_segments = 8;
+    opt.now_ms = 1000;
+    opt.lease_timeout_ms = 1000;
+    opt.heartbeat_interval_ms = 1000;
+    opt.open_mode = VE_TLS_LEASE_OPEN_TAKEOVER_IF_STALE;
+    if (ve_tls_persistent_open(&persistent, &opt) != 0 ||
+        ve_tls_persistent_append(&persistent, 1, NULL, payload, sizeof(payload) - 1) != 0 ||
+        ve_tls_persistent_append(&persistent, 2, NULL, payload, sizeof(payload) - 1) != 0 ||
+        ve_tls_persistent_append(&persistent, 3, NULL, payload, sizeof(payload) - 1) != 0 ||
+        persistent.store.active_segment_id != 1) {
+        ve_tls_persistent_close(&persistent);
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    test_track_reset(dir);
+    if (ve_tls_persistent_recover(&persistent, test_persistent_recover_count_record, &counter) != 0 ||
+        counter.count != 3 ||
+        counter.last_log_id != 3 ||
+        counter.total_payload_size != (sizeof(payload) - 1) * 3 ||
+        g_track_segment_opens != 1) {
+        ve_tls_persistent_close(&persistent);
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    ve_tls_persistent_close(&persistent);
+    cleanup_persistent_dir(dir);
+    return 0;
+}
+
 static int test_persistent_sender_ack_updates_checkpoint_and_reclaims_closed_segment(void) {
     char dir[PATH_MAX];
     char seg1[PATH_MAX];
@@ -8584,6 +8671,55 @@ static int test_persistent_heartbeat_before_due_skips_lease_reload(void) {
     }
     test_track_reset(dir);
     if (ve_tls_persistent_heartbeat_if_due(&persistent, 0) != 0 || g_track_lease_opens != 0) {
+        ve_tls_persistent_close(&persistent);
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    ve_tls_persistent_close(&persistent);
+    cleanup_persistent_dir(dir);
+    return 0;
+}
+
+static int test_persistent_append_before_due_skips_lease_reload(void) {
+    char dir[PATH_MAX];
+    ve_tls_persistent_options opt;
+    ve_tls_persistent persistent;
+    ve_tls_config cfg;
+    static const unsigned char payload[] = "123456789";
+    if (make_temp_dir(dir, sizeof(dir)) != 0) {
+        return -1;
+    }
+    ve_tls_config_init(&cfg);
+    g_real_platform = cfg.platform;
+    g_fake_time = 1000;
+    cfg.platform.time_ms = test_fake_time_ms;
+    cfg.platform.sleep_ms = test_fake_sleep_ms;
+    cfg.platform.file_open = test_track_file_open;
+    memset(&opt, 0, sizeof(opt));
+    memset(&persistent, 0, sizeof(persistent));
+    test_track_reset(dir);
+    opt.platform = &cfg.platform;
+    opt.dir_path = dir;
+    opt.instance_id = "test-instance";
+    opt.owner_id = "owner-a";
+    opt.owner_process_name = "proc-a";
+    opt.owner_pid = 123;
+    opt.segment_max_bytes = 1024;
+    opt.segment_max_records = 128;
+    opt.max_bytes = 4096;
+    opt.max_records = 512;
+    opt.max_segments = 8;
+    opt.now_ms = 1000;
+    opt.lease_timeout_ms = 1000;
+    opt.heartbeat_interval_ms = 100;
+    opt.open_mode = VE_TLS_LEASE_OPEN_TAKEOVER_IF_STALE;
+    if (ve_tls_persistent_open(&persistent, &opt) != 0) {
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    test_track_reset(dir);
+    if (ve_tls_persistent_append(&persistent, 1, NULL, payload, sizeof(payload) - 1) != 0 ||
+        g_track_lease_opens != 0) {
         ve_tls_persistent_close(&persistent);
         cleanup_persistent_dir(dir);
         return -1;
@@ -8953,6 +9089,92 @@ static int test_persistent_reclaim_cursor_advances_with_ack_progress(void) {
         return -1;
     }
     ve_tls_persistent_close(&persistent);
+    cleanup_persistent_dir(dir);
+    return 0;
+}
+
+static int test_persistent_reopen_uses_last_segment_after_reclaim_gap(void) {
+    char dir[PATH_MAX];
+    char seg1[PATH_MAX];
+    char seg2[PATH_MAX];
+    char seg3[PATH_MAX];
+    ve_tls_config cfg;
+    ve_tls_persistent first;
+    ve_tls_persistent reopened;
+    ve_tls_persistent_options opt;
+    ve_tls_path_info info1;
+    ve_tls_path_info info2;
+    ve_tls_path_info info3;
+    static const unsigned char payload[] = "123456789";
+    if (make_temp_dir(dir, sizeof(dir)) != 0) {
+        return -1;
+    }
+    join_path(seg1, sizeof(seg1), dir, "seg-000001.log");
+    join_path(seg2, sizeof(seg2), dir, "seg-000002.log");
+    join_path(seg3, sizeof(seg3), dir, "seg-000003.log");
+    ve_tls_config_init(&cfg);
+    g_real_platform = cfg.platform;
+    g_fake_time = 1000;
+    cfg.platform.time_ms = test_fake_time_ms;
+    cfg.platform.sleep_ms = test_fake_sleep_ms;
+    memset(&first, 0, sizeof(first));
+    memset(&reopened, 0, sizeof(reopened));
+    memset(&opt, 0, sizeof(opt));
+    memset(&info1, 0, sizeof(info1));
+    memset(&info2, 0, sizeof(info2));
+    memset(&info3, 0, sizeof(info3));
+    opt.platform = &cfg.platform;
+    opt.dir_path = dir;
+    opt.instance_id = "test-instance";
+    opt.owner_id = "owner-a";
+    opt.owner_process_name = "proc-a";
+    opt.owner_pid = 123;
+    opt.segment_max_bytes = 40;
+    opt.segment_max_records = 128;
+    opt.max_bytes = 4096;
+    opt.max_records = 512;
+    opt.max_segments = 8;
+    opt.now_ms = 1000;
+    opt.lease_timeout_ms = 1000;
+    opt.heartbeat_interval_ms = 1000;
+    opt.open_mode = VE_TLS_LEASE_OPEN_TAKEOVER_IF_STALE;
+    if (ve_tls_persistent_open(&first, &opt) != 0 ||
+        ve_tls_persistent_append(&first, 1, NULL, payload, sizeof(payload) - 1) != 0 ||
+        ve_tls_persistent_append(&first, 2, NULL, payload, sizeof(payload) - 1) != 0 ||
+        first.store.active_segment_id != 2 ||
+        ve_tls_persistent_ack_range(&first, 1, 1) != 0 ||
+        ve_tls_persistent_flush(&first) != 0) {
+        ve_tls_persistent_close(&first);
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    ve_tls_persistent_close(&first);
+    if (cfg.platform.path_stat(seg1, &info1) != 0 ||
+        cfg.platform.path_stat(seg2, &info2) != 0 ||
+        info1.exists ||
+        !info2.exists) {
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    g_fake_time += 10;
+    opt.now_ms = g_fake_time;
+    if (ve_tls_persistent_open(&reopened, &opt) != 0 ||
+        reopened.store.active_segment_id != 2 ||
+        reopened.current_segments != 1 ||
+        reopened.current_records != 1 ||
+        ve_tls_persistent_append(&reopened, 3, NULL, payload, sizeof(payload) - 1) != 0 ||
+        reopened.store.active_segment_id != 3 ||
+        cfg.platform.path_stat(seg1, &info1) != 0 ||
+        cfg.platform.path_stat(seg2, &info2) != 0 ||
+        cfg.platform.path_stat(seg3, &info3) != 0 ||
+        info1.exists ||
+        !info2.exists ||
+        !info3.exists) {
+        ve_tls_persistent_close(&reopened);
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    ve_tls_persistent_close(&reopened);
     cleanup_persistent_dir(dir);
     return 0;
 }
@@ -9767,17 +9989,20 @@ int main(void) {
     RUN(130, test_producer_create_with_persistent_adds_disk_record());
     RUN(131, test_persistent_recover_requeues_hash_key_record());
     RUN(145, test_persistent_recover_batches_multiple_logs_into_single_request());
+    RUN(160, test_persistent_recover_streams_single_segment_with_one_open());
     RUN(132, test_persistent_sender_ack_updates_checkpoint_and_reclaims_closed_segment());
     RUN(133, test_persistent_manager_drop_updates_checkpoint_and_reclaims_closed_segment());
     RUN(134, test_persistent_overflow_reject_new_returns_drop_error());
     RUN(135, test_persistent_overflow_block_times_out());
     RUN(136, test_persistent_heartbeat_updates_lease());
     RUN(148, test_persistent_heartbeat_before_due_skips_lease_reload());
+    RUN(159, test_persistent_append_before_due_skips_lease_reload());
     RUN(137, test_persistent_takeover_invalidates_old_writer());
     RUN(149, test_persistent_ack_range_reclaims_without_rescanning_segments());
     RUN(156, test_persistent_ack_range_throttles_checkpoint_persistence());
     RUN(157, test_persistent_ack_range_defers_reclaim_until_flush());
     RUN(155, test_persistent_reclaim_cursor_advances_with_ack_progress());
+    RUN(158, test_persistent_reopen_uses_last_segment_after_reclaim_gap());
     RUN(138, test_persistent_overflow_drop_newest_sample_uses_sample_rate());
     RUN(139, test_add_log_with_id_returns_monotonic_ids());
     RUN(140, test_persistent_recover_repairs_truncated_tail_record());

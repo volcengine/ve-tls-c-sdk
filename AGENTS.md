@@ -66,7 +66,7 @@
   - VE_TLS_ENABLE_ASAN / VE_TLS_ENABLE_UBSAN （Sanitizer）
   - VE_TLS_ENABLE_COVERAGE （Clang 覆盖率）
 - Built tools/demos (targets defined in root CMakeLists.txt , discover before referencing):
-  - ve_tls_demo , ve_tls_demo_real , ve_tls_bench , ve_tls_gen_raw_log , ve_tls_perf_sls , ve_tls_benchmark_sls
+  - ve_tls_demo , ve_tls_demo_real , ve_tls_bench , ve_tls_gen_raw_log , ve_tls_perf_tls , ve_tls_benchmark_tls
   - Test: ve_tls_test_basic
 ## Workflow Standard (apply to most coding/UT/debug tasks)
 1. Proceed best-effort (only ask questions if truly ambiguous).

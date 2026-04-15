@@ -94,11 +94,11 @@ if(VE_TLS_BUILD_TOOLS AND NOT ANDROID)
     add_executable(ve_tls_gen_raw_log tools/gen_raw_log.c)
     target_link_libraries(ve_tls_gen_raw_log PRIVATE ve_tls_core)
 
-    add_executable(ve_tls_perf_sls tools/perf_sls.c)
-    target_link_libraries(ve_tls_perf_sls PRIVATE ve_tls_core)
+    add_executable(ve_tls_perf_tls tools/perf_tls.c)
+    target_link_libraries(ve_tls_perf_tls PRIVATE ve_tls_core)
 
-    add_executable(ve_tls_benchmark_sls tools/benchmark_sls.c)
-    target_link_libraries(ve_tls_benchmark_sls PRIVATE ve_tls_core)
+    add_executable(ve_tls_benchmark_tls tools/benchmark_tls.c)
+    target_link_libraries(ve_tls_benchmark_tls PRIVATE ve_tls_core)
 
     add_executable(ve_tls_persistent_bench tools/persistent_bench.c)
     target_link_libraries(ve_tls_persistent_bench PRIVATE ve_tls_core)
@@ -118,7 +118,7 @@ if(VE_TLS_BUILD_TESTS)
     if(TARGET ve_tls_bench)
         add_test(NAME ve_tls_bench_help COMMAND ve_tls_bench --help)
         set_tests_properties(ve_tls_bench_help PROPERTIES
-            PASS_REGULAR_EXPRESSION "--use-persistent 0\\|1.*--profile sls200\\|sls700\\|sls5120"
+            PASS_REGULAR_EXPRESSION "--use-persistent 0\\|1.*--profile tls200\\|tls700\\|tls5120"
         )
         add_test(NAME ve_tls_bench_phase_metrics
             COMMAND ve_tls_bench

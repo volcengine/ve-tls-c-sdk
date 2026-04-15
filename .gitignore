@@ -9,9 +9,9 @@ out/
 *.dll
 *.exe
 *.log
-*.tmp
+*.tmpq
 .vscode/
 .idea/
 cospec/
-docs/
+**/docs/*
 build_*/

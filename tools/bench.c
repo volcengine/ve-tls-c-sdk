@@ -107,15 +107,15 @@ static const char * queue_full_policy_str(ve_tls_send_queue_full_policy p) {
 
 static int parse_profile(const char * s, int32_t * message_bytes) {
     if (!s || !message_bytes) return -1;
-    if (strcasecmp(s, "sls200") == 0) {
+    if (strcasecmp(s, "tls200") == 0) {
         *message_bytes = 200;
         return 0;
     }
-    if (strcasecmp(s, "sls700") == 0) {
+    if (strcasecmp(s, "tls700") == 0) {
         *message_bytes = 700;
         return 0;
     }
-    if (strcasecmp(s, "sls5120") == 0) {
+    if (strcasecmp(s, "tls5120") == 0) {
         *message_bytes = 5120;
         return 0;
     }
@@ -145,7 +145,7 @@ static void usage(const char * argv0) {
     fprintf(stderr, "usage: %s [--duration-s S] [--rate-lps N] [--message-bytes N] [--writer-threads N] [--flush-every-n N] [--close-timeout-ms N] [--use-global-env 0|1] [--global-senders N]\n", argv0 ? argv0 : "ve_tls_bench");
     fprintf(stderr, "optional: [--write-mode raw|kv|template] [--template-mode on|off] [--send-thread-count N] [--compress-type none|lz4|zlib]\n");
     fprintf(stderr, "optional: [--queue-full-policy block|drop|drop_sampled] [--send-queue-block-timeout-ms N] [--max-buffer-bytes N] [--send-queue-size N] [--flush-interval-ms N] [--log-count-per-package N]\n");
-    fprintf(stderr, "optional: [--use-persistent 0|1] [--persistent-dir PATH] [--profile sls200|sls700|sls5120]\n");
+    fprintf(stderr, "optional: [--use-persistent 0|1] [--persistent-dir PATH] [--profile tls200|tls700|tls5120]\n");
 }
 
 static uint64_t g_sent = 0;

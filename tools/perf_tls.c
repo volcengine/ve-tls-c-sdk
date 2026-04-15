@@ -130,7 +130,7 @@ static int http_ok_do(ve_tls_http_client * client, const ve_tls_http_request * r
     (void)req;
     if (!resp) return -1;
     resp->status_code = 200;
-    resp->request_id = strdup("rid-sls-mock");
+    resp->request_id = strdup("rid-tls-mock");
     resp->body = NULL;
     resp->body_size = 0;
     return 0;
@@ -214,14 +214,14 @@ static void * writer_main(void * arg) {
     return NULL;
 }
 
-static const ve_tls_kv k_sls_200_kvs[] = {
+static const ve_tls_kv k_tls_200_kvs[] = {
     {"Interconnection", "Grafana and JDBC/SQL92"},
     {"LogHub", "Real-time log collection and consumption"},
     {"Search/Analytics", "Query and real-time analysis"},
     {"Visualized", "dashboard and report functions"}
 };
 
-static const ve_tls_kv k_sls_700_kvs[] = {
+static const ve_tls_kv k_tls_700_kvs[] = {
     {"content_key_1", "1abcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()_+abcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()_+abcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()_+"},
     {"content_key_2", "2abcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()_+"},
     {"content_key_3", "3abcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()_+"},
@@ -234,7 +234,7 @@ static const ve_tls_kv k_sls_700_kvs[] = {
     {"index", "0"}
 };
 
-static const ve_tls_kv k_sls_tags[] = {
+static const ve_tls_kv k_tls_tags[] = {
     {"tag_1", "val_1"},
     {"tag_2", "val_2"},
     {"tag_3", "val_3"},
@@ -247,7 +247,7 @@ static double tv_to_s(struct timeval tv) {
 }
 
 static void usage(const char * argv0) {
-    fprintf(stderr, "usage: %s [--mode mock|curl] [--config path] [--duration-s S] [--rate-lps N] [--writers N] [--profile sls200|sls700] [--close-timeout-ms M]\n", argv0 ? argv0 : "ve_tls_perf_sls");
+    fprintf(stderr, "usage: %s [--mode mock|curl] [--config path] [--duration-s S] [--rate-lps N] [--writers N] [--profile tls200|tls700] [--close-timeout-ms M]\n", argv0 ? argv0 : "ve_tls_perf_tls");
 }
 
 int main(int argc, char ** argv) {
@@ -256,7 +256,7 @@ int main(int argc, char ** argv) {
     int32_t duration_s = 60;
     int64_t rate_lps = 100000;
     int32_t writers = 1;
-    const char * profile = "sls700";
+    const char * profile = "tls700";
     int32_t close_timeout_ms = 60000;
 
     for (int i = 1; i < argc; i++) {
@@ -312,19 +312,19 @@ int main(int argc, char ** argv) {
 
     const ve_tls_kv * kvs = NULL;
     size_t kv_count = 0;
-    if (!profile || strcmp(profile, "sls700") == 0) {
-        kvs = k_sls_700_kvs;
-        kv_count = sizeof(k_sls_700_kvs) / sizeof(k_sls_700_kvs[0]);
-    } else if (strcmp(profile, "sls200") == 0) {
-        kvs = k_sls_200_kvs;
-        kv_count = sizeof(k_sls_200_kvs) / sizeof(k_sls_200_kvs[0]);
+    if (!profile || strcmp(profile, "tls700") == 0) {
+        kvs = k_tls_700_kvs;
+        kv_count = sizeof(k_tls_700_kvs) / sizeof(k_tls_700_kvs[0]);
+    } else if (strcmp(profile, "tls200") == 0) {
+        kvs = k_tls_200_kvs;
+        kv_count = sizeof(k_tls_200_kvs) / sizeof(k_tls_200_kvs[0]);
     } else {
         fprintf(stderr, "invalid profile: %s\n", profile);
         conf_free(&conf);
         return 3;
     }
-    const ve_tls_kv * tags = k_sls_tags;
-    size_t tag_count = sizeof(k_sls_tags) / sizeof(k_sls_tags[0]);
+    const ve_tls_kv * tags = k_tls_tags;
+    size_t tag_count = sizeof(k_tls_tags) / sizeof(k_tls_tags[0]);
 
     ve_tls_config cfg;
     ve_tls_config_init(&cfg);
@@ -478,7 +478,7 @@ int main(int argc, char ** argv) {
     double raw_kb_s = (run_s > 0) ? ((double)m0.bytes_enqueued_total / 1024.0 / run_s) : 0.0;
 
     printf(
-        "slsperf mode=%s profile=%s target_lps=%lld writers=%d run_s=%.3f wall_s=%.3f close_rc=%d "
+        "tlsperf mode=%s profile=%s target_lps=%lld writers=%d run_s=%.3f wall_s=%.3f close_rc=%d "
         "ok=%llu drop=%llu other=%llu logs_enq=%llu logs_drop=%llu bytes_enq=%llu bytes_drop=%llu req=%llu failed=%llu "
         "enq_lps=%.2f us_per_log=%.2f raw_kb_s=%.2f user_s=%.3f sys_s=%.3f cpu_cores=%.2f cpu_pct_1=%.2f cpu_pct_total=%.2f rss_mb=%.2f\n",
         mode,

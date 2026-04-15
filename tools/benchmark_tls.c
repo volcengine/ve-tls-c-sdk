@@ -53,7 +53,7 @@ static int http_ok_do(ve_tls_http_client * client, const ve_tls_http_request * r
     (void)req;
     if (!resp) return -1;
     resp->status_code = 200;
-    resp->request_id = strdup("rid-sls-mock");
+    resp->request_id = strdup("rid-tls-mock");
     resp->body = NULL;
     resp->body_size = 0;
     return 0;
@@ -97,7 +97,7 @@ static void on_send_done(
     }
 }
 
-static const char * k_sls_700_vals[] = {
+static const char * k_tls_700_vals[] = {
     "1abcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()_+abcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()_+abcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()_+",
     "2abcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()_+",
     "3abcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()_+",
@@ -110,20 +110,20 @@ static const char * k_sls_700_vals[] = {
     "0"
 };
 
-static void fill_sls700_kvs(ve_tls_kv * out, const char * index_str) {
-    out[0].key = "content_key_1"; out[0].value = k_sls_700_vals[0];
-    out[1].key = "content_key_2"; out[1].value = k_sls_700_vals[1];
-    out[2].key = "content_key_3"; out[2].value = k_sls_700_vals[2];
-    out[3].key = "content_key_4"; out[3].value = k_sls_700_vals[3];
-    out[4].key = "content_key_5"; out[4].value = k_sls_700_vals[4];
-    out[5].key = "content_key_6"; out[5].value = k_sls_700_vals[5];
-    out[6].key = "content_key_7"; out[6].value = k_sls_700_vals[6];
-    out[7].key = "content_key_8"; out[7].value = k_sls_700_vals[7];
-    out[8].key = "content_key_9"; out[8].value = k_sls_700_vals[8];
-    out[9].key = "index"; out[9].value = index_str ? index_str : k_sls_700_vals[9];
+static void fill_tls700_kvs(ve_tls_kv * out, const char * index_str) {
+    out[0].key = "content_key_1"; out[0].value = k_tls_700_vals[0];
+    out[1].key = "content_key_2"; out[1].value = k_tls_700_vals[1];
+    out[2].key = "content_key_3"; out[2].value = k_tls_700_vals[2];
+    out[3].key = "content_key_4"; out[3].value = k_tls_700_vals[3];
+    out[4].key = "content_key_5"; out[4].value = k_tls_700_vals[4];
+    out[5].key = "content_key_6"; out[5].value = k_tls_700_vals[5];
+    out[6].key = "content_key_7"; out[6].value = k_tls_700_vals[6];
+    out[7].key = "content_key_8"; out[7].value = k_tls_700_vals[7];
+    out[8].key = "content_key_9"; out[8].value = k_tls_700_vals[8];
+    out[9].key = "index"; out[9].value = index_str ? index_str : k_tls_700_vals[9];
 }
 
-static void fill_sls200_kvs(ve_tls_kv * out) {
+static void fill_tls200_kvs(ve_tls_kv * out) {
     out[0].key = "LogHub"; out[0].value = "Real-time log collection and consumption";
     out[1].key = "Search/Analytics"; out[1].value = "Query and real-time analysis";
     out[2].key = "Visualized"; out[2].value = "dashboard and report functions";
@@ -141,10 +141,10 @@ int main(int argc, char ** argv) {
     if (argc >= 4) {
         profile = argv[3];
     } else {
-        profile = env_str("SLS_BENCH_PROFILE", "both");
+        profile = env_str("TLS_BENCH_PROFILE", "both");
     }
-    const char * mode = env_str("SLS_BENCH_MODE", "mock");
-    fprintf(stderr, "ve_tls_benchmark_sls build=%s %s profile=%s mode=%s\n", __DATE__, __TIME__, profile ? profile : "(null)", mode ? mode : "(null)");
+    const char * mode = env_str("TLS_BENCH_MODE", "mock");
+    fprintf(stderr, "ve_tls_benchmark_tls build=%s %s profile=%s mode=%s\n", __DATE__, __TIME__, profile ? profile : "(null)", mode ? mode : "(null)");
 
     ve_tls_config cfg;
     ve_tls_config_init(&cfg);
@@ -173,17 +173,17 @@ int main(int argc, char ** argv) {
         return 2;
     }
 
-    cfg.max_buffer_bytes = env_i32("SLS_MAX_BUFFER_BYTES", 64 * 1024 * 1024);
-    cfg.log_bytes_per_package = env_i32("SLS_PACKET_LOG_BYTES", 4 * 1024 * 1024);
-    cfg.log_count_per_package = env_i32("SLS_PACKET_LOG_COUNT", 4096);
-    cfg.flush_interval_ms = env_i32("SLS_PACKET_TIMEOUT_MS", 3000);
-    cfg.send_thread_count = env_i32("SLS_SEND_THREADS", 16);
-    cfg.pack_thread_count = env_i32("SLS_PACK_THREADS", cfg.send_thread_count);
+    cfg.max_buffer_bytes = env_i32("TLS_MAX_BUFFER_BYTES", 64 * 1024 * 1024);
+    cfg.log_bytes_per_package = env_i32("TLS_PACKET_LOG_BYTES", 4 * 1024 * 1024);
+    cfg.log_count_per_package = env_i32("TLS_PACKET_LOG_COUNT", 4096);
+    cfg.flush_interval_ms = env_i32("TLS_PACKET_TIMEOUT_MS", 3000);
+    cfg.send_thread_count = env_i32("TLS_SEND_THREADS", 16);
+    cfg.pack_thread_count = env_i32("TLS_PACK_THREADS", cfg.send_thread_count);
     cfg.buffer_full_policy = VE_TLS_BUFFER_FULL_DROP;
 
-    int use_lz4 = env_i32("SLS_COMPRESS_LZ4", 1);
+    int use_lz4 = env_i32("TLS_COMPRESS_LZ4", 1);
     cfg.compress_type = use_lz4 ? "lz4" : "none";
-    fprintf(stderr, "ve_tls_benchmark_sls cfg: lps=%d send_s=%d send_threads=%d pack_threads=%d compress=%s ordered_send=%d\n",
+    fprintf(stderr, "ve_tls_benchmark_tls cfg: lps=%d send_s=%d send_threads=%d pack_threads=%d compress=%s ordered_send=%d\n",
             logs_per_sec, send_sec, (int)cfg.send_thread_count, (int)cfg.pack_thread_count, cfg.compress_type ? cfg.compress_type : "(null)", (int)cfg.ordered_send);
 
     int32_t est_q = 0;
@@ -224,15 +224,15 @@ int main(int argc, char ** argv) {
         for (int j = 0; j < logs_per_sec; j++) {
             char index_str[32];
             snprintf(index_str, sizeof(index_str), "%d", i * logs_per_sec + j);
-            if (!profile || strcmp(profile, "both") == 0 || strcmp(profile, "sls700") == 0) {
+            if (!profile || strcmp(profile, "both") == 0 || strcmp(profile, "tls700") == 0) {
                 ve_tls_kv kvs[10];
-                fill_sls700_kvs(kvs, index_str);
+                fill_tls700_kvs(kvs, index_str);
                 ve_tls_result r = ve_tls_producer_add_log_kv(p, 0, kvs, 10, 0);
                 if (r == VE_TLS_OK) ok++; else if (r == VE_TLS_DROP_ERROR) drop++; else other++;
             }
-            if (!profile || strcmp(profile, "both") == 0 || strcmp(profile, "sls200") == 0) {
+            if (!profile || strcmp(profile, "both") == 0 || strcmp(profile, "tls200") == 0) {
                 ve_tls_kv kvs[4];
-                fill_sls200_kvs(kvs);
+                fill_tls200_kvs(kvs);
                 ve_tls_result r = ve_tls_producer_add_log_kv(p, 0, kvs, 4, 0);
                 if (r == VE_TLS_OK) ok++; else if (r == VE_TLS_DROP_ERROR) drop++; else other++;
             }

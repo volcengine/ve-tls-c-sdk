@@ -219,6 +219,23 @@ static int validate_current_lease(ve_tls_persistent * persistent) {
     return 0;
 }
 
+static int validate_current_lease_if_needed(ve_tls_persistent * persistent) {
+    int64_t now_ms;
+    if (!persistent) {
+        return -1;
+    }
+    if (persistent->heartbeat_interval_ms <= 0 ||
+        persistent->lease_timeout_ms <= 0 ||
+        persistent->heartbeat_interval_ms >= persistent->lease_timeout_ms) {
+        return validate_current_lease(persistent);
+    }
+    now_ms = persistent_now_ms(persistent);
+    if (now_ms <= 0 || persistent->next_heartbeat_ms <= 0 || now_ms >= persistent->next_heartbeat_ms) {
+        return validate_current_lease(persistent);
+    }
+    return 0;
+}
+
 int ve_tls_persistent_heartbeat_if_due(ve_tls_persistent * persistent, int force) {
     ve_tls_lease_options options;
     int64_t now_ms;
@@ -611,6 +628,9 @@ int ve_tls_persistent_open(ve_tls_persistent * persistent, const ve_tls_persiste
     store_options.dir_path = persistent->dir_path;
     store_options.segment_max_bytes = options->segment_max_bytes;
     store_options.segment_max_records = options->segment_max_records;
+    store_options.resume_segment_id = persistent->checkpoint.last_segment_id > 0
+        ? persistent->checkpoint.last_segment_id
+        : 0;
     if (ve_tls_segment_store_open(&persistent->store, &store_options) != 0) {
         ve_tls_persistent_close(persistent);
         return -1;
@@ -685,7 +705,7 @@ int ve_tls_persistent_append(ve_tls_persistent * persistent, int64_t log_id, con
     if (ve_tls_persistent_heartbeat_if_due(persistent, 0) != 0) {
         return -1;
     }
-    if (validate_current_lease(persistent) != 0) {
+    if (validate_current_lease_if_needed(persistent) != 0) {
         return -1;
     }
     memset(&view, 0, sizeof(view));
@@ -763,14 +783,15 @@ int ve_tls_persistent_recover(ve_tls_persistent * persistent, int (*on_record)(i
     if (ve_tls_persistent_heartbeat_if_due(persistent, 1) != 0) {
         return -1;
     }
-    if (validate_current_lease(persistent) != 0) {
+    if (validate_current_lease_if_needed(persistent) != 0) {
         return -1;
     }
     last_segment = persistent->store.active_segment_id;
     for (uint32_t segment_id = 1; segment_id <= last_segment; segment_id++) {
-        uint64_t offset = 0;
         char path[640];
         ve_tls_path_info info;
+        ve_tls_segment_reader reader;
+        memset(&reader, 0, sizeof(reader));
         if (ve_tls_segment_store_get_segment_path(&persistent->store, segment_id, path, sizeof(path)) != 0) {
             return -1;
         }
@@ -783,16 +804,24 @@ int ve_tls_persistent_recover(ve_tls_persistent * persistent, int (*on_record)(i
         if (ve_tls_persistent_heartbeat_if_due(persistent, 0) != 0) {
             return -1;
         }
-        if (validate_current_lease(persistent) != 0) {
+        if (validate_current_lease_if_needed(persistent) != 0) {
             return -1;
         }
-        while (offset < info.size) {
+        if (ve_tls_segment_store_reader_open(&persistent->store, segment_id, info.size, &reader) != 0) {
+            return -1;
+        }
+        while (1) {
             unsigned char * record_buf = NULL;
             size_t record_size = 0;
-            uint64_t next_offset = offset;
             ve_tls_persistent_record record;
+            int read_rc;
             memset(&record, 0, sizeof(record));
-            if (ve_tls_segment_store_read(&persistent->store, segment_id, offset, &record_buf, &record_size, &next_offset) != 0) {
+            read_rc = ve_tls_segment_store_reader_next(&persistent->store, &reader, &record_buf, &record_size);
+            if (read_rc == 0) {
+                break;
+            }
+            if (read_rc != 1) {
+                ve_tls_segment_store_reader_close(&persistent->store, &reader);
                 if (ve_tls_segment_store_repair_tail(&persistent->store, segment_id, NULL) != 0) {
                     return -1;
                 }
@@ -803,6 +832,7 @@ int ve_tls_persistent_recover(ve_tls_persistent * persistent, int (*on_record)(i
             }
             if (ve_tls_persistent_record_decode(record_buf, record_size, &record) != 0) {
                 ve_tls_segment_store_read_free(record_buf);
+                ve_tls_segment_store_reader_close(&persistent->store, &reader);
                 if (ve_tls_segment_store_repair_tail(&persistent->store, segment_id, NULL) != 0) {
                     return -1;
                 }
@@ -816,15 +846,13 @@ int ve_tls_persistent_recover(ve_tls_persistent * persistent, int (*on_record)(i
             if (record.log_id > persistent->checkpoint.acked_log_id) {
                 if (on_record(record.log_id, record.hash_key, record.payload, record.payload_size, user) != 0) {
                     ve_tls_persistent_record_free(&record);
+                    ve_tls_segment_store_reader_close(&persistent->store, &reader);
                     return -1;
                 }
             }
             ve_tls_persistent_record_free(&record);
-            if (next_offset <= offset) {
-                return -1;
-            }
-            offset = next_offset;
         }
+        ve_tls_segment_store_reader_close(&persistent->store, &reader);
     }
     return 0;
 }
@@ -836,7 +864,7 @@ int ve_tls_persistent_ack_range(ve_tls_persistent * persistent, int64_t start_id
     if (ve_tls_persistent_heartbeat_if_due(persistent, 0) != 0) {
         return -1;
     }
-    if (validate_current_lease(persistent) != 0) {
+    if (validate_current_lease_if_needed(persistent) != 0) {
         return -1;
     }
     if (end_id > persistent->checkpoint.acked_log_id) {
