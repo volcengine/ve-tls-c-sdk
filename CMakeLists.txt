@@ -85,6 +85,12 @@ if(VE_TLS_BUILD_TOOLS AND NOT ANDROID)
     add_executable(ve_tls_demo tools/demo.c)
     target_link_libraries(ve_tls_demo PRIVATE ve_tls_core)
 
+    add_executable(ve_tls_demo_putlogs tools/putlogs_demo.c)
+    target_link_libraries(ve_tls_demo_putlogs PRIVATE ve_tls_core)
+
+    add_executable(ve_tls_demo_putlogsv2 tools/putlogsv2_demo.c)
+    target_link_libraries(ve_tls_demo_putlogsv2 PRIVATE ve_tls_core)
+
     add_executable(ve_tls_demo_real tools/real_demo.c)
     target_link_libraries(ve_tls_demo_real PRIVATE ve_tls_core)
 
@@ -149,6 +155,24 @@ if(VE_TLS_BUILD_TESTS)
         )
         set_tests_properties(ve_tls_bench_persistent_default_sender PROPERTIES
             PASS_REGULAR_EXPRESSION "bench config .*persistent=1.*senders=1"
+        )
+    endif()
+    if(TARGET ve_tls_demo)
+        add_test(NAME ve_tls_demo_help COMMAND ve_tls_demo --help)
+        set_tests_properties(ve_tls_demo_help PROPERTIES
+            PASS_REGULAR_EXPRESSION "VE_TLS_ENDPOINT.*VE_TLS_DEMO_MESSAGE"
+        )
+    endif()
+    if(TARGET ve_tls_demo_putlogs)
+        add_test(NAME ve_tls_demo_putlogs_help COMMAND ve_tls_demo_putlogs --help)
+        set_tests_properties(ve_tls_demo_putlogs_help PROPERTIES
+            PASS_REGULAR_EXPRESSION "VE_TLS_ENDPOINT.*VE_TLS_DEMO_MESSAGE"
+        )
+    endif()
+    if(TARGET ve_tls_demo_putlogsv2)
+        add_test(NAME ve_tls_demo_putlogsv2_help COMMAND ve_tls_demo_putlogsv2 --help)
+        set_tests_properties(ve_tls_demo_putlogsv2_help PROPERTIES
+            PASS_REGULAR_EXPRESSION "VE_TLS_CONTEXT_FLOW.*VE_TLS_API_VERSION"
         )
     endif()
     if(TARGET ve_tls_persistent_real_bench)

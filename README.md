@@ -40,7 +40,7 @@ TLS C Producer（纯 C 实现）是面向 **Linux 服务器 / 嵌入式 / 多端
 | master | 可用 | 低依赖、高性能、资源占用小 | Linux 服务器、嵌入式 Linux |
 | live | 可用 | 功能与 master 等价，支持更多平台 | Windows、Mac、Android、iOS |
 | bricks | 可用 | 极致精简、体积极小 | 资源极小场景，例如 RTOS |
-| persistent | 可用 | 在 master 基础上增加落盘缓存，限制单线程发送 | Android、iOS |
+| persistent | 可用 | 在 master 基础上增加本地持久化、崩溃恢复与 stale takeover | Android、iOS |
 
 ## 目录结构
 ```
@@ -101,6 +101,46 @@ ve_tls_producer_destroy(p);
 return rc == VE_TLS_OK ? 0 : 2;
 ```
 
+### Demo 入口
+
+- `tools/putlogs_demo.c`
+  - 直调 `/PutLogs` 的最小 OpenAPI demo，自己做 protobuf 编码、签名和 HTTP 发送
+- `tools/putlogsv2_demo.c`
+  - 直调 `/PutLogs` 的 V2 风格 demo；当前仓库没有单独的 `PutLogsV2` endpoint 封装，这里通过显式 `x-tls-apiversion` + 扩展 proto 字段演示 V2 用法
+- `tools/demo.c`
+  - 基于 producer API 的最小异步发送 demo
+
+构建：
+
+```
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DVE_TLS_ENABLE_CURL=ON
+cmake --build build -j
+```
+
+运行前至少设置：
+
+```bash
+export VE_TLS_ENDPOINT=https://tls-cn-beijing.volces.com
+export VE_TLS_REGION=cn-beijing
+export VE_TLS_TOPIC_ID=your-topic-id
+export VE_TLS_ACCESS_KEY_ID=your-ak
+export VE_TLS_ACCESS_KEY_SECRET=your-sk
+```
+
+示例：
+
+```bash
+export VE_TLS_DEMO_MESSAGE="hello from putlogs"
+./build/ve_tls_demo_putlogs
+
+export VE_TLS_API_VERSION=0.3.0
+export VE_TLS_CONTEXT_FLOW=demo-putlogsv2
+./build/ve_tls_demo_putlogsv2
+
+export VE_TLS_DEMO_MESSAGE="hello from producer"
+./build/ve_tls_demo
+```
+
 ### 多 Producer 场景（共享 sender 线程池）
 
 当同一进程需要创建多个 Producer（例如按 Source/Topic 隔离），建议初始化全局 Env，并让 Producer 选择使用共享 sender。
@@ -134,7 +174,49 @@ ve_tls_producer_destroy(p2);
 
 `time/timeNs` 与 `log-count/earliest-log-time/latest-log-time` 的语义、推荐用法与 raw 写入边界见：
 
-- [producer-time-and-io-stats.md](file:///Users/bytedance/workspace/src/sdk/volcengine-sdk/ve-tls-android-sdk/ve-tls-c-sdk/docs/producer-time-and-io-stats.md)
+- [docs/producer-time-and-io-stats.md](docs/producer-time-and-io-stats.md)
+
+### Persistent 快速开始
+
+如果业务需要在进程崩溃、异常退出或短时网络失败后继续补发，可开启 persistent 模式，将待发送日志先写入本地目录，并在重启后显式调用 `ve_tls_producer_recover()` 回灌 backlog。
+
+```c
+ve_tls_config cfg;
+ve_tls_config_init(&cfg);
+cfg.endpoint = "https://tls-cn-beijing.volces.com";
+cfg.region = "cn-beijing";
+cfg.topic_id = "your-topic-id";
+cfg.access_key_id = "your-ak";
+cfg.access_key_secret = "your-sk";
+
+cfg.use_persistent = 1;
+cfg.persistent_file_path = "/var/lib/ve-tls/persistent";
+cfg.max_persistent_log_count = 200000;
+cfg.max_persistent_file_size = 8 * 1024 * 1024;
+cfg.max_persistent_file_count = 32;
+cfg.persistent_overflow_policy = VE_TLS_POVERFLOW_REJECT_NEW;
+cfg.persistent_open_mode = VE_TLS_POPEN_TAKEOVER_IF_STALE;
+
+ve_tls_producer * p = ve_tls_producer_create(&cfg);
+if (!p) {
+  return 1;
+}
+
+if (ve_tls_producer_recover(p) != VE_TLS_OK) {
+  ve_tls_producer_destroy(p);
+  return 2;
+}
+
+// ... 正常 add_log / flush / close
+```
+
+persistent 对外能力要点：
+
+- 本地持久化 + 重启恢复：通过 `use_persistent`、`persistent_file_path` 和 `ve_tls_producer_recover()` 组成完整链路
+- 多种持久化溢出策略：支持 `REJECT_NEW`、`BLOCK`、`DROP_OLDEST_UNACKED`、`DROP_NEWEST_SAMPLE`
+- 租约与接管：`persistent_open_mode` 默认 `TAKEOVER_IF_STALE`，可用于 stale owner 接管恢复
+- 恢复健壮性：可修复截断尾记录、损坏 checkpoint 等常见异常场景
+- 发送并发：SDK 支持 persistent + 多 sender；若不显式配置，默认 `send_thread_count=1`
 
 ### 真实环境 Demo
 
@@ -161,7 +243,7 @@ cmake --build build
 - `--profile tls200|tls700|tls5120|custom`：固定日志模板；`custom` 时可配 `--message-bytes`
 - `--rate-lps 0`：表示不做节流，直接压满发送路径
 - `--report-interval-s 1`：每秒输出一次实时速率与 backlog
-- persistent 模式下会强制 `send_thread_count=1`；如果配置文件里写了更大的值，二进制会打印收敛结果
+- benchmark 默认 `send_thread_count=1`；可通过 `--send-thread-count` 或 `VE_TLS_SEND_THREAD_COUNT` 调整，SDK 本身支持 persistent + 多 sender
 - 输出包括：
   - `PERSISTENT_REAL_PROGRESS ...`：实时窗口速率与 backlog，包含 `phase=steady|recover|drain`、窗口 `enqueue_lps/success_lps`、累计 `enqueue_lps_avg/success_lps_avg`、`buffered_bytes`、`acked_log_id`、`active_segment_id`、`current_segments/current_records/current_bytes`
   - `PERSISTENT_REAL_BENCH ...`：最终汇总结果
