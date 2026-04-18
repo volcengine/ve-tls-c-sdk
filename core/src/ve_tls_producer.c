@@ -3,6 +3,7 @@
 #include "ve_tls_env.h"
 #include "ve_tls_alloc.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
@@ -58,7 +59,7 @@ static void ve_tls_secure_free_str(char ** ps) {
     *ps = NULL;
 }
 
-static int ve_tls_wait_buffer_space_locked(ve_tls_producer * producer, size_t need_bytes);
+static int ve_tls_wait_buffer_space_locked(ve_tls_producer * producer, size_t need_bytes, int reserve_for_send);
 
 static int ve_tls_copy_log_tags(const ve_tls_kv * tags, size_t count, ve_tls_kv ** out_tags, size_t * out_count) {
     *out_tags = NULL;
@@ -96,6 +97,72 @@ static int ve_tls_persistent_enabled(const ve_tls_producer * producer) {
     return producer && producer->config.use_persistent && producer->persistent;
 }
 
+static size_t ve_tls_effective_package_bytes(const ve_tls_config * cfg) {
+    if (!cfg) {
+        return 0;
+    }
+    size_t bytes = cfg->log_bytes_per_package > 0 ? (size_t)cfg->log_bytes_per_package : 0;
+    if (cfg->agg_max_raw_bytes_per_request > 0) {
+        size_t max_raw = (size_t)cfg->agg_max_raw_bytes_per_request;
+        if (bytes == 0 || bytes > max_raw) {
+            bytes = max_raw;
+        }
+    }
+    if (bytes == 0) {
+        bytes = 256 * 1024;
+    }
+    return bytes;
+}
+
+static size_t ve_tls_desired_send_reserved_bytes(const ve_tls_config * cfg) {
+    if (!cfg) {
+        return 0;
+    }
+    size_t pkg_bytes = ve_tls_effective_package_bytes(cfg);
+    size_t sender_count = (size_t)(cfg->send_thread_count > 0 ? cfg->send_thread_count : 1);
+    if (pkg_bytes == 0 || sender_count == 0) {
+        return 0;
+    }
+    if (pkg_bytes > (SIZE_MAX / sender_count)) {
+        return SIZE_MAX;
+    }
+    return pkg_bytes * sender_count;
+}
+
+static size_t ve_tls_effective_send_reserved_bytes(const ve_tls_config * cfg) {
+    if (!cfg || cfg->max_buffer_bytes <= 0) {
+        return 0;
+    }
+    size_t desired = ve_tls_desired_send_reserved_bytes(cfg);
+    size_t max_buffer = (size_t)cfg->max_buffer_bytes;
+    size_t cap = max_buffer / 2;
+    if (desired > cap) {
+        desired = cap;
+    }
+    return desired;
+}
+
+static void ve_tls_warn_risky_block_config(const ve_tls_config * cfg) {
+    if (!cfg || cfg->buffer_full_policy != VE_TLS_BUFFER_FULL_BLOCK || cfg->max_buffer_bytes <= 0) {
+        return;
+    }
+    size_t desired_reserved = ve_tls_desired_send_reserved_bytes(cfg);
+    if (desired_reserved == 0 || desired_reserved == SIZE_MAX || desired_reserved > (SIZE_MAX / 2)) {
+        return;
+    }
+    size_t max_buffer = (size_t)cfg->max_buffer_bytes;
+    size_t suggested = desired_reserved * 2;
+    if (max_buffer < suggested) {
+        fprintf(stderr,
+                "ve_tls warning: BLOCK mode config may over-throttle ingress before send threads are fully utilized "
+                "(max_buffer_bytes=%d send_thread_count=%d effective_package_bytes=%zu suggested_buffer_bytes>=%zu)\n",
+                (int)cfg->max_buffer_bytes,
+                (int)(cfg->send_thread_count > 0 ? cfg->send_thread_count : 1),
+                ve_tls_effective_package_bytes(cfg),
+                suggested);
+    }
+}
+
 static int ve_tls_config_is_valid_for_create(const ve_tls_config * cfg) {
     if (!cfg) return 0;
     if (!ve_tls_is_http_url(cfg->endpoint)) return 0;
@@ -107,6 +174,11 @@ static int ve_tls_config_is_valid_for_create(const ve_tls_config * cfg) {
     if (cfg->use_persistent) {
         if (ve_tls_str_empty(cfg->persistent_file_path)) return 0;
         if (cfg->max_persistent_log_count <= 0 || cfg->max_persistent_file_size <= 0 || cfg->max_persistent_file_count <= 0) return 0;
+    }
+    if (cfg->buffer_full_policy == VE_TLS_BUFFER_FULL_BLOCK) {
+        if (cfg->max_buffer_bytes <= 0) return 0;
+        if (cfg->buffer_full_block_timeout_ms <= 0) return 0;
+        if (ve_tls_effective_package_bytes(cfg) > ((size_t)cfg->max_buffer_bytes / 2)) return 0;
     }
     return 1;
 }
@@ -228,7 +300,7 @@ static ve_tls_result ve_tls_enqueue_raw_owned_locked(
             return VE_TLS_DROP_ERROR;
         }
     }
-    int wrc = ve_tls_wait_buffer_space_locked(producer, size);
+    int wrc = ve_tls_wait_buffer_space_locked(producer, size, 0);
     if (wrc != 0) {
         ve_tls_free(hk_owned);
         ve_tls_free(data);
@@ -300,7 +372,7 @@ static ve_tls_result ve_tls_enqueue_ingress_raw_owned_locked(
         ve_tls_free(data);
         return VE_TLS_CLOSED;
     }
-    wrc = ve_tls_wait_buffer_space_locked(producer, size);
+    wrc = ve_tls_wait_buffer_space_locked(producer, size, 0);
     if (wrc != 0) {
         ve_tls_free(data);
         return ve_tls_map_wait_error_to_result(producer, wrc, size);
@@ -651,6 +723,7 @@ static void ve_tls_tls_batch_reset(ve_tls_log_group_builder * b) {
     ve_tls_log_builder_shrink_if_needed(b, VE_TLS_TLS_BATCH_SHRINK_THRESHOLD, VE_TLS_TLS_BATCH_SHRINK_TO);
 }
 
+static int ve_tls_wait_buffer_space_locked(ve_tls_producer * producer, size_t need_bytes, int reserve_for_send);
 int ve_tls_ingress_task_merge_locked(ve_tls_producer * producer, const ve_tls_ingress_task * task) {
     if (!producer || !task || !task->batch || task->batch->log_count == 0 || task->batch->logs_len == 0) {
         return 0;
@@ -760,7 +833,7 @@ static int ve_tls_tls_batch_flush_locked(ve_tls_producer * producer, const char 
     if (!producer || !tb || tb->log_count == 0 || tb->logs_len == 0) {
         return 0;
     }
-    int wrc = ve_tls_wait_buffer_space_locked(producer, tb->logs_len);
+    int wrc = ve_tls_wait_buffer_space_locked(producer, tb->logs_len, 0);
     if (wrc != 0) {
         return wrc;
     }
@@ -829,7 +902,7 @@ static int ve_tls_tls_batch_merge_locked(ve_tls_producer * producer, const char 
     if (!producer || !tb || tb->log_count == 0 || tb->logs_len == 0) {
         return 0;
     }
-    int wrc = ve_tls_wait_buffer_space_locked(producer, tb->logs_len);
+    int wrc = ve_tls_wait_buffer_space_locked(producer, tb->logs_len, 0);
     if (wrc != 0) {
         return wrc;
     }
@@ -1016,9 +1089,12 @@ ve_tls_producer * ve_tls_producer_create(const ve_tls_config * config) {
     if (!config) {
         return NULL;
     }
-    if (!ve_tls_config_is_valid_for_create(config)) {
+    ve_tls_config effective = *config;
+    ve_tls_producer_config_apply_runtime_defaults(&effective);
+    if (!ve_tls_config_is_valid_for_create(&effective)) {
         return NULL;
     }
+    ve_tls_warn_risky_block_config(&effective);
     ve_tls_producer * producer = (ve_tls_producer *)ve_tls_calloc(1, sizeof(ve_tls_producer));
     if (!producer) {
         return NULL;
@@ -1072,6 +1148,8 @@ ve_tls_producer * ve_tls_producer_create(const ve_tls_config * config) {
     producer->config.proxy = producer->cfg_proxy;
     producer->config.user_agent = producer->cfg_user_agent;
     producer->config.persistent_file_path = producer->cfg_persistent_file_path;
+    ve_tls_producer_config_apply_runtime_defaults(&producer->config);
+    producer->send_reserved_bytes = ve_tls_effective_send_reserved_bytes(&producer->config);
     producer->send_cfg_version = __atomic_add_fetch(&g_send_cfg_version_seed, 1, __ATOMIC_RELAXED);
     producer->static_cred_version = __atomic_add_fetch(&g_static_cred_version_seed, 1, __ATOMIC_RELAXED);
     if (ve_tls_producer_build_group_suffix(producer) != 0) {
@@ -1634,67 +1712,63 @@ size_t ve_tls_producer_get_buffered_bytes(ve_tls_producer * producer) {
     if (!producer || !producer->mutex) {
         return 0;
     }
-    size_t total = 0;
     producer->config.platform.mutex_lock(producer->mutex);
-    total += producer->queue_bytes;
-    total += producer->ingress_queue_bytes;
-    total += (size_t)__atomic_load_n(&producer->tls_bytes, __ATOMIC_RELAXED);
-    if (producer->default_builder) {
-        total += producer->default_builder->logs_len;
-    }
-    for (ve_tls_log_group_builder * b = producer->sealed_head; b; b = b->next) {
-        total += b->logs_len;
-    }
-    if (producer->key_buckets) {
-        for (size_t bi = 0; bi < producer->key_bucket_count; bi++) {
-            for (ve_tls_key_queue * q = producer->key_buckets[bi]; q; q = q->hnext) {
-                if (q->builder) {
-                    total += q->builder->logs_len;
-                }
-                if (q->q && q->cap > 0) {
-                    for (size_t i = 0; i < q->cap; i++) {
-                        if (q->q[i].body) {
-                            total += q->q[i].body_size;
-                        }
-                        if (q->q[i].precompressed) {
-                            total += q->q[i].precompressed_size;
-                        }
-                    }
-                }
-            }
-        }
-    }
+    size_t total = producer->queue_bytes +
+                   producer->ingress_queue_bytes +
+                   producer->send_queue_bytes +
+                   producer->inflight_bytes +
+                   (size_t)__atomic_load_n(&producer->tls_bytes, __ATOMIC_RELAXED);
     producer->config.platform.mutex_unlock(producer->mutex);
-
-    if (producer->send_queue.mutex && producer->send_queue.platform) {
-        producer->send_queue.platform->mutex_lock(producer->send_queue.mutex);
-        if (producer->send_queue.buf && producer->send_queue.cap > 0) {
-            for (size_t i = 0; i < producer->send_queue.cap; i++) {
-                ve_tls_send_task * task = producer->send_queue.buf[i];
-                if (!task) {
-                    continue;
-                }
-                if (task->body) {
-                    total += task->body_size;
-                }
-                if (task->precompressed) {
-                    total += task->precompressed_size;
-                }
-            }
-        }
-        producer->send_queue.platform->mutex_unlock(producer->send_queue.mutex);
-    }
     return total;
 }
 
-static int ve_tls_wait_buffer_space_locked(ve_tls_producer * producer, size_t need_bytes) {
+static size_t ve_tls_producer_buffered_bytes_locked(ve_tls_producer * producer) {
+    if (!producer) {
+        return 0;
+    }
+    return producer->queue_bytes +
+           producer->ingress_queue_bytes +
+           producer->send_queue_bytes +
+           producer->inflight_bytes +
+           (size_t)__atomic_load_n(&producer->tls_bytes, __ATOMIC_RELAXED);
+}
+
+static size_t ve_tls_producer_ingress_bytes_locked(ve_tls_producer * producer) {
+    if (!producer) {
+        return 0;
+    }
+    return producer->queue_bytes +
+           producer->ingress_queue_bytes +
+           (size_t)__atomic_load_n(&producer->tls_bytes, __ATOMIC_RELAXED);
+}
+
+static int ve_tls_has_buffer_space_locked(ve_tls_producer * producer, size_t need_bytes, int reserve_for_send) {
+    if (!producer) {
+        return 0;
+    }
+    if (producer->config.max_buffer_bytes <= 0) {
+        return 1;
+    }
+    size_t max_buffer = (size_t)producer->config.max_buffer_bytes;
+    if (reserve_for_send) {
+        return (ve_tls_producer_buffered_bytes_locked(producer) + need_bytes) <= max_buffer;
+    }
+    size_t reserved = producer->send_reserved_bytes;
+    if (reserved > max_buffer) {
+        reserved = max_buffer;
+    }
+    size_t ingress_limit = max_buffer - reserved;
+    return (ve_tls_producer_ingress_bytes_locked(producer) + need_bytes) <= ingress_limit;
+}
+
+static int ve_tls_wait_buffer_space_locked(ve_tls_producer * producer, size_t need_bytes, int reserve_for_send) {
     if (!producer) {
         return -1;
     }
     if (producer->config.max_buffer_bytes <= 0) {
         return 0;
     }
-    if ((int64_t)(producer->queue_bytes + producer->ingress_queue_bytes + need_bytes) <= producer->config.max_buffer_bytes) {
+    if (ve_tls_has_buffer_space_locked(producer, need_bytes, reserve_for_send)) {
         return 0;
     }
     if (producer->config.buffer_full_policy != VE_TLS_BUFFER_FULL_BLOCK) {
@@ -1709,7 +1783,7 @@ static int ve_tls_wait_buffer_space_locked(ve_tls_producer * producer, size_t ne
         if (producer->stop || !producer->accepting) {
             return -2;
         }
-        if ((int64_t)(producer->queue_bytes + producer->ingress_queue_bytes + need_bytes) <= producer->config.max_buffer_bytes) {
+        if (ve_tls_has_buffer_space_locked(producer, need_bytes, reserve_for_send)) {
             return 0;
         }
         producer->flush_requested = 1;
@@ -1730,6 +1804,91 @@ static int ve_tls_wait_buffer_space_locked(ve_tls_producer * producer, size_t ne
             producer->config.platform.cond_wait(producer->cond, producer->mutex);
         }
     }
+}
+
+size_t ve_tls_send_task_memory_bytes(const ve_tls_send_task * task) {
+    size_t total = 0;
+    if (!task) {
+        return 0;
+    }
+    if (task->body) {
+        total += task->body_size;
+    }
+    if (task->precompressed) {
+        total += task->precompressed_size;
+    }
+    return total;
+}
+
+int ve_tls_producer_reserve_send_task_bytes(ve_tls_producer * producer, const ve_tls_send_task * task) {
+    if (!producer || !producer->mutex) {
+        return -1;
+    }
+    size_t bytes = ve_tls_send_task_memory_bytes(task);
+    if (bytes == 0) {
+        return 0;
+    }
+    producer->config.platform.mutex_lock(producer->mutex);
+    int rc = ve_tls_wait_buffer_space_locked(producer, bytes, 1);
+    if (rc == 0) {
+        producer->send_queue_bytes += bytes;
+    }
+    producer->config.platform.mutex_unlock(producer->mutex);
+    return rc;
+}
+
+void ve_tls_producer_release_send_queue_task_bytes(ve_tls_producer * producer, const ve_tls_send_task * task) {
+    if (!producer || !producer->mutex) {
+        return;
+    }
+    size_t bytes = ve_tls_send_task_memory_bytes(task);
+    if (bytes == 0) {
+        return;
+    }
+    producer->config.platform.mutex_lock(producer->mutex);
+    if (producer->send_queue_bytes >= bytes) {
+        producer->send_queue_bytes -= bytes;
+    } else {
+        producer->send_queue_bytes = 0;
+    }
+    producer->config.platform.cond_broadcast(producer->cond);
+    producer->config.platform.mutex_unlock(producer->mutex);
+}
+
+void ve_tls_producer_move_send_task_to_inflight(ve_tls_producer * producer, const ve_tls_send_task * task) {
+    if (!producer || !producer->mutex) {
+        return;
+    }
+    size_t bytes = ve_tls_send_task_memory_bytes(task);
+    if (bytes == 0) {
+        return;
+    }
+    producer->config.platform.mutex_lock(producer->mutex);
+    if (producer->send_queue_bytes >= bytes) {
+        producer->send_queue_bytes -= bytes;
+    } else {
+        producer->send_queue_bytes = 0;
+    }
+    producer->inflight_bytes += bytes;
+    producer->config.platform.mutex_unlock(producer->mutex);
+}
+
+void ve_tls_producer_release_inflight_task_bytes(ve_tls_producer * producer, const ve_tls_send_task * task) {
+    if (!producer || !producer->mutex) {
+        return;
+    }
+    size_t bytes = ve_tls_send_task_memory_bytes(task);
+    if (bytes == 0) {
+        return;
+    }
+    producer->config.platform.mutex_lock(producer->mutex);
+    if (producer->inflight_bytes >= bytes) {
+        producer->inflight_bytes -= bytes;
+    } else {
+        producer->inflight_bytes = 0;
+    }
+    producer->config.platform.cond_broadcast(producer->cond);
+    producer->config.platform.mutex_unlock(producer->mutex);
 }
 
 ve_tls_result ve_tls_producer_add_log_raw(ve_tls_producer * producer, const char * log_buf, size_t log_size, int flush) {
@@ -1794,7 +1953,7 @@ static ve_tls_result ve_tls_producer_add_log_kv_lens_time_parts_hashkey(
         producer->config.platform.mutex_unlock(producer->mutex);
         return VE_TLS_CLOSED;
     }
-    int wrc = ve_tls_wait_buffer_space_locked(producer, 0);
+    int wrc = ve_tls_wait_buffer_space_locked(producer, 0, 0);
     if (wrc != 0) {
         producer->config.platform.mutex_unlock(producer->mutex);
         if (wrc == -2) {
@@ -2680,7 +2839,7 @@ ve_tls_result ve_tls_producer_import_raw_buffer(ve_tls_producer * producer, cons
             producer->config.platform.mutex_unlock(producer->mutex);
             return VE_TLS_INVALID;
         }
-        if (producer->config.max_buffer_bytes > 0 && (int64_t)(producer->queue_bytes + data_size) > producer->config.max_buffer_bytes) {
+        if (!ve_tls_has_buffer_space_locked(producer, data_size, 0)) {
             producer->config.platform.mutex_unlock(producer->mutex);
             return VE_TLS_DROP_ERROR;
         }

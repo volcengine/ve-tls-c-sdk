@@ -31,6 +31,45 @@ static void ve_tls_http_client_init_noop(ve_tls_http_client * client) {
 }
 #endif
 
+enum {
+    VE_TLS_DEFAULT_SEND_THREAD_COUNT = 1,
+    VE_TLS_DEFAULT_PACK_THREAD_COUNT = 1,
+    VE_TLS_DEFAULT_MAX_BUFFER_BYTES = 64 * 1024 * 1024,
+    VE_TLS_DEFAULT_LOG_BYTES_PER_PACKAGE = 10 * 1024 * 1024,
+    VE_TLS_DEFAULT_LOG_COUNT_PER_PACKAGE = 2048,
+    VE_TLS_DEFAULT_SEND_QUEUE_SIZE = 1024
+};
+
+static int32_t ve_tls_runtime_default_package_bytes(int32_t max_buffer_bytes) {
+    if (max_buffer_bytes > 0 && max_buffer_bytes <= 64 * 1024 * 1024) {
+        return 2 * 1024 * 1024;
+    }
+    return 4 * 1024 * 1024;
+}
+
+static int32_t ve_tls_runtime_default_thread_count(int32_t max_buffer_bytes) {
+    if (max_buffer_bytes > 0 && max_buffer_bytes <= 64 * 1024 * 1024) {
+        return 2;
+    }
+    if (max_buffer_bytes > 0 && max_buffer_bytes <= 256 * 1024 * 1024) {
+        return 4;
+    }
+    return 8;
+}
+
+static int32_t ve_tls_runtime_default_send_queue_size(int32_t max_buffer_bytes, int32_t log_bytes_per_package) {
+    int32_t base = 8;
+    if (max_buffer_bytes > 0 && log_bytes_per_package > 0) {
+        base += max_buffer_bytes / log_bytes_per_package;
+    }
+    if (base < 8) {
+        base = 8;
+    } else if (base > 128) {
+        base = 128;
+    }
+    return base;
+}
+
 void ve_tls_producer_config_init(ve_tls_config * config) {
     if (!config) {
         return;
@@ -45,8 +84,8 @@ void ve_tls_producer_config_init(ve_tls_config * config) {
 #else
     config->compress_type = "none";
 #endif
-    config->send_thread_count = 1;
-    config->pack_thread_count = 1;
+    config->send_thread_count = VE_TLS_DEFAULT_SEND_THREAD_COUNT;
+    config->pack_thread_count = VE_TLS_DEFAULT_PACK_THREAD_COUNT;
     config->use_global_env = 0;
     config->ordered_send = 0;
     config->rate_limit_rps = 0;
@@ -54,13 +93,13 @@ void ve_tls_producer_config_init(ve_tls_config * config) {
     config->breaker_fail_threshold = 0;
     config->breaker_open_ms = 30000;
     config->breaker_half_open_max_inflight = 1;
-    config->max_buffer_bytes = 64 * 1024 * 1024;
+    config->max_buffer_bytes = VE_TLS_DEFAULT_MAX_BUFFER_BYTES;
     config->buffer_full_policy = VE_TLS_BUFFER_FULL_DROP;
     config->buffer_full_block_timeout_ms = 0;
-    config->log_bytes_per_package = 10 * 1024 * 1024;
-    config->log_count_per_package = 2048;
+    config->log_bytes_per_package = VE_TLS_DEFAULT_LOG_BYTES_PER_PACKAGE;
+    config->log_count_per_package = VE_TLS_DEFAULT_LOG_COUNT_PER_PACKAGE;
     config->flush_interval_ms = 1000;
-    config->send_queue_size = 1024;
+    config->send_queue_size = VE_TLS_DEFAULT_SEND_QUEUE_SIZE;
     config->send_queue_full_policy = VE_TLS_SEND_QUEUE_FULL_DROP;
     config->send_queue_block_timeout_ms = 100;
     config->send_queue_sample_every_n = 10;
@@ -105,4 +144,34 @@ void ve_tls_producer_config_init(ve_tls_config * config) {
 #else
     ve_tls_http_client_init_noop(&config->http_client);
 #endif
+}
+
+void ve_tls_producer_config_apply_runtime_defaults(ve_tls_config * config) {
+    int32_t derived_log_bytes;
+    int32_t derived_threads;
+
+    if (!config) {
+        return;
+    }
+
+    derived_log_bytes = ve_tls_runtime_default_package_bytes(config->max_buffer_bytes);
+    if (config->log_bytes_per_package == VE_TLS_DEFAULT_LOG_BYTES_PER_PACKAGE) {
+        config->log_bytes_per_package = derived_log_bytes;
+    }
+    if (config->log_count_per_package == VE_TLS_DEFAULT_LOG_COUNT_PER_PACKAGE) {
+        config->log_count_per_package = 4096;
+    }
+
+    derived_threads = ve_tls_runtime_default_thread_count(config->max_buffer_bytes);
+    if (config->send_thread_count == VE_TLS_DEFAULT_SEND_THREAD_COUNT) {
+        config->send_thread_count = derived_threads;
+    }
+    if (config->pack_thread_count == VE_TLS_DEFAULT_PACK_THREAD_COUNT) {
+        config->pack_thread_count = config->send_thread_count;
+    }
+    if (config->send_queue_size == VE_TLS_DEFAULT_SEND_QUEUE_SIZE) {
+        config->send_queue_size = ve_tls_runtime_default_send_queue_size(
+            config->max_buffer_bytes,
+            config->log_bytes_per_package > 0 ? config->log_bytes_per_package : derived_log_bytes);
+    }
 }
