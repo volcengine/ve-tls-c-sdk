@@ -157,6 +157,21 @@ if(VE_TLS_BUILD_TESTS)
             PASS_REGULAR_EXPRESSION "bench config .*persistent=1.*senders=1"
         )
     endif()
+    if(TARGET ve_tls_perf_tls)
+        add_test(
+            NAME ve_tls_perf_tls_output_fields
+            COMMAND $<TARGET_FILE:ve_tls_perf_tls>
+                --mode mock
+                --duration-s 1
+                --rate-lps 100
+                --writers 1
+                --profile tls200
+                --close-timeout-ms 1000
+        )
+        set_tests_properties(ve_tls_perf_tls_output_fields PROPERTIES
+            PASS_REGULAR_EXPRESSION "sdk_buffered_bytes_peak=[0-9][0-9]*.*sdk_buffered_bytes_final=[0-9][0-9]*"
+        )
+    endif()
     if(TARGET ve_tls_demo)
         add_test(NAME ve_tls_demo_help COMMAND ve_tls_demo --help)
         set_tests_properties(ve_tls_demo_help PROPERTIES

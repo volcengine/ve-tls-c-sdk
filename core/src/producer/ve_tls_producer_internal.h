@@ -169,6 +169,9 @@ struct ve_tls_producer {
     size_t ingress_queue_tail;
     size_t ingress_queue_count;
     size_t ingress_queue_bytes;
+    size_t send_queue_bytes;
+    size_t inflight_bytes;
+    size_t send_reserved_bytes;
     size_t tls_bytes;
     ve_tls_log_group_builder * sealed_head;
     ve_tls_log_group_builder * sealed_tail;
@@ -229,7 +232,13 @@ struct ve_tls_producer {
 };
 
 void ve_tls_producer_config_init(ve_tls_config * config);
+void ve_tls_producer_config_apply_runtime_defaults(ve_tls_config * config);
 void ve_tls_metrics_emit(ve_tls_producer * producer, const char * name, int64_t v1, int64_t v2);
+size_t ve_tls_send_task_memory_bytes(const ve_tls_send_task * task);
+int ve_tls_producer_reserve_send_task_bytes(ve_tls_producer * producer, const ve_tls_send_task * task);
+void ve_tls_producer_release_send_queue_task_bytes(ve_tls_producer * producer, const ve_tls_send_task * task);
+void ve_tls_producer_move_send_task_to_inflight(ve_tls_producer * producer, const ve_tls_send_task * task);
+void ve_tls_producer_release_inflight_task_bytes(ve_tls_producer * producer, const ve_tls_send_task * task);
 int ve_tls_latency_bucket_index(int64_t ms);
 void ve_tls_rate_limit_wait(ve_tls_producer * producer, size_t bytes);
 void ve_tls_breaker_wait_open(ve_tls_producer * producer);

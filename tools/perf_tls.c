@@ -106,6 +106,19 @@ static int32_t conf_get_i32(conf_kv * c, const char * key, int32_t defv) {
     return (int32_t)v;
 }
 
+static int conf_has_key(conf_kv * c, const char * key) {
+    if (!key) return 0;
+    for (int i = 0; c && i < c->kv_len; i++) {
+        if (strcmp(c->kv[i][0], key) == 0) {
+            return 1;
+        }
+    }
+    {
+        const char * e = getenv(key);
+        return (e && e[0] != 0) ? 1 : 0;
+    }
+}
+
 static uint64_t now_ns(void) {
     struct timespec ts;
     memset(&ts, 0, sizeof(ts));
@@ -354,12 +367,24 @@ int main(int argc, char ** argv) {
     cfg.max_buffer_bytes = conf_get_i32(&conf, "VE_TLS_MAX_BUFFER_BYTES", 64 * 1024 * 1024);
     cfg.buffer_full_policy = VE_TLS_BUFFER_FULL_BLOCK;
     cfg.buffer_full_block_timeout_ms = close_timeout_ms;
-    cfg.flush_interval_ms = conf_get_i32(&conf, "VE_TLS_FLUSH_INTERVAL_MS", 3000);
-    cfg.log_bytes_per_package = conf_get_i32(&conf, "VE_TLS_LOG_BYTES_PER_PACKAGE", 4 * 1024 * 1024);
-    cfg.log_count_per_package = conf_get_i32(&conf, "VE_TLS_LOG_COUNT_PER_PACKAGE", 4096);
-    cfg.send_thread_count = conf_get_i32(&conf, "VE_TLS_SEND_THREAD_COUNT", 16);
-    cfg.pack_thread_count = conf_get_i32(&conf, "VE_TLS_PACK_THREAD_COUNT", cfg.send_thread_count);
-    cfg.compress_type = conf_get_str(&conf, "VE_TLS_COMPRESS_TYPE", "lz4");
+    if (conf_has_key(&conf, "VE_TLS_FLUSH_INTERVAL_MS")) {
+        cfg.flush_interval_ms = conf_get_i32(&conf, "VE_TLS_FLUSH_INTERVAL_MS", cfg.flush_interval_ms);
+    }
+    if (conf_has_key(&conf, "VE_TLS_LOG_BYTES_PER_PACKAGE")) {
+        cfg.log_bytes_per_package = conf_get_i32(&conf, "VE_TLS_LOG_BYTES_PER_PACKAGE", cfg.log_bytes_per_package);
+    }
+    if (conf_has_key(&conf, "VE_TLS_LOG_COUNT_PER_PACKAGE")) {
+        cfg.log_count_per_package = conf_get_i32(&conf, "VE_TLS_LOG_COUNT_PER_PACKAGE", cfg.log_count_per_package);
+    }
+    if (conf_has_key(&conf, "VE_TLS_SEND_THREAD_COUNT")) {
+        cfg.send_thread_count = conf_get_i32(&conf, "VE_TLS_SEND_THREAD_COUNT", cfg.send_thread_count);
+    }
+    if (conf_has_key(&conf, "VE_TLS_PACK_THREAD_COUNT")) {
+        cfg.pack_thread_count = conf_get_i32(&conf, "VE_TLS_PACK_THREAD_COUNT", cfg.pack_thread_count);
+    }
+    if (conf_has_key(&conf, "VE_TLS_COMPRESS_TYPE")) {
+        cfg.compress_type = conf_get_str(&conf, "VE_TLS_COMPRESS_TYPE", cfg.compress_type);
+    }
     cfg.retry_policy.max_attempts = 1;
     cfg.log_tags = tags;
     cfg.log_tag_count = tag_count;
@@ -412,6 +437,8 @@ int main(int argc, char ** argv) {
     struct rusage ru0;
     memset(&ru0, 0, sizeof(ru0));
     getrusage(RUSAGE_SELF, &ru0);
+    size_t sdk_buffered_bytes_peak = ve_tls_producer_get_buffered_bytes(p);
+    size_t sdk_buffered_bytes_final = sdk_buffered_bytes_peak;
 
     cfg.platform.mutex_lock(gate.mu);
     gate.start_ns = now_ns();
@@ -419,6 +446,14 @@ int main(int argc, char ** argv) {
     gate.started = 1;
     cfg.platform.cond_broadcast(gate.cv);
     cfg.platform.mutex_unlock(gate.mu);
+
+    while (now_ns() < gate.end_ns) {
+        size_t buffered_bytes = ve_tls_producer_get_buffered_bytes(p);
+        if (buffered_bytes > sdk_buffered_bytes_peak) {
+            sdk_buffered_bytes_peak = buffered_bytes;
+        }
+        usleep(10000);
+    }
 
     for (int32_t i = 0; i < writers; i++) {
         cfg.platform.thread_join(th[i]);
@@ -444,9 +479,17 @@ int main(int argc, char ** argv) {
     ve_tls_metrics m0;
     memset(&m0, 0, sizeof(m0));
     ve_tls_producer_get_metrics(p, &m0);
+    sdk_buffered_bytes_final = ve_tls_producer_get_buffered_bytes(p);
+    if (sdk_buffered_bytes_final > sdk_buffered_bytes_peak) {
+        sdk_buffered_bytes_peak = sdk_buffered_bytes_final;
+    }
 
     (void)ve_tls_producer_flush(p);
     ve_tls_result close_rc = ve_tls_producer_close(p, close_timeout_ms);
+    sdk_buffered_bytes_final = ve_tls_producer_get_buffered_bytes(p);
+    if (sdk_buffered_bytes_final > sdk_buffered_bytes_peak) {
+        sdk_buffered_bytes_peak = sdk_buffered_bytes_final;
+    }
 
     ve_tls_metrics m;
     memset(&m, 0, sizeof(m));
@@ -480,7 +523,8 @@ int main(int argc, char ** argv) {
     printf(
         "tlsperf mode=%s profile=%s target_lps=%lld writers=%d run_s=%.3f wall_s=%.3f close_rc=%d "
         "ok=%llu drop=%llu other=%llu logs_enq=%llu logs_drop=%llu bytes_enq=%llu bytes_drop=%llu req=%llu failed=%llu "
-        "enq_lps=%.2f us_per_log=%.2f raw_kb_s=%.2f user_s=%.3f sys_s=%.3f cpu_cores=%.2f cpu_pct_1=%.2f cpu_pct_total=%.2f rss_mb=%.2f\n",
+        "enq_lps=%.2f us_per_log=%.2f raw_kb_s=%.2f user_s=%.3f sys_s=%.3f cpu_cores=%.2f cpu_pct_1=%.2f cpu_pct_total=%.2f rss_mb=%.2f "
+        "sdk_buffered_bytes_peak=%llu sdk_buffered_bytes_final=%llu\n",
         mode,
         profile ? profile : "",
         (long long)rate_lps,
@@ -505,7 +549,9 @@ int main(int argc, char ** argv) {
         cpu_cores,
         cpu_pct_1,
         cpu_pct_total,
-        rss_mb
+        rss_mb,
+        (unsigned long long)sdk_buffered_bytes_peak,
+        (unsigned long long)sdk_buffered_bytes_final
     );
 
     conf_free(&conf);
