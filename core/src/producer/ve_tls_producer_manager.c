@@ -195,8 +195,24 @@ static int ve_tls_manager_push_send_task(ve_tls_producer * producer, ve_tls_send
             wait_ms = 0;
         }
     }
+    int reserve_rc = ve_tls_producer_reserve_send_task_bytes(producer, t);
+    if (reserve_rc != 0) {
+        if (reserve_rc == -3) {
+            ve_tls_metrics_emit(producer, "send_budget_timeout_drop", 1, 0);
+            ve_tls_manager_drop_range(producer, t->batch_bytes, t->start_id, t->end_id, "BufferFullTimeout", "buffer budget wait timeout");
+        } else if (reserve_rc == -2) {
+            ve_tls_metrics_emit(producer, "send_budget_stop_drop", 1, 0);
+            ve_tls_manager_drop_range(producer, t->batch_bytes, t->start_id, t->end_id, "ProducerClosed", "producer closed while waiting for buffer budget");
+        } else {
+            ve_tls_metrics_emit(producer, "send_budget_drop", 1, 0);
+            ve_tls_manager_drop_range(producer, t->batch_bytes, t->start_id, t->end_id, "BufferFull", "buffer budget exceeded");
+        }
+        ve_tls_send_task_free(t);
+        return -1;
+    }
     int push_rc = ve_tls_send_queue_push(&producer->send_queue, t, wait_ms);
     if (push_rc != 0) {
+        ve_tls_producer_release_send_queue_task_bytes(producer, t);
         if (push_rc == -2) {
             ve_tls_metrics_emit(producer, "send_queue_timeout_drop", 1, 0);
             ve_tls_manager_drop_range(producer, t->batch_bytes, t->start_id, t->end_id, "SendQueueTimeout", "send queue push timeout");

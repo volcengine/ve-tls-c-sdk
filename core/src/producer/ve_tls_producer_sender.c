@@ -30,6 +30,25 @@ static void ve_tls_secure_free_str(char ** ps) {
     *ps = NULL;
 }
 
+static int ve_tls_sender_pop_send_queue_task(ve_tls_producer * producer, ve_tls_send_task * task, int wait_ms) {
+    if (!producer || !task) {
+        return -1;
+    }
+    int rc = ve_tls_send_queue_pop(&producer->send_queue, task, wait_ms);
+    if (rc == 0) {
+        ve_tls_producer_move_send_task_to_inflight(producer, task);
+    }
+    return rc;
+}
+
+static void ve_tls_sender_release_task(ve_tls_producer * producer, ve_tls_send_task * task) {
+    if (!task) {
+        return;
+    }
+    ve_tls_producer_release_inflight_task_bytes(producer, task);
+    ve_tls_send_task_free(task);
+}
+
 static void ve_tls_sender_heartbeat_persistent(ve_tls_producer * producer) {
     if (producer && producer->persistent) {
         if (producer->persistent_mutex) {
@@ -1095,7 +1114,7 @@ int ve_tls_sender_step(ve_tls_producer * producer) {
 
     ve_tls_send_task inbound;
     memset(&inbound, 0, sizeof(inbound));
-    if (ve_tls_send_queue_pop(&producer->send_queue, &inbound, 0) == 0) {
+    if (ve_tls_sender_pop_send_queue_task(producer, &inbound, 0) == 0) {
         producer->config.platform.mutex_lock(producer->mutex);
         const char * nk = ve_tls_normalize_hash_key(producer, inbound.hash_key);
         if (ve_tls_key_queue_push_task(producer, nk, &inbound) != 0) {
@@ -1118,7 +1137,7 @@ int ve_tls_sender_step(ve_tls_producer * producer) {
                 cbs.cb2(VE_TLS_DROP_ERROR, inbound.batch_bytes, 0, &derr, NULL, cbs.cb2_param, inbound.start_id, inbound.end_id);
             }
             ve_tls_error_free_fields(&derr);
-            ve_tls_send_task_free(&inbound);
+            ve_tls_sender_release_task(producer, &inbound);
         } else {
             producer->config.platform.cond_signal(producer->send_cond);
             producer->config.platform.mutex_unlock(producer->mutex);
@@ -1153,7 +1172,7 @@ have_task: {
             cbs.cb2(VE_TLS_DROP_ERROR, task.batch_bytes, 0, &err, NULL, cbs.cb2_param, task.start_id, task.end_id);
         }
         ve_tls_error_free_fields(&err);
-        ve_tls_send_task_free(&task);
+        ve_tls_sender_release_task(producer, &task);
         producer->config.platform.mutex_lock(producer->mutex);
         ve_tls_key_queue_finish(producer, kq);
         producer->config.platform.mutex_unlock(producer->mutex);
@@ -1306,7 +1325,7 @@ have_task: {
     }
     ve_tls_key_breaker_on_final_result(producer, kq, sent_ok ? 1 : 0);
     ve_tls_error_free_fields(&err);
-    ve_tls_send_task_free(&task);
+    ve_tls_sender_release_task(producer, &task);
     producer->config.platform.mutex_lock(producer->mutex);
     ve_tls_key_queue_finish(producer, kq);
     producer->config.platform.mutex_unlock(producer->mutex);
@@ -1323,7 +1342,7 @@ static void * ve_tls_sender_main_fast(void * arg) {
         ve_tls_sender_heartbeat_persistent(producer);
         ve_tls_send_task task;
         memset(&task, 0, sizeof(task));
-        if (ve_tls_send_queue_pop(&producer->send_queue, &task, -1) != 0) {
+        if (ve_tls_sender_pop_send_queue_task(producer, &task, -1) != 0) {
             ve_tls_sender_thread_cache_clear();
             return NULL;
         }
@@ -1351,7 +1370,7 @@ static void * ve_tls_sender_main_fast(void * arg) {
                 cbs.cb2(VE_TLS_DROP_ERROR, task.batch_bytes, 0, &err, NULL, cbs.cb2_param, task.start_id, task.end_id);
             }
             ve_tls_error_free_fields(&err);
-            ve_tls_send_task_free(&task);
+            ve_tls_sender_release_task(producer, &task);
             (void)__atomic_fetch_sub(&producer->fast_inflight, 1, __ATOMIC_RELAXED);
             continue;
         }
@@ -1445,7 +1464,7 @@ static void * ve_tls_sender_main_fast(void * arg) {
             ve_tls_free(msg);
         }
         ve_tls_error_free_fields(&err);
-        ve_tls_send_task_free(&task);
+        ve_tls_sender_release_task(producer, &task);
         (void)__atomic_fetch_sub(&producer->fast_inflight, 1, __ATOMIC_RELAXED);
     }
 }
@@ -1487,7 +1506,7 @@ next_task:
             producer->config.platform.mutex_unlock(producer->mutex);
             ve_tls_send_task inbound;
             memset(&inbound, 0, sizeof(inbound));
-            if (ve_tls_send_queue_pop(&producer->send_queue, &inbound, wait_sendq_ms) == 0) {
+            if (ve_tls_sender_pop_send_queue_task(producer, &inbound, wait_sendq_ms) == 0) {
                 producer->config.platform.mutex_lock(producer->mutex);
                 const char * nk = ve_tls_normalize_hash_key(producer, inbound.hash_key);
                 if (ve_tls_key_queue_push_task(producer, nk, &inbound) != 0) {
@@ -1510,7 +1529,7 @@ next_task:
                         cbs.cb2(VE_TLS_DROP_ERROR, inbound.batch_bytes, 0, &derr, NULL, cbs.cb2_param, inbound.start_id, inbound.end_id);
                     }
                     ve_tls_error_free_fields(&derr);
-                    ve_tls_send_task_free(&inbound);
+                    ve_tls_sender_release_task(producer, &inbound);
                 } else {
                     producer->config.platform.cond_signal(producer->send_cond);
                     producer->config.platform.mutex_unlock(producer->mutex);
@@ -1537,7 +1556,7 @@ next_task:
                 producer->config.platform.mutex_unlock(producer->mutex);
                 ve_tls_send_task tail;
                 memset(&tail, 0, sizeof(tail));
-                int have_sendq = (ve_tls_send_queue_pop(&producer->send_queue, &tail, 0) == 0);
+                int have_sendq = (ve_tls_sender_pop_send_queue_task(producer, &tail, 0) == 0);
                 if (have_sendq) {
                     producer->config.platform.mutex_lock(producer->mutex);
                     const char * nk = ve_tls_normalize_hash_key(producer, tail.hash_key);
@@ -1561,7 +1580,7 @@ next_task:
                             cbs.cb2(VE_TLS_DROP_ERROR, tail.batch_bytes, 0, &derr, NULL, cbs.cb2_param, tail.start_id, tail.end_id);
                         }
                         ve_tls_error_free_fields(&derr);
-                        ve_tls_send_task_free(&tail);
+                        ve_tls_sender_release_task(producer, &tail);
                     } else {
                         producer->config.platform.cond_signal(producer->send_cond);
                         producer->config.platform.mutex_unlock(producer->mutex);
@@ -1618,7 +1637,7 @@ next_task:
                 cbs.cb2(VE_TLS_DROP_ERROR, task.batch_bytes, 0, &err, NULL, cbs.cb2_param, task.start_id, task.end_id);
             }
             ve_tls_error_free_fields(&err);
-            ve_tls_send_task_free(&task);
+            ve_tls_sender_release_task(producer, &task);
             producer->config.platform.mutex_lock(producer->mutex);
             ve_tls_key_queue_finish(producer, kq);
             producer->config.platform.mutex_unlock(producer->mutex);
@@ -1765,7 +1784,7 @@ next_task:
         }
         ve_tls_key_breaker_on_final_result(producer, kq, sent_ok ? 1 : 0);
         ve_tls_error_free_fields(&err);
-        ve_tls_send_task_free(&task);
+        ve_tls_sender_release_task(producer, &task);
         producer->config.platform.mutex_lock(producer->mutex);
         ve_tls_key_queue_finish(producer, kq);
         producer->config.platform.mutex_unlock(producer->mutex);
