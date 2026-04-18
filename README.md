@@ -222,7 +222,7 @@ persistent 对外能力要点：
 
 - 可执行 demo：`tools/real_demo.c`
 - 可执行真实环境 persistent benchmark：`tools/persistent_real_bench.c`
-- 支持通过环境变量或配置文件注入参数：`tools/real_demo.env`
+- 支持通过环境变量或配置文件注入参数：先复制 `tools/real_demo_perf.env.template` 到 `.local/config/real_demo.env`
 - persistent 真实环境完整性验证脚本：`tools/persistent_real_validation.sh`
 - 服务端结果查询脚本：`tools/tls_search_logs.go`（依赖本地 `volc-sdk-golang` checkout）
 
@@ -231,8 +231,9 @@ persistent 对外能力要点：
 ``` 
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DVE_TLS_ENABLE_CURL=ON
 cmake --build build
-./build/ve_tls_demo_real --config tools/real_demo.env --duration-s 60 --wait-ms 3000
-./build/ve_tls_persistent_real_bench --config tools/real_demo.env --mode steady --write-mode kv --profile tls700 --duration-s 30 --rate-lps 0 --report-interval-s 1 --wait-ms 120000
+cp tools/real_demo_perf.env.template .local/config/real_demo.env
+./build/ve_tls_demo_real --config .local/config/real_demo.env --duration-s 60 --wait-ms 3000
+./build/ve_tls_persistent_real_bench --config .local/config/real_demo.env --mode steady --write-mode kv --profile tls700 --duration-s 30 --rate-lps 0 --report-interval-s 1 --wait-ms 120000
 ```
 
 其中 `ve_tls_persistent_real_bench` 是适合直接部署到真实环境机器上跑的单个二进制：

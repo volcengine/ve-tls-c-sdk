@@ -7697,15 +7697,15 @@ static int test_sign_matches_go_reference_with_fixed_xdate(void) {
     const unsigned char body[5] = {1, 2, 3, 4, 5};
     char * out = NULL;
     int rc = ve_tls_sign_v4_append_at(
-        "your-ak",
-        "WkRnd1lXUmhOak5oTkRNeE5HSTNZMkZrWlRRellUa3hZV015Wm1NeFpHWQ==",
+        "AKIDEXAMPLE",
+        "SECRETKEYEXAMPLE",
         "",
-        "cn-guilin-boe",
+        "cn-beijing",
         "TLS",
         "POST",
-        "tls-cn-guilin-boe.volces.com",
+        "tls.example.com",
         "/PutLogs",
-        "TopicId=3db5e9ad-7706-4cb2-9567-2909a98b9638",
+        "TopicId=test-topic",
         body,
         sizeof(body),
         "20260410T032329Z",
@@ -7717,7 +7717,7 @@ static int test_sign_matches_go_reference_with_fixed_xdate(void) {
         return -1;
     }
     int ok = strstr(out, "X-Date: 20260410T032329Z\n") != NULL &&
-             strstr(out, "Signature=b149a648374cc58cb847c7fa8fc79dba48ecb99a2dc52200bc9107501a79d678") != NULL;
+             strstr(out, "Signature=3a9df4eee603ef2c96640e38b2e1aa5725873b58da1a3d7b962c0986219d52b4") != NULL;
     free(out);
     return ok ? 0 : -1;
 }

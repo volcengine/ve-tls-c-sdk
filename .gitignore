@@ -15,3 +15,5 @@ out/
 cospec/
 **/docs/*
 build_*/
+.local/
+tools/real_demo.env
