@@ -5,6 +5,8 @@
 #include <string.h>
 #include <ctype.h>
 #include <unistd.h>
+#include <time.h>
+#include <errno.h>
 
 typedef struct {
     char * kv[128][2];
@@ -21,6 +23,31 @@ typedef struct {
 } demo_run_state;
 
 static demo_run_state g_demo_state;
+
+static int64_t monotonic_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+}
+
+static void pace_rate_lps(int32_t rate_lps, int64_t * next_emit_ns) {
+    int64_t step_ns;
+    int64_t sleep_ns;
+    struct timespec req;
+    if (rate_lps <= 0 || !next_emit_ns) return;
+    step_ns = 1000000000LL / rate_lps;
+    if (step_ns <= 0) step_ns = 1;
+    if (*next_emit_ns == 0) {
+        *next_emit_ns = monotonic_ns();
+    }
+    *next_emit_ns += step_ns;
+    sleep_ns = *next_emit_ns - monotonic_ns();
+    if (sleep_ns <= 0) return;
+    req.tv_sec = sleep_ns / 1000000000LL;
+    req.tv_nsec = sleep_ns % 1000000000LL;
+    while (nanosleep(&req, &req) != 0 && errno == EINTR) {
+    }
+}
 
 static void conf_free(demo_conf * c) {
     if (!c) return;
@@ -576,11 +603,7 @@ int main(int argc, char ** argv) {
     int32_t add_ok = 0;
     int32_t add_fail = 0;
     int32_t seq_i = 0;
-    int32_t per_log_sleep_ms = 0;
-    if (demo_rate_lps > 0) {
-        per_log_sleep_ms = 1000 / demo_rate_lps;
-        if (per_log_sleep_ms < 0) per_log_sleep_ms = 0;
-    }
+    int64_t next_emit_ns = 0;
     for (;;) {
         if (duration_s > 0) {
             int64_t now = cfg.platform.time_ms();
@@ -633,8 +656,8 @@ int main(int argc, char ** argv) {
         }
         if (interval_ms > 0) {
             cfg.platform.sleep_ms(interval_ms);
-        } else if (per_log_sleep_ms > 0) {
-            cfg.platform.sleep_ms(per_log_sleep_ms);
+        } else if (demo_rate_lps > 0) {
+            pace_rate_lps(demo_rate_lps, &next_emit_ns);
         }
     }
 

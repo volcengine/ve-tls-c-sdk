@@ -40,6 +40,7 @@ target_sources(ve_tls_core PRIVATE
     core/src/ve_tls_error.c
     core/src/ve_tls_hash.c
     core/src/ve_tls_sign.c
+    bindings/android/src/ve_tls_android_binding.c
     adapters/src/ve_tls_adapter_posix.c
     adapters/src/ve_tls_platform_pthread.c
 )
@@ -69,6 +70,7 @@ endif()
 target_include_directories(ve_tls_core PUBLIC
     core/include
     adapters/include
+    bindings/android/include
 )
 
 if(VE_TLS_ENABLE_PTHREAD)
@@ -121,6 +123,10 @@ if(VE_TLS_BUILD_TESTS)
     target_link_libraries(ve_tls_test_basic PRIVATE ve_tls_core)
     target_include_directories(ve_tls_test_basic PRIVATE core/src)
     add_test(NAME ve_tls_test_basic COMMAND ve_tls_test_basic)
+
+    add_executable(ve_tls_test_android_binding tests/test_android_binding.c)
+    target_link_libraries(ve_tls_test_android_binding PRIVATE ve_tls_core)
+    add_test(NAME ve_tls_test_android_binding COMMAND ve_tls_test_android_binding)
     if(TARGET ve_tls_bench)
         add_test(NAME ve_tls_bench_help COMMAND ve_tls_bench --help)
         set_tests_properties(ve_tls_bench_help PROPERTIES

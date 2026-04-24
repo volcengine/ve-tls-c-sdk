@@ -61,6 +61,7 @@ func main() {
 	expectCount := envInt("PERSIST_QUERY_EXPECT_COUNT", 0)
 	expectExact := envInt("PERSIST_QUERY_EXPECT_EXACT", -1)
 	allowDuplicates := envInt("PERSIST_QUERY_ALLOW_DUPLICATES", 0) != 0
+	includeSeqs := envInt("PERSIST_QUERY_INCLUDE_SEQS", 1) != 0
 	limit := envInt("PERSIST_QUERY_LIMIT", 500)
 	timeoutMs := envInt64("PERSIST_QUERY_TIMEOUT_MS", 30000)
 	pollMs := envInt64("PERSIST_QUERY_POLL_MS", 1000)
@@ -77,18 +78,15 @@ func main() {
 		hitCount := 0
 		totalCount := 0
 		pages := 0
-		for offset := int64(0); ; {
-			req := &tls.SearchLogsRequest{
-				TopicID:   topic,
-				Query:     "*",
-				StartTime: startMs,
-				EndTime:   endMs,
-				Limit:     limit,
-				Sort:      "desc",
-			}
-			if offset > 0 {
-				req.Offset = &offset
-			}
+		req := &tls.SearchLogsRequest{
+			TopicID:   topic,
+			Query:     "*",
+			StartTime: startMs,
+			EndTime:   endMs,
+			Limit:     limit,
+			Sort:      "desc",
+		}
+		for {
 			resp, err := cli.SearchLogsV2(req)
 			if err != nil {
 				fmt.Printf("SEARCH_ERR %T %v\n", err, err)
@@ -108,10 +106,10 @@ func main() {
 					seqSet[seq] = struct{}{}
 				}
 			}
-			if resp.ListOver || len(resp.Logs) == 0 {
+			if resp.ListOver || len(resp.Logs) == 0 || resp.Context == "" {
 				break
 			}
-			offset += int64(len(resp.Logs))
+			req.Context = resp.Context
 		}
 
 		seqs := make([]string, 0, len(seqSet))
@@ -120,8 +118,7 @@ func main() {
 		}
 		sort.Strings(seqs)
 
-		fmt.Printf("SEARCH_RESULT run_id=%s matches=%d unique_seq=%d duplicates=%d seqs=%v status=%s hit_count=%d count=%d pages=%d\n",
-			runID, totalMatches, len(seqSet), totalMatches-len(seqSet), seqs, status, hitCount, totalCount, pages)
+		fmt.Println(formatSearchResult(runID, totalMatches, seqs, includeSeqs, status, hitCount, totalCount, pages))
 
 		if expectExact >= 0 {
 			if len(seqSet) == expectExact && (allowDuplicates || totalMatches == len(seqSet)) {

@@ -188,9 +188,15 @@ typedef struct {
 void ve_tls_config_init(ve_tls_config * config);
 
 ve_tls_producer * ve_tls_producer_create(const ve_tls_config * config);
+/*
+ * Updates the active send target for subsequent requests. Requests that have already
+ * entered the send path may still use the previously captured endpoint/region/topic,
+ * but new requests are expected to converge quickly to the refreshed target.
+ */
 ve_tls_result ve_tls_producer_update_endpoint(ve_tls_producer * producer, const char * endpoint, const char * region, const char * topic_id);
 ve_tls_result ve_tls_producer_update_static_credentials(ve_tls_producer * producer, const char * access_key_id, const char * access_key_secret, const char * security_token);
 ve_tls_result ve_tls_producer_close(ve_tls_producer * producer, int32_t timeout_ms);
+ve_tls_result ve_tls_producer_close_split(ve_tls_producer * producer, int32_t flusher_timeout_ms, int32_t sender_timeout_ms);
 void ve_tls_producer_destroy(ve_tls_producer * producer);
 
 void ve_tls_producer_set_send_done(ve_tls_producer * producer, ve_tls_send_done_fn callback, void * user_param);

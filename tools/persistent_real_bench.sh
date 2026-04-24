@@ -6,7 +6,9 @@ SDK_ROOT="${SCRIPT_DIR:h}"
 BUILD_DIR="${BUILD_DIR:-$SDK_ROOT/build-persistent-real}"
 CONF_FILE="${CONF_FILE:-$SDK_ROOT/tools/real_demo.env}"
 QUERY="$SDK_ROOT/tools/tls_search_logs.go"
-RUNNER="$BUILD_DIR/ve_tls_demo_real"
+QUERY_FORMAT="$SDK_ROOT/tools/tls_search_logs_format.go"
+DEMO_RUNNER="$BUILD_DIR/ve_tls_demo_real"
+BENCH_RUNNER="$BUILD_DIR/ve_tls_persistent_real_bench"
 ARCHIVE_ROOT_DEFAULT="$BUILD_DIR/bench-results"
 
 if [[ -z "${GO_SDK_ROOT:-}" && -d "/Users/bytedance/workspace/go/src/code.byted.org/volcengine/volc-sdk-golang" ]]; then
@@ -64,13 +66,13 @@ if [[ -z "${GO_BIN:-}" || ! -x "$GO_BIN" ]]; then
   echo "missing GO_BIN: $GO_BIN" >&2
   exit 2
 fi
-if [[ ! -x "$RUNNER" ]]; then
+if [[ ! -x "$DEMO_RUNNER" || ! -x "$BENCH_RUNNER" ]]; then
   if [[ -z "$CMAKE_BIN" || ! -x "$CMAKE_BIN" ]]; then
-    echo "missing cmake to build ve_tls_demo_real" >&2
+    echo "missing cmake to build benchmark/demo runners" >&2
     exit 2
   fi
   "$CMAKE_BIN" -S "$SDK_ROOT" -B "$BUILD_DIR" -DVE_TLS_ENABLE_CURL=ON
-  "$CMAKE_BIN" --build "$BUILD_DIR" --target ve_tls_demo_real -j4
+  "$CMAKE_BIN" --build "$BUILD_DIR" --target ve_tls_demo_real ve_tls_persistent_real_bench -j4
 fi
 
 MODE="all"
@@ -139,7 +141,8 @@ query_exact() {
     export PERSIST_QUERY_TIMEOUT_MS="$timeout_ms"
     export PERSIST_QUERY_POLL_MS=1000
     export PERSIST_QUERY_LIMIT=1000
-    "$GO_BIN" run "$QUERY"
+    export PERSIST_QUERY_INCLUDE_SEQS=0
+    "$GO_BIN" run "$QUERY" "$QUERY_FORMAT"
   ) | tee "$out_file"
 }
 
@@ -150,7 +153,29 @@ run_demo_capture() {
   shift 3
   local start_ms=$(( $(date +%s) * 1000 ))
   set +e
-  env "$@" "$RUNNER" --config "$CONF_FILE" --count "$count" --duration-s "$duration_s" --wait-ms "$WAIT_MS" 2>&1 | tee "$out_file" >&2
+  env "$@" "$DEMO_RUNNER" --config "$CONF_FILE" --count "$count" --duration-s "$duration_s" --wait-ms "$WAIT_MS" 2>&1 | tee "$out_file" >&2
+  local rc=$?
+  set -e
+  local end_ms=$(( $(date +%s) * 1000 ))
+  echo "$start_ms $end_ms $rc"
+}
+
+run_bench_capture() {
+  local out_file="$1"
+  shift
+  local -a runner_args
+  runner_args=()
+  while [[ $# -gt 0 ]]; do
+    if [[ "$1" == "--" ]]; then
+      shift
+      break
+    fi
+    runner_args+=("$1")
+    shift
+  done
+  local start_ms=$(( $(date +%s) * 1000 ))
+  set +e
+  env "$@" "$BENCH_RUNNER" --config "$CONF_FILE" "${runner_args[@]}" 2>&1 | tee "$out_file" >&2
   local rc=$?
   set -e
   local end_ms=$(( $(date +%s) * 1000 ))
@@ -161,7 +186,7 @@ parse_run_result() {
   local file="$1"
   local field="$2"
   local line
-  line="$(grep 'RUN_RESULT' "$file" | tail -n 1 || true)"
+  line="$(grep -E 'RUN_RESULT|PERSISTENT_REAL_BENCH' "$file" | tail -n 1 || true)"
   if [[ -z "$line" ]]; then
     echo ""
     return 0
@@ -209,34 +234,7 @@ bench_steady_once() {
   local bench_pass=0
 
   echo "BENCH_START mode=steady rate=$rate run_id=$run_id archive=$log_file"
-  timing="$(run_demo_capture "$log_file" 0 "$DURATION_S" \
-    VE_TLS_ENDPOINT="$VE_TLS_ENDPOINT" \
-    VE_TLS_REGION="$VE_TLS_REGION" \
-    VE_TLS_TOPIC_ID="$VE_TLS_TOPIC_ID" \
-    VE_TLS_ACCESS_KEY_ID="$VE_TLS_ACCESS_KEY_ID" \
-    VE_TLS_ACCESS_KEY_SECRET="$VE_TLS_ACCESS_KEY_SECRET" \
-    VE_TLS_SECURITY_TOKEN="${VE_TLS_SECURITY_TOKEN:-}" \
-    VE_TLS_COMPRESS_TYPE="${VE_TLS_COMPRESS_TYPE:-lz4}" \
-    VE_TLS_SEND_THREAD_COUNT="$SEND_THREAD_COUNT" \
-    VE_TLS_REQUEST_TIMEOUT_MS=10000 \
-    VE_TLS_CONNECT_TIMEOUT_MS=10000 \
-    VE_TLS_SEND_QUEUE_SIZE=4096 \
-    VE_TLS_SEND_QUEUE_FULL_POLICY=block \
-    VE_TLS_SEND_QUEUE_BLOCK_TIMEOUT_MS=100 \
-    VE_TLS_SEND_QUEUE_SAMPLE_EVERY_N=10 \
-    VE_TLS_HTTP_DEBUG=0 \
-    VE_TLS_USE_PERSISTENT=1 \
-    VE_TLS_PERSISTENT_FILE_PATH="$dir" \
-    VE_TLS_MAX_PERSISTENT_LOG_COUNT=200000 \
-    VE_TLS_MAX_PERSISTENT_FILE_SIZE=8388608 \
-    VE_TLS_MAX_PERSISTENT_FILE_COUNT=32 \
-    VE_TLS_DEMO_RUN_ID="$run_id" \
-    VE_TLS_DEMO_SCENARIO=steady_bench \
-    VE_TLS_DEMO_DURATION_S="$DURATION_S" \
-    VE_TLS_DEMO_RATE_LPS="$rate" \
-    VE_TLS_DEMO_PRINT_SUCCESS_CALLBACKS=0 \
-    VE_TLS_FLUSH_INTERVAL_MS="$FLUSH_INTERVAL_MS" \
-    VE_TLS_LOG_COUNT_PER_PACKAGE="$LOG_COUNT_PER_PACKAGE")"
+  timing="$(run_bench_capture "$log_file"     --mode steady     --duration-s "$DURATION_S"     --rate-lps "$rate"     --wait-ms "$WAIT_MS"     --run-id "$run_id"     --persistent-dir "$dir"     --send-thread-count "$SEND_THREAD_COUNT"     --     VE_TLS_ENDPOINT="$VE_TLS_ENDPOINT"     VE_TLS_REGION="$VE_TLS_REGION"     VE_TLS_TOPIC_ID="$VE_TLS_TOPIC_ID"     VE_TLS_ACCESS_KEY_ID="$VE_TLS_ACCESS_KEY_ID"     VE_TLS_ACCESS_KEY_SECRET="$VE_TLS_ACCESS_KEY_SECRET"     VE_TLS_SECURITY_TOKEN="${VE_TLS_SECURITY_TOKEN:-}"     VE_TLS_COMPRESS_TYPE="${VE_TLS_COMPRESS_TYPE:-lz4}"     VE_TLS_SEND_THREAD_COUNT="$SEND_THREAD_COUNT"     VE_TLS_REQUEST_TIMEOUT_MS=10000     VE_TLS_CONNECT_TIMEOUT_MS=10000     VE_TLS_SEND_QUEUE_SIZE=4096     VE_TLS_SEND_QUEUE_FULL_POLICY=block     VE_TLS_SEND_QUEUE_BLOCK_TIMEOUT_MS=100     VE_TLS_SEND_QUEUE_SAMPLE_EVERY_N=10     VE_TLS_HTTP_DEBUG=0     VE_TLS_USE_PERSISTENT=1     VE_TLS_PERSISTENT_FILE_PATH="$dir"     VE_TLS_MAX_PERSISTENT_LOG_COUNT=200000     VE_TLS_MAX_PERSISTENT_FILE_SIZE=8388608     VE_TLS_MAX_PERSISTENT_FILE_COUNT=32     VE_TLS_DEMO_RUN_ID="$run_id"     VE_TLS_FLUSH_INTERVAL_MS="$FLUSH_INTERVAL_MS"     VE_TLS_LOG_COUNT_PER_PACKAGE="$LOG_COUNT_PER_PACKAGE")"
   producer_start_ms="${timing%% *}"
   timing="${timing#* }"
   producer_end_ms="${timing%% *}"
@@ -324,36 +322,7 @@ bench_recover_once() {
   fi
   sleep 5
 
-  timing="$(run_demo_capture "$recover_log" 0 0 \
-    VE_TLS_ENDPOINT="$VE_TLS_ENDPOINT" \
-    VE_TLS_REGION="$VE_TLS_REGION" \
-    VE_TLS_TOPIC_ID="$VE_TLS_TOPIC_ID" \
-    VE_TLS_ACCESS_KEY_ID="$VE_TLS_ACCESS_KEY_ID" \
-    VE_TLS_ACCESS_KEY_SECRET="$VE_TLS_ACCESS_KEY_SECRET" \
-    VE_TLS_SECURITY_TOKEN="${VE_TLS_SECURITY_TOKEN:-}" \
-    VE_TLS_COMPRESS_TYPE="${VE_TLS_COMPRESS_TYPE:-lz4}" \
-    VE_TLS_SEND_THREAD_COUNT="$SEND_THREAD_COUNT" \
-    VE_TLS_REQUEST_TIMEOUT_MS=10000 \
-    VE_TLS_CONNECT_TIMEOUT_MS=10000 \
-    VE_TLS_SEND_QUEUE_SIZE=4096 \
-    VE_TLS_SEND_QUEUE_FULL_POLICY=block \
-    VE_TLS_SEND_QUEUE_BLOCK_TIMEOUT_MS=100 \
-    VE_TLS_SEND_QUEUE_SAMPLE_EVERY_N=10 \
-    VE_TLS_HTTP_DEBUG=0 \
-    VE_TLS_USE_PERSISTENT=1 \
-    VE_TLS_PERSISTENT_FILE_PATH="$dir" \
-    VE_TLS_MAX_PERSISTENT_LOG_COUNT=500000 \
-    VE_TLS_MAX_PERSISTENT_FILE_SIZE=8388608 \
-    VE_TLS_MAX_PERSISTENT_FILE_COUNT=64 \
-    VE_TLS_DEMO_RUN_ID="$run_id" \
-    VE_TLS_DEMO_SCENARIO=recover_bench \
-    VE_TLS_DEMO_RECOVER=1 \
-    VE_TLS_DEMO_EXPECT_SUCCESS="$records" \
-    VE_TLS_DEMO_PRINT_SUCCESS_CALLBACKS=0 \
-    VE_TLS_PERSISTENT_LEASE_TIMEOUT_MS=3000 \
-    VE_TLS_PERSISTENT_HEARTBEAT_INTERVAL_MS=500 \
-    VE_TLS_FLUSH_INTERVAL_MS="$FLUSH_INTERVAL_MS" \
-    VE_TLS_LOG_COUNT_PER_PACKAGE="$LOG_COUNT_PER_PACKAGE")"
+  timing="$(run_bench_capture "$recover_log"     --mode recover     --wait-ms "$WAIT_MS"     --run-id "$run_id"     --persistent-dir "$dir"     --recover-expect "$records"     --send-thread-count "$SEND_THREAD_COUNT"     --     VE_TLS_ENDPOINT="$VE_TLS_ENDPOINT"     VE_TLS_REGION="$VE_TLS_REGION"     VE_TLS_TOPIC_ID="$VE_TLS_TOPIC_ID"     VE_TLS_ACCESS_KEY_ID="$VE_TLS_ACCESS_KEY_ID"     VE_TLS_ACCESS_KEY_SECRET="$VE_TLS_ACCESS_KEY_SECRET"     VE_TLS_SECURITY_TOKEN="${VE_TLS_SECURITY_TOKEN:-}"     VE_TLS_COMPRESS_TYPE="${VE_TLS_COMPRESS_TYPE:-lz4}"     VE_TLS_SEND_THREAD_COUNT="$SEND_THREAD_COUNT"     VE_TLS_REQUEST_TIMEOUT_MS=10000     VE_TLS_CONNECT_TIMEOUT_MS=10000     VE_TLS_SEND_QUEUE_SIZE=4096     VE_TLS_SEND_QUEUE_FULL_POLICY=block     VE_TLS_SEND_QUEUE_BLOCK_TIMEOUT_MS=100     VE_TLS_SEND_QUEUE_SAMPLE_EVERY_N=10     VE_TLS_HTTP_DEBUG=0     VE_TLS_USE_PERSISTENT=1     VE_TLS_PERSISTENT_FILE_PATH="$dir"     VE_TLS_MAX_PERSISTENT_LOG_COUNT=500000     VE_TLS_MAX_PERSISTENT_FILE_SIZE=8388608     VE_TLS_MAX_PERSISTENT_FILE_COUNT=64     VE_TLS_DEMO_RUN_ID="$run_id"     VE_TLS_PERSISTENT_LEASE_TIMEOUT_MS=3000     VE_TLS_PERSISTENT_HEARTBEAT_INTERVAL_MS=500     VE_TLS_FLUSH_INTERVAL_MS="$FLUSH_INTERVAL_MS"     VE_TLS_LOG_COUNT_PER_PACKAGE="$LOG_COUNT_PER_PACKAGE")"
   producer_start_ms="${timing%% *}"
   timing="${timing#* }"
   producer_end_ms="${timing%% *}"
