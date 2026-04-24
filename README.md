@@ -180,6 +180,8 @@ ve_tls_producer_destroy(p2);
 
 如果业务需要在进程崩溃、异常退出或短时网络失败后继续补发，可开启 persistent 模式，将待发送日志先写入本地目录，并在重启后显式调用 `ve_tls_producer_recover()` 回灌 backlog。
 
+persistent 语义是 **at-least-once**：SDK 优先保证已入 persistent 的日志在崩溃后可以 recover 补发，但不承诺 exactly-once。`success callback` 表示请求已进入发送成功路径，不等价于 checkpoint 已 durable 落盘；在 `partial_send_then_crash` 这类“部分发送成功后立即崩溃”的边界场景中，recover 后允许出现少量重复，但不应漏发。若业务不能接受重复，必须依赖业务主键或消费侧去重。
+
 ```c
 ve_tls_config cfg;
 ve_tls_config_init(&cfg);
@@ -275,7 +277,7 @@ export GO_SDK_ROOT=/path/to/volc-sdk-golang
 
 - baseline：正常发送与重复 recover 不重放
 - crash_before_send：入盘后、发送前崩溃，重启 recover 后补齐
-- partial_send_then_crash：部分发送成功后崩溃，重启 recover 后补齐
+- partial_send_then_crash：部分发送成功后崩溃，重启 recover 后补齐；以 `unique_seq` 完整性为准，允许 crash 边界重复
 - timeout_then_recover：网络失败/超时后崩溃，重启 recover 后补齐
 - terminal_auth_drop：鉴权终态失败后不重放
 - quota_reject_new：用 persistent quota 打满模拟本地持久化空间耗尽，验证 `reject_new` 后只恢复已落盘日志
@@ -285,7 +287,9 @@ export GO_SDK_ROOT=/path/to/volc-sdk-golang
 说明：
 
 - `quota_reject_new` 当前覆盖的是 SDK 自身 quota 打满，不等同于真实文件系统 `ENOSPC`
+- `partial_send_then_crash` 的结果判断以 `unique_seq` 完整性为准；该场景允许 `duplicates=` 非零，但不允许 `unique_seq` 少于预期
 - `checkpoint_corruption` 当前修复策略是将损坏的 checkpoint 重置为零 checkpoint 后继续 recover；这能优先保证完整性，但在“已有部分 ack 且 checkpoint 丢失”的更复杂场景下，语义会退化为可能重复发送
+- `success callback` 不代表 checkpoint 已 durable 落盘；若在 success callback 后、checkpoint 持久化前崩溃，recover 仍可能重放边界内的少量日志
 - `stale_takeover` 的结果判断以 `unique_seq` 完整性为准；若服务端在重试歧义下出现重复写入，会在查询结果里用 `duplicates=` 显式体现
 - `tools/persistent_real_bench.sh` 会把每轮 benchmark 的 stdout/stderr 和查询结果归档到 `build-persistent-real/bench-results/<timestamp>/`
 - benchmark 当前支持两类模式：steady-state rate sweep 和 recover drain throughput

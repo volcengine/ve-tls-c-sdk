@@ -6,6 +6,7 @@ SDK_ROOT="${SCRIPT_DIR:h}"
 BUILD_DIR="${BUILD_DIR:-$SDK_ROOT/build-persistent-real}"
 CONF_FILE="${CONF_FILE:-$SDK_ROOT/tools/real_demo.env}"
 QUERY="$SDK_ROOT/tools/tls_search_logs.go"
+QUERY_FORMAT="$SDK_ROOT/tools/tls_search_logs_format.go"
 RUNNER="$BUILD_DIR/ve_tls_demo_real"
 
 if [[ -z "${GO_SDK_ROOT:-}" && -d "/Users/bytedance/workspace/go/src/code.byted.org/volcengine/volc-sdk-golang" ]]; then
@@ -82,7 +83,7 @@ run_query_exact() {
     export PERSIST_QUERY_POLL_MS=1000
     export PERSIST_QUERY_LIMIT=500
     export PERSIST_QUERY_ALLOW_DUPLICATES="$allow_duplicates"
-    "$GO_BIN" run "$QUERY"
+    "$GO_BIN" run "$QUERY" "$QUERY_FORMAT"
   )
 }
 
@@ -230,7 +231,7 @@ scenario_partial_send_then_crash() {
     VE_TLS_PERSISTENT_HEARTBEAT_INTERVAL_MS=500 \
     VE_TLS_FLUSH_INTERVAL_MS=0 \
     VE_TLS_LOG_COUNT_PER_PACKAGE=1
-  run_query_exact "$run_id" 30 "$start_ms" $(( $(date +%s) * 1000 + 60000 ))
+  run_query_exact "$run_id" 30 "$start_ms" $(( $(date +%s) * 1000 + 60000 )) 60000 1
 }
 
 scenario_timeout_then_recover() {

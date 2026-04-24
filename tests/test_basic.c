@@ -6202,6 +6202,11 @@ static int test_close_rejects_new_writes(void) {
 static int g_update_called = 0;
 static char g_update_seen_url[256];
 static char g_update_seen_ak[128];
+static int g_update_mix_called = 0;
+static int g_update_mix_first_started = 0;
+static int g_update_mix_release_first = 0;
+static char g_update_mix_first_url[256];
+static char g_update_mix_second_url[256];
 
 static int test_http_capture_url_and_ak_do(ve_tls_http_client * client, const ve_tls_http_request * req, ve_tls_http_response * resp) {
     (void)client;
@@ -6228,6 +6233,39 @@ static int test_http_capture_url_and_ak_do(ve_tls_http_client * client, const ve
     }
     resp->status_code = 200;
     resp->request_id = strdup("rid-update");
+    resp->body = NULL;
+    resp->body_size = 0;
+    return 0;
+}
+
+static int test_http_capture_update_mixed_do(ve_tls_http_client * client, const ve_tls_http_request * req, ve_tls_http_response * resp) {
+    (void)client;
+    if (!req || !resp) {
+        return -1;
+    }
+    int call = __atomic_add_fetch(&g_update_mix_called, 1, __ATOMIC_RELAXED);
+    if (req->url) {
+        if (call == 1) {
+            snprintf(g_update_mix_first_url, sizeof(g_update_mix_first_url), "%s", req->url);
+        } else if (call == 2) {
+            snprintf(g_update_mix_second_url, sizeof(g_update_mix_second_url), "%s", req->url);
+        }
+    }
+    if (call == 1) {
+        __atomic_store_n(&g_update_mix_first_started, 1, __ATOMIC_RELEASE);
+        for (int i = 0; i < 2000; i++) {
+            if (__atomic_load_n(&g_update_mix_release_first, __ATOMIC_ACQUIRE)) {
+                break;
+            }
+            if (g_real_platform.sleep_ms) {
+                g_real_platform.sleep_ms(1);
+            } else {
+                usleep(1000);
+            }
+        }
+    }
+    resp->status_code = 200;
+    resp->request_id = strdup("rid-update-mixed");
     resp->body = NULL;
     resp->body_size = 0;
     return 0;
@@ -6296,6 +6334,89 @@ static int test_runtime_config_update_effective_for_new_requests(void) {
     }
     ve_tls_producer_destroy(p);
     return ok ? 0 : -1;
+}
+
+static int test_update_endpoint_allows_inflight_old_request_and_converges_new_requests(void) {
+    __atomic_store_n(&g_update_mix_called, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_update_mix_first_started, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_update_mix_release_first, 0, __ATOMIC_RELAXED);
+    g_update_mix_first_url[0] = 0;
+    g_update_mix_second_url[0] = 0;
+
+    ve_tls_config cfg;
+    ve_tls_config_init(&cfg);
+    g_real_platform = cfg.platform;
+    cfg.endpoint = "https://old.example.com";
+    cfg.region = "cn-beijing";
+    cfg.topic_id = "old-topic";
+    cfg.access_key_id = "ak1";
+    cfg.access_key_secret = "sk1";
+    cfg.retry_policy.max_attempts = 1;
+    cfg.flush_interval_ms = 0;
+    cfg.send_thread_count = 1;
+    cfg.log_count_per_package = 1;
+    cfg.http_client.do_request = test_http_capture_update_mixed_do;
+    cfg.http_client.free_response = test_http_ok_free;
+
+    ve_tls_producer * p = ve_tls_producer_create(&cfg);
+    if (!p) {
+        return -1;
+    }
+
+    ve_tls_kv kvs[1];
+    kvs[0].key = "k";
+    kvs[0].value = "v1";
+    if (ve_tls_producer_add_log_kv(p, 0, kvs, 1, 1) != VE_TLS_OK) {
+        ve_tls_producer_destroy(p);
+        return -1;
+    }
+    for (int i = 0; i < 2000; i++) {
+        if (__atomic_load_n(&g_update_mix_first_started, __ATOMIC_ACQUIRE)) {
+            break;
+        }
+        cfg.platform.sleep_ms(1);
+    }
+    if (!__atomic_load_n(&g_update_mix_first_started, __ATOMIC_ACQUIRE)) {
+        ve_tls_producer_destroy(p);
+        return -1;
+    }
+
+    if (ve_tls_producer_update_endpoint(p, "https://new.example.com", "cn-beijing", "new-topic") != VE_TLS_OK) {
+        __atomic_store_n(&g_update_mix_release_first, 1, __ATOMIC_RELEASE);
+        ve_tls_producer_destroy(p);
+        return -1;
+    }
+
+    kvs[0].value = "v2";
+    if (ve_tls_producer_add_log_kv(p, 0, kvs, 1, 1) != VE_TLS_OK) {
+        __atomic_store_n(&g_update_mix_release_first, 1, __ATOMIC_RELEASE);
+        ve_tls_producer_destroy(p);
+        return -1;
+    }
+
+    __atomic_store_n(&g_update_mix_release_first, 1, __ATOMIC_RELEASE);
+    for (int i = 0; i < 2000; i++) {
+        if (__atomic_load_n(&g_update_mix_called, __ATOMIC_ACQUIRE) >= 2) {
+            break;
+        }
+        cfg.platform.sleep_ms(1);
+    }
+
+    ve_tls_result close_rc = ve_tls_producer_close(p, 5000);
+    ve_tls_producer_destroy(p);
+    if (close_rc != VE_TLS_OK) {
+        return -1;
+    }
+    if (__atomic_load_n(&g_update_mix_called, __ATOMIC_ACQUIRE) < 2) {
+        return -1;
+    }
+    if (strstr(g_update_mix_first_url, "https://old.example.com/PutLogs?TopicId=old-topic") == NULL) {
+        return -1;
+    }
+    if (strstr(g_update_mix_second_url, "https://new.example.com/PutLogs?TopicId=new-topic") == NULL) {
+        return -1;
+    }
+    return 0;
 }
 
 static int test_runtime_snapshot_reflects_runtime_updates(void) {
@@ -10189,6 +10310,7 @@ int main(void) {
     RUN(23, test_create_fail_fast_missing_required());
     RUN(24, test_create_deep_copies_string_fields());
     RUN(25, test_runtime_config_update_effective_for_new_requests());
+    RUN(148, test_update_endpoint_allows_inflight_old_request_and_converges_new_requests());
     RUN(109, test_runtime_snapshot_reflects_runtime_updates());
     RUN(110, test_obj_pool_reuses_recent_item());
     RUN(26, test_runtime_update_rejected_during_close());

@@ -8,6 +8,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#include <errno.h>
 
 typedef struct {
     char * kv[128][2];
@@ -60,6 +62,31 @@ typedef struct {
     ve_tls_result rc;
     volatile int done;
 } close_thread_ctx;
+
+static int64_t monotonic_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+}
+
+static void pace_rate_lps(int32_t rate_lps, int64_t * next_emit_ns) {
+    int64_t step_ns;
+    int64_t sleep_ns;
+    struct timespec req;
+    if (rate_lps <= 0 || !next_emit_ns) return;
+    step_ns = 1000000000LL / rate_lps;
+    if (step_ns <= 0) step_ns = 1;
+    if (*next_emit_ns == 0) {
+        *next_emit_ns = monotonic_ns();
+    }
+    *next_emit_ns += step_ns;
+    sleep_ns = *next_emit_ns - monotonic_ns();
+    if (sleep_ns <= 0) return;
+    req.tv_sec = sleep_ns / 1000000000LL;
+    req.tv_nsec = sleep_ns % 1000000000LL;
+    while (nanosleep(&req, &req) != 0 && errno == EINTR) {
+    }
+}
 
 static const char * k_tls_700_vals[] = {
     "1abcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()_+abcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()_+abcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()_+",
@@ -460,7 +487,7 @@ int main(int argc, char ** argv) {
     int32_t add_ok = 0;
     int32_t add_fail = 0;
     int32_t seq = 0;
-    int32_t sleep_ms = 0;
+    int64_t next_emit_ns = 0;
     int32_t kv_count = 0;
     int32_t flush_interval_ms = 1000;
     int32_t log_count_per_package = 1024;
@@ -660,9 +687,6 @@ int main(int argc, char ** argv) {
             if (cfg.platform.sleep_ms) cfg.platform.sleep_ms(50);
         }
     } else {
-        if (rate_lps > 0 && rate_lps <= 1000) {
-            sleep_ms = 1000 / rate_lps;
-        }
         end_ms = duration_s > 0 ? begin_ms + (int64_t)duration_s * 1000 : 0;
         for (;;) {
             int64_t now_ms = cfg.platform.time_ms ? cfg.platform.time_ms() : 0;
@@ -699,8 +723,8 @@ int main(int argc, char ** argv) {
                 print_progress("steady", write_mode, profile, now_ms - begin_ms, add_ok, add_fail, producer, &progress_prev);
                 next_report_ms += (int64_t)report_interval_s * 1000;
             }
-            if (sleep_ms > 0 && cfg.platform.sleep_ms) {
-                cfg.platform.sleep_ms(sleep_ms);
+            if (rate_lps > 0) {
+                pace_rate_lps(rate_lps, &next_emit_ns);
             }
         }
         (void)ve_tls_producer_flush(producer);
