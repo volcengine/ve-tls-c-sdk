@@ -118,16 +118,37 @@ static int test_android_binding_build_persistent_path_and_clamps_sender(void) {
     ve_tls_android_config_view in;
     ve_tls_android_runtime_options runtime;
     ve_tls_config out;
+    ve_tls_kv tags[1];
     char rewritten[128] = {0};
     ve_tls_result rc;
 
     memset(&in, 0, sizeof(in));
     memset(&runtime, 0, sizeof(runtime));
+    tags[0].key = "tag_key";
+    tags[0].value = "tag_value";
 
-    in.compress_type = VE_TLS_ANDROID_COMPRESS_LZ4;
+    in.compress_type = VE_TLS_ANDROID_COMPRESS_UNSPECIFIED;
     in.send_thread_count = 8;
     in.use_persistent = 1;
     in.destroy_wait_ms = 15000;
+    in.log_tags = tags;
+    in.log_tag_count = 1;
+    in.persistent_file_path = "/tmp/persistent";
+    in.log_bytes_per_package = 4096;
+    in.log_count_per_package = 128;
+    in.flush_interval_ms = 3000;
+    in.max_buffer_bytes = 65536;
+    in.retry_max_attempts = 7;
+    in.retry_total_timeout_ms = 90000;
+    in.retry_initial_interval_ms = 500;
+    in.retry_max_interval_ms = 10000;
+    in.connect_timeout_ms = 10000;
+    in.request_timeout_ms = 15000;
+    in.enable_time_ns = 1;
+    in.max_persistent_log_count = 65536;
+    in.max_persistent_file_size = 1048576;
+    in.max_persistent_file_count = 10;
+    in.force_flush_disk = 1;
 
     rc = ve_tls_android_binding_build_config(&in, &out, &runtime);
     if (rc != VE_TLS_OK) {
@@ -136,6 +157,45 @@ static int test_android_binding_build_persistent_path_and_clamps_sender(void) {
     }
     if (out.send_thread_count != 1) {
         fprintf(stderr, "unexpected send_thread_count=%d, want 1\n", out.send_thread_count);
+        return 1;
+    }
+    if (strcmp(out.compress_type, "lz4") != 0) {
+        fprintf(stderr, "unspecified compress type should default to lz4, got %s\n", out.compress_type);
+        return 1;
+    }
+    if (strcmp(out.persistent_file_path, "/tmp/persistent") != 0) {
+        fprintf(stderr, "persistent_file_path was not copied\n");
+        return 1;
+    }
+    if (out.log_tags != tags || out.log_tag_count != 1) {
+        fprintf(stderr, "log tags were not copied\n");
+        return 1;
+    }
+    if (out.log_bytes_per_package != 4096 ||
+        out.log_count_per_package != 128 ||
+        out.flush_interval_ms != 3000 ||
+        out.max_buffer_bytes != 65536) {
+        fprintf(stderr, "packet and buffer fields were not copied\n");
+        return 1;
+    }
+    if (out.retry_policy.max_attempts != 7 ||
+        out.retry_policy.total_timeout_ms != 90000 ||
+        out.retry_policy.initial_interval_ms != 500 ||
+        out.retry_policy.max_interval_ms != 10000) {
+        fprintf(stderr, "retry policy fields were not copied\n");
+        return 1;
+    }
+    if (out.connect_timeout_ms != 10000 ||
+        out.request_timeout_ms != 15000 ||
+        out.enable_time_ns != 1) {
+        fprintf(stderr, "timeout/time fields were not copied\n");
+        return 1;
+    }
+    if (out.max_persistent_log_count != 65536 ||
+        out.max_persistent_file_size != 1048576 ||
+        out.max_persistent_file_count != 10 ||
+        out.force_flush_disk != 1) {
+        fprintf(stderr, "persistent limit fields were not copied\n");
         return 1;
     }
     if (!runtime.persistent_enabled) {
@@ -237,6 +297,17 @@ static int test_android_binding_build_config_runtime_defaults_without_memset(voi
     }
     if (runtime.destroy != ve_tls_producer_destroy) {
         fprintf(stderr, "runtime.destroy should default to ve_tls_producer_destroy\n");
+        return 1;
+    }
+
+    in.compress_type = VE_TLS_ANDROID_COMPRESS_ZLIB;
+    rc = ve_tls_android_binding_build_config(&in, &out, &runtime);
+    if (rc != VE_TLS_OK) {
+        fprintf(stderr, "build_config failed for zlib compress type: %d\n", rc);
+        return 1;
+    }
+    if (strcmp(out.compress_type, "zlib") != 0) {
+        fprintf(stderr, "zlib compress type should map to zlib, got %s\n", out.compress_type);
         return 1;
     }
 

@@ -12,8 +12,10 @@ typedef ve_tls_result (*ve_tls_android_close_split_fn)(ve_tls_producer * produce
 typedef void (*ve_tls_android_destroy_fn)(ve_tls_producer * producer);
 
 typedef enum {
-    VE_TLS_ANDROID_COMPRESS_NONE = 0,
-    VE_TLS_ANDROID_COMPRESS_LZ4 = 1
+    VE_TLS_ANDROID_COMPRESS_UNSPECIFIED = 0,
+    VE_TLS_ANDROID_COMPRESS_NONE = 1,
+    VE_TLS_ANDROID_COMPRESS_LZ4 = 2,
+    VE_TLS_ANDROID_COMPRESS_ZLIB = 3
 } ve_tls_android_compress_type;
 
 typedef struct {
@@ -32,9 +34,27 @@ typedef struct {
     const char * security_token;
     const char * source;
     const char * hash_key;
+    const ve_tls_kv * log_tags;
+    size_t log_tag_count;
     ve_tls_android_compress_type compress_type;
     int32_t send_thread_count;
+    int32_t log_bytes_per_package;
+    int32_t log_count_per_package;
+    int32_t flush_interval_ms;
+    int32_t max_buffer_bytes;
+    int32_t retry_max_attempts;
+    int32_t retry_total_timeout_ms;
+    int32_t retry_initial_interval_ms;
+    int32_t retry_max_interval_ms;
+    int32_t connect_timeout_ms;
+    int32_t request_timeout_ms;
+    int32_t enable_time_ns;
     int32_t use_persistent;
+    const char * persistent_file_path;
+    int32_t max_persistent_log_count;
+    int32_t max_persistent_file_size;
+    int32_t max_persistent_file_count;
+    int32_t force_flush_disk;
     int32_t destroy_wait_ms;
     int32_t destroy_flusher_wait_ms;
     int32_t destroy_sender_wait_ms;
