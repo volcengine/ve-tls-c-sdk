@@ -6,7 +6,7 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 
 option(VE_TLS_ENABLE_PTHREAD "Enable pthread-based runtime" ON)
 option(VE_TLS_ENABLE_CURL "Enable libcurl http adapter" OFF)
-option(VE_TLS_ENABLE_ZLIB "Enable zlib compression" OFF)
+option(VE_TLS_ENABLE_ZLIB "Enable zlib compression" ON)
 option(VE_TLS_ENABLE_LZ4 "Enable lz4 compression" ON)
 option(VE_TLS_BUILD_TESTS "Build unit tests" ON)
 option(VE_TLS_BUILD_TOOLS "Build demo and benchmark tools" ON)

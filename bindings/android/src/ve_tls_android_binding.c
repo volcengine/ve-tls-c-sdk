@@ -13,6 +13,7 @@ static void ve_tls_android_config_view_copy_strings(const ve_tls_android_config_
     out->access_key_secret = in->access_key_secret;
     out->security_token = in->security_token;
     out->hash_key = in->hash_key;
+    out->persistent_file_path = in->persistent_file_path;
 }
 
 static void ve_tls_android_config_view_copy_http_client(const ve_tls_android_config_view * in, ve_tls_config * out) {
@@ -22,6 +23,29 @@ static void ve_tls_android_config_view_copy_http_client(const ve_tls_android_con
     out->http_client.do_request = in->http_client->do_request;
     out->http_client.free_response = in->http_client->free_response;
     out->http_client.user_data = in->http_client->user_data;
+}
+
+static void ve_tls_android_config_view_copy_runtime_fields(const ve_tls_android_config_view * in, ve_tls_config * out) {
+    if (!in || !out) {
+        return;
+    }
+    out->log_tags = in->log_tags;
+    out->log_tag_count = in->log_tag_count;
+    out->log_bytes_per_package = in->log_bytes_per_package;
+    out->log_count_per_package = in->log_count_per_package;
+    out->flush_interval_ms = in->flush_interval_ms;
+    out->max_buffer_bytes = in->max_buffer_bytes;
+    out->retry_policy.max_attempts = in->retry_max_attempts;
+    out->retry_policy.total_timeout_ms = in->retry_total_timeout_ms;
+    out->retry_policy.initial_interval_ms = in->retry_initial_interval_ms;
+    out->retry_policy.max_interval_ms = in->retry_max_interval_ms;
+    out->connect_timeout_ms = in->connect_timeout_ms;
+    out->request_timeout_ms = in->request_timeout_ms;
+    out->enable_time_ns = in->enable_time_ns;
+    out->max_persistent_log_count = in->max_persistent_log_count;
+    out->max_persistent_file_size = in->max_persistent_file_size;
+    out->max_persistent_file_count = in->max_persistent_file_count;
+    out->force_flush_disk = in->force_flush_disk;
 }
 
 static int ve_tls_android_binding_sanitize_process_name(const char * in, char * out, size_t out_cap) {
@@ -133,9 +157,20 @@ ve_tls_result ve_tls_android_binding_build_config(
     if (in->use_persistent) {
         out->send_thread_count = 1;
     }
-    out->compress_type = "none";
-    if (in->compress_type == VE_TLS_ANDROID_COMPRESS_LZ4) {
-        out->compress_type = "lz4";
+    switch (in->compress_type) {
+        case VE_TLS_ANDROID_COMPRESS_NONE:
+            out->compress_type = "none";
+            break;
+        case VE_TLS_ANDROID_COMPRESS_LZ4:
+            out->compress_type = "lz4";
+            break;
+        case VE_TLS_ANDROID_COMPRESS_ZLIB:
+            out->compress_type = "zlib";
+            break;
+        case VE_TLS_ANDROID_COMPRESS_UNSPECIFIED:
+        default:
+            out->compress_type = "lz4";
+            break;
     }
     if (runtime) {
         runtime->destroy_wait_ms = in->destroy_wait_ms;
@@ -149,6 +184,7 @@ ve_tls_result ve_tls_android_binding_build_config(
         runtime->destroy = ve_tls_producer_destroy;
     }
     ve_tls_android_config_view_copy_strings(in, out);
+    ve_tls_android_config_view_copy_runtime_fields(in, out);
     ve_tls_android_config_view_copy_http_client(in, out);
     return VE_TLS_OK;
 }

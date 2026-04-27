@@ -8,10 +8,11 @@ TLS C Producer（纯 C 实现）是面向 **Linux 服务器 / 嵌入式 / 多端
   - 写入侧仅入内存队列，不阻塞业务线程（除非你选择阻塞背压策略）
 - 聚合与压缩上传
   - 支持按超时时间、日志条数、日志字节数聚合发送
-  - 支持 `lz4`/`zlib`（按编译能力自动选择默认压缩）
-- HashKey 有序与多 key 并发
-  - 同一 hashKey 严格有序
-  - 不同 hashKey 并发发送提升吞吐
+  - 默认构建支持 `lz4`、`zlib` 与 `none`；运行时默认压缩类型仍是 `lz4`
+- HashKey 透传与可选有序治理
+  - 用户设置的 hashKey 会作为 PutLogs `x-tls-hashkey` header 透传给服务端
+  - 非 fast_send/key_queue 路径可对同一 hashKey 串行发送，并允许不同 hashKey 并发
+  - 命中 fast_send 且配置多 sender 时优先吞吐，不承诺同一 hashKey 严格有序；需要严格顺序时建议显式 `send_thread_count=1`
 - 背压与队列保护
   - 有界 send_queue，支持 `DROP/BLOCK/DROP_SAMPLED`
   - key_queue 保护与限流/熔断，避免热点与故障扩散
@@ -23,6 +24,9 @@ TLS C Producer（纯 C 实现）是面向 **Linux 服务器 / 嵌入式 / 多端
 - 鉴权
   - 支持静态 AK/SK
   - 支持 STS/临时凭证（credentials_provider 动态刷新）
+- 本地持久化（persistent）
+  - 支持 append-before-send、崩溃后 recover、checkpoint、segment 回收、租约与 stale takeover
+  - 语义为 at-least-once，允许崩溃/重试边界出现少量重复，不提供 exactly-once
 - Agent 与 IO 统计头
   - 默认携带 `User-Agent: volc-tls-c/producer/v<version>`
   - PutLogs 固定携带 IO 统计头（rawsize/compresstype/log-count/earliest/latest/apiversion），减少服务端解析成本
@@ -49,7 +53,6 @@ adapters/      平台适配层
 bindings/      平台绑定
 tests/         测试
 tools/         工具与脚本
-docs/          文档
 ```
 
 ## 安装与构建
@@ -57,7 +60,7 @@ docs/          文档
 ### 依赖
 
 - 启用真实网络发送：需要 `libcurl`
-- 压缩（可选）：`lz4` 或 `zlib`
+- 压缩：默认启用 `lz4` 与 `zlib`；如需最小包，可通过 `-DVE_TLS_ENABLE_ZLIB=OFF` 关闭 zlib
 
 ### 构建（CMake）
 
@@ -72,6 +75,15 @@ cmake --build build
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DVE_TLS_ENABLE_CURL=ON
 cmake --build build
 ```
+
+如需最小包关闭 zlib 压缩，可以显式关闭：
+
+```
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DVE_TLS_ENABLE_CURL=ON -DVE_TLS_ENABLE_ZLIB=OFF
+cmake --build build
+```
+
+Android binding 暴露 `none`/`lz4`/`zlib`；未指定时仍默认使用 `lz4`。
 
 ## 使用
 
@@ -172,9 +184,17 @@ ve_tls_producer_destroy(p2);
 
 ### 时间字段与 IO 统计头说明
 
-`time/timeNs` 与 `log-count/earliest-log-time/latest-log-time` 的语义、推荐用法与 raw 写入边界见：
+- `time_ms` 使用毫秒时间戳；`enable_time_ns=1` 后，`*_time_parts` 与模板 API 可写入 `timeNs`
+- PutLogs 会固定携带 `x-tls-log-count`、`x-tls-earliest-log-time`、`x-tls-latest-log-time`、`x-tls-rawsize`、`x-tls-compresstype`、`x-tls-apiversion`
+- raw API 适合已经完成编码的日志体；如果业务需要 SDK 维护 kv/time/timeNs/log tags，优先使用 kv 或 template API
 
-- [docs/producer-time-and-io-stats.md](docs/producer-time-and-io-stats.md)
+### HashKey 说明
+
+- 调用级 hashKey 优先级高于 `cfg.hash_key`；都为空时发送空 `x-tls-hashkey`
+- SDK 不计算服务端 hash；该字符串原样进入 PutLogs `x-tls-hashkey` header，由服务端按 PutLogs 语义处理
+- 服务端要求非空 `x-tls-hashkey` 为 32 位以内十六进制分区位置值，且不能等于全 `f` 上界；如需按业务 key 固定路由，业务侧应先把 key 映射为服务端可接受的 hashKey
+- 本地 key_queue 使用同一规范化字符串作为限流、熔断与非 fast_send 路径下的串行发送 key
+- 若必须保证客户端侧同一 hashKey 严格串行，建议显式配置 `send_thread_count=1`；命中 fast_send 且配置多 sender 时同一 hashKey 可能并发发送
 
 ### Persistent 快速开始
 
@@ -196,8 +216,11 @@ cfg.persistent_file_path = "/var/lib/ve-tls/persistent";
 cfg.max_persistent_log_count = 200000;
 cfg.max_persistent_file_size = 8 * 1024 * 1024;
 cfg.max_persistent_file_count = 32;
+cfg.persistent_max_records = 200000;
+cfg.persistent_max_segments = 32;
 cfg.persistent_overflow_policy = VE_TLS_POVERFLOW_REJECT_NEW;
 cfg.persistent_open_mode = VE_TLS_POPEN_TAKEOVER_IF_STALE;
+cfg.send_thread_count = 1;  // 资源可比性优先时建议显式固定；C core 本身支持多 sender
 
 ve_tls_producer * p = ve_tls_producer_create(&cfg);
 if (!p) {
@@ -214,11 +237,51 @@ if (ve_tls_producer_recover(p) != VE_TLS_OK) {
 
 persistent 对外能力要点：
 
-- 本地持久化 + 重启恢复：通过 `use_persistent`、`persistent_file_path` 和 `ve_tls_producer_recover()` 组成完整链路
+- 本地持久化 + 重启恢复：通过 `use_persistent`、`persistent_file_path` 和 `ve_tls_producer_recover()` 组成完整链路；建议在新写入前先 recover
 - 多种持久化溢出策略：支持 `REJECT_NEW`、`BLOCK`、`DROP_OLDEST_UNACKED`、`DROP_NEWEST_SAMPLE`
 - 租约与接管：`persistent_open_mode` 默认 `TAKEOVER_IF_STALE`，可用于 stale owner 接管恢复
 - 恢复健壮性：可修复截断尾记录、损坏 checkpoint 等常见异常场景
-- 发送并发：SDK 支持 persistent + 多 sender；若不显式配置，默认 `send_thread_count=1`
+- 发送并发：C core 支持 persistent + 多 sender；benchmark/Android 对齐场景建议显式配置 `send_thread_count=1`
+- 文件布局：目录下包含 `manifest`、`lease`、`checkpoint` 与 `seg-000001.log` 这类 segment 文件
+
+### Persistent 配置字段
+
+| 字段 | 必填/默认 | 说明 |
+| --- | --- | --- |
+| `use_persistent` | 默认 `0` | 设为 `1` 开启本地持久化 |
+| `persistent_file_path` | 开启 persistent 后必填 | 持久化目录；建议每个 Producer/进程使用独立目录，除非明确需要 stale takeover |
+| `max_persistent_file_size` | 开启 persistent 后必填 | 单个 segment 文件最大字节数；推荐 `1-10 MiB`，示例使用 `8 MiB` |
+| `max_persistent_file_count` | 开启 persistent 后必填 | segment 文件上限；示例使用 `32` |
+| `max_persistent_log_count` | 开启 persistent 后必填 | 单个 segment 最大记录数；示例使用 `200000` |
+| `persistent_max_bytes` | 默认 `max_persistent_file_size * max_persistent_file_count` | 本地 persistent 总字节上限 |
+| `persistent_max_records` | 默认 `max_persistent_log_count` | 本地 persistent 总记录上限；如果希望全局可缓存更多日志，需要显式调大 |
+| `persistent_max_segments` | 默认 `max_persistent_file_count` | 本地 segment 总数上限 |
+| `persistent_high_watermark_pct` | 默认 `85` | 超过软水位后优先尝试回收已 ack segment |
+| `persistent_low_watermark_pct` | 默认 `70` | 预留给回收/水位策略的低水位 |
+| `persistent_overflow_policy` | 默认 `VE_TLS_POVERFLOW_REJECT_NEW` | 本地持久化空间不足时的策略 |
+| `persistent_sample_every_n` | 默认 `10` | `DROP_NEWEST_SAMPLE` 策略下的采样参数 |
+| `persistent_block_timeout_ms` | 默认 `1000` | `BLOCK` 策略下等待可用空间的最长时间 |
+| `persistent_lease_timeout_ms` | 默认 `60000` | stale owner 判定超时时间 |
+| `persistent_heartbeat_interval_ms` | 默认 `10000` | owner lease 心跳间隔 |
+| `persistent_open_mode` | 默认 `VE_TLS_POPEN_TAKEOVER_IF_STALE` | `FAIL_IF_OWNED` 会在目录被占用时直接失败，`TAKEOVER_IF_STALE` 允许 stale 后接管 |
+| `send_thread_count` | C core 会按内存预算派生默认值 | persistent 不强制单 sender；为了资源对比、Android 对齐和问题定界，建议显式设为 `1` |
+
+溢出策略说明：
+
+- `VE_TLS_POVERFLOW_REJECT_NEW`：空间不足时拒绝新日志，`add_log` 返回 `VE_TLS_DROP_ERROR`
+- `VE_TLS_POVERFLOW_BLOCK`：空间不足时等待回收，超过 `persistent_block_timeout_ms` 返回 `VE_TLS_TIMEOUT`
+- `VE_TLS_POVERFLOW_DROP_OLDEST_UNACKED`：删除最老未 ack segment 换空间，可能牺牲 at-least-once 完整性，只适合“保新不保旧”场景
+- `VE_TLS_POVERFLOW_DROP_NEWEST_SAMPLE`：按 `persistent_sample_every_n` 采样丢弃新日志，用于过载降采样
+
+### Persistent 可靠性边界
+
+- SDK 在写入内存队列前先 append 到本地 segment；append 成功后，进程崩溃可由 `ve_tls_producer_recover()` 重放
+- checkpoint 记录已 ack 的日志进度，并会在 ack 增量、时间窗口或 close/flush 时持久化；不是每次 success callback 都立即 durable
+- segment append 当前不对每条日志执行 `fsync`；`force_flush_disk` 字段已暴露给绑定层/配置入口，但 C core 目前不把它作为“每次 AddLog 强制落盘”的语义使用
+- `VE_TLS_OK` 最终结果会推进 checkpoint；终态丢弃（例如不可重试鉴权失败）也会作为已处理范围推进，避免 recover 无限重放毒丸日志
+- recover 会跳过 `checkpoint.acked_log_id` 之前的记录，遇到截断尾记录会 repair tail；checkpoint 损坏时会重置为零 checkpoint，优先保证不漏发，但可能扩大重复范围
+- lease 用于避免多个活跃 owner 同时写同一路径；stale takeover 只应作为崩溃恢复机制，不建议多个活跃进程共享同一个 persistent 目录
+- at-least-once 只覆盖“已成功进入 persistent 的日志”；如果 `add_log` 因 persistent quota、内存背压或参数错误返回失败，该日志不在 SDK 恢复范围内
 
 ### 真实环境 Demo
 
@@ -305,6 +368,7 @@ export GO_SDK_ROOT=/path/to/volc-sdk-golang
 - `VE_TLS_DEMO_EXIT_AFTER_SUCCESS=10`
 - `VE_TLS_PERSISTENT_MAX_RECORDS=5`
 - `VE_TLS_PERSISTENT_OVERFLOW_POLICY=reject_new`
+- `VE_TLS_PERSISTENT_OPEN_MODE=takeover_if_stale`
 
 ## 退出语义
 
@@ -319,13 +383,3 @@ export GO_SDK_ROOT=/path/to/volc-sdk-golang
 - master 分支默认仅使用内存队列，不提供落盘与崩溃恢复能力
 - 正常退出建议：先停止业务侧产生新日志，再调用 `ve_tls_producer_close(p, timeout_ms)`，最后 `ve_tls_producer_destroy(p)` 回收资源
 - 若业务必须具备 at-least-once（崩溃后恢复）语义，请使用 persistent 分支或在上层自行做外部持久化
-
-## 文档索引
-
-- master 能力清单：docs/master-capabilities.md
-- 配置字段：docs/config-fields.md
-- 调优指南：docs/tuning.md
-- 重试策略：docs/retry-policy.md
-- 签名：docs/signing.md
-- 错误模型：docs/error-model.md
-- 指标：docs/metrics.md
