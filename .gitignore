@@ -12,3 +12,7 @@ out/
 *.tmp
 .vscode/
 .idea/
+cospec/
+AGENT.md
+AGENTS.md
+build_*/
