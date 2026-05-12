@@ -4,12 +4,7 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#include "ve_tls_producer.h"
-
-typedef struct {
-    unsigned char * data;
-    size_t size;
-} ve_tls_bytes;
+#include "ve_tls_types.h"
 
 int ve_tls_proto_encode_log(int64_t time_ms, const ve_tls_kv * kvs, size_t kv_count, ve_tls_bytes * out);
 int ve_tls_proto_encode_log_ex(int64_t time_ms, uint32_t time_ns, int32_t has_time_ns, const ve_tls_kv * kvs, size_t kv_count, ve_tls_bytes * out);

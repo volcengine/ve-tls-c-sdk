@@ -8,6 +8,7 @@
 #include "ve_tls_http.h"
 #include "ve_tls_error.h"
 #include "ve_tls_platform.h"
+#include "ve_tls_types.h"
 
 typedef struct ve_tls_producer ve_tls_producer;
 typedef struct ve_tls_log_template ve_tls_log_template;
@@ -31,11 +32,6 @@ typedef enum {
     VE_TLS_BUFFER_FULL_DROP = 0,
     VE_TLS_BUFFER_FULL_BLOCK = 1
 } ve_tls_buffer_full_policy;
-
-typedef struct {
-    const char * key;
-    const char * value;
-} ve_tls_kv;
 
 typedef struct {
     void (*emit)(const char * name, int64_t v1, int64_t v2, void * user_param);

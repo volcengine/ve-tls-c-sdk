@@ -8,6 +8,7 @@
 #include "ve_tls_error.h"
 #include "ve_tls_http.h"
 #include "ve_tls_version.h"
+#include "ve_tls_bricks.h"
 #include "producer/ve_tls_producer_internal.h"
 #include "producer/ve_tls_snapshot.h"
 #include "producer/ve_tls_pool.h"
@@ -7824,6 +7825,163 @@ static int test_lz4_compress_roundtrip(void) {
 }
 #endif
 
+#if defined(VE_TLS_HAVE_BRICKS)
+static int test_bricks_pack_request_smoke(void) {
+    const unsigned char raw_body[] = {0x0a, 0x00};
+    ve_tls_bricks_config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.endpoint = "https://example.com";
+    cfg.region = "cn-beijing";
+    cfg.topic_id = "topic-1";
+    cfg.api_version = "0.3.0";
+    cfg.access_key_id = "ak";
+    cfg.access_key_secret = "sk";
+    cfg.security_token = "tok";
+    cfg.compress_type = "none";
+    cfg.hash_key = "hk";
+    cfg.xdate = "20240508T010203Z";
+
+    ve_tls_bricks_request req;
+    memset(&req, 0, sizeof(req));
+    if (ve_tls_bricks_pack_request(&cfg, raw_body, sizeof(raw_body), 2, 1000, 2000, &req) != 0) {
+        ve_tls_bricks_request_free(&req);
+        return -1;
+    }
+    if (!req.method || strcmp(req.method, "POST") != 0) {
+        ve_tls_bricks_request_free(&req);
+        return -1;
+    }
+    if (!req.url || strstr(req.url, "https://example.com/PutLogs?TopicId=topic-1") == NULL) {
+        ve_tls_bricks_request_free(&req);
+        return -1;
+    }
+    if (!req.headers ||
+        strstr(req.headers, "Authorization: HMAC-SHA256") == NULL ||
+        strstr(req.headers, "Content-MD5:") == NULL ||
+        strstr(req.headers, "x-tls-bodyrawsize: 2") == NULL ||
+        strstr(req.headers, "x-tls-compresstype: none") == NULL ||
+        strstr(req.headers, "x-tls-hashkey: hk") == NULL ||
+        strstr(req.headers, "log-count: 2") == NULL ||
+        strstr(req.headers, "earliest-log-time: 1000") == NULL ||
+        strstr(req.headers, "latest-log-time: 2000") == NULL) {
+        ve_tls_bricks_request_free(&req);
+        return -1;
+    }
+    if (!req.body || req.body_size == 0 || req.raw_body_size != sizeof(raw_body) ||
+        !req.body_owned || req.log_count != 2 || req.earliest_log_time_ms != 1000 || req.latest_log_time_ms != 2000) {
+        ve_tls_bricks_request_free(&req);
+        return -1;
+    }
+    ve_tls_bricks_request_free(&req);
+    if (req.method || req.url || req.headers || req.body || req.body_size != 0 || req.raw_body_size != 0) {
+        return -1;
+    }
+    cfg.compress_type = "bad";
+    memset(&req, 0, sizeof(req));
+    if (ve_tls_bricks_pack_request(&cfg, raw_body, sizeof(raw_body), 2, 1000, 2000, &req) != -3) {
+        ve_tls_bricks_request_free(&req);
+        return -1;
+    }
+    if (req.method || req.url || req.headers || req.body || req.body_size != 0 || req.raw_body_size != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+static int test_bricks_pack_request_matches_fixed_contract(void) {
+    const unsigned char raw_body[] = {1, 2, 3, 4, 5};
+    const char * expected_base =
+        "Content-Type: application/x-protobuf\n"
+        "Content-MD5: 7CFDD07889B3295D6A550914AB35E068\n"
+        "x-tls-apiversion: 0.3.0\n"
+        "x-tls-bodyrawsize: 5\n"
+        "x-tls-compresstype: none\n"
+        "x-tls-hashkey: \n";
+    ve_tls_bricks_config cfg;
+    ve_tls_bricks_request req;
+    char * expected_headers = NULL;
+    const char * p_auth;
+    const char * p_count;
+    const char * p_earliest;
+    const char * p_latest;
+    int rc;
+
+#define BRICKS_CONTRACT_FAIL(code) do { \
+    free(expected_headers); \
+    ve_tls_bricks_request_free(&req); \
+    return (code); \
+} while (0)
+
+    memset(&cfg, 0, sizeof(cfg));
+    memset(&req, 0, sizeof(req));
+    cfg.endpoint = "https://tls-cn-test.example.com";
+    cfg.region = "cn-test";
+    cfg.topic_id = "test-topic-id";
+    cfg.api_version = "0.3.0";
+    cfg.access_key_id = "test-access-key-id";
+    cfg.access_key_secret = "test-secret-access-key";
+    cfg.security_token = "";
+    cfg.compress_type = "none";
+    cfg.hash_key = "";
+    cfg.xdate = "20260410T032329Z";
+    cfg.body_no_copy = 1;
+
+    rc = ve_tls_bricks_pack_request(&cfg, raw_body, sizeof(raw_body), 3, 1710000000000LL,
+                                    1710000001000LL, &req);
+    if (rc != 0) BRICKS_CONTRACT_FAIL(1);
+    if (!req.method || strcmp(req.method, "POST") != 0) BRICKS_CONTRACT_FAIL(2);
+    if (!req.url || strcmp(req.url, "https://tls-cn-test.example.com/PutLogs?TopicId=test-topic-id") != 0) {
+        BRICKS_CONTRACT_FAIL(3);
+    }
+    if (req.body != raw_body || req.body_owned) BRICKS_CONTRACT_FAIL(4);
+    if (req.body_size != sizeof(raw_body) || memcmp(req.body, raw_body, sizeof(raw_body)) != 0) {
+        BRICKS_CONTRACT_FAIL(5);
+    }
+
+    rc = ve_tls_sign_v4_append_at("test-access-key-id",
+                                  "test-secret-access-key",
+                                  "",
+                                  "cn-test",
+                                  "TLS",
+                                  "POST",
+                                  "tls-cn-test.example.com",
+                                  "/PutLogs",
+                                  "TopicId=test-topic-id",
+                                  raw_body,
+                                  sizeof(raw_body),
+                                  "20260410T032329Z",
+                                  expected_base,
+                                  &expected_headers);
+    if (rc != 0 || !expected_headers) BRICKS_CONTRACT_FAIL(6);
+    if (!req.headers || strncmp(req.headers, expected_headers, strlen(expected_headers)) != 0) {
+        BRICKS_CONTRACT_FAIL(7);
+    }
+    if (!strstr(req.headers,
+                "SignedHeaders=content-md5;content-type;host;x-content-sha256;x-date;"
+                "x-tls-apiversion;x-tls-bodyrawsize;x-tls-compresstype;x-tls-hashkey")) {
+        BRICKS_CONTRACT_FAIL(8);
+    }
+    if (!strstr(req.headers,
+                "Signature=930943d3627c4b1958490bde6a3a794a29271167630c0e4d91dd82fd1cbfa20b")) {
+        BRICKS_CONTRACT_FAIL(9);
+    }
+
+    p_auth = strstr(req.headers, "\nAuthorization: HMAC-SHA256");
+    p_count = strstr(req.headers, "\nlog-count: 3\n");
+    p_earliest = strstr(req.headers, "\nearliest-log-time: 1710000000000\n");
+    p_latest = strstr(req.headers, "\nlatest-log-time: 1710000001000\n");
+    if (!p_auth || !p_count || !p_earliest || !p_latest) BRICKS_CONTRACT_FAIL(10);
+    if (!(p_auth < p_count && p_count < p_earliest && p_earliest < p_latest)) {
+        BRICKS_CONTRACT_FAIL(11);
+    }
+
+    free(expected_headers);
+    ve_tls_bricks_request_free(&req);
+#undef BRICKS_CONTRACT_FAIL
+    return 0;
+}
+#endif
+
 int main(void) {
     int rc = 0;
 #define RUN(code, fn) do { if ((fn) != 0) { rc = (code); goto end; } } while (0)
@@ -7905,6 +8063,10 @@ int main(void) {
     RUN(15, test_circuit_breaker_delays_second_send());
     RUN(16, test_sign());
     RUN(127, test_sign_matches_go_reference_with_fixed_xdate());
+#if defined(VE_TLS_HAVE_BRICKS)
+    RUN(139, test_bricks_pack_request_smoke());
+    RUN(140, test_bricks_pack_request_matches_fixed_contract());
+#endif
     RUN(128, test_builder_flush_interval_respects_configured_deadline());
     RUN(129, test_sender_idle_wait_without_delayed_does_not_spin_timedwait());
     RUN(118, test_sign_cache_secret_change_same_pointer_effective());
