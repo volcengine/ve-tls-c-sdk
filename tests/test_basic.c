@@ -372,6 +372,21 @@ static int test_fake_cond_timedwait_ms(ve_tls_cond * c, ve_tls_mutex * m, int64_
     return 0;
 }
 
+static ve_tls_thread * test_noop_thread_create(ve_tls_thread_fn fn, void * arg) {
+    (void)fn;
+    (void)arg;
+    return (ve_tls_thread *)malloc(1);
+}
+
+static void test_noop_thread_join(ve_tls_thread * t) {
+    free(t);
+}
+
+static void test_disable_background_threads(ve_tls_config * cfg) {
+    cfg->platform.thread_create = test_noop_thread_create;
+    cfg->platform.thread_join = test_noop_thread_join;
+}
+
 static int test_http_do(ve_tls_http_client * client, const ve_tls_http_request * req, ve_tls_http_response * resp) {
     (void)client;
     (void)req;
@@ -5192,6 +5207,7 @@ static int test_create_deep_copies_string_fields(void) {
 static int test_export_import_raw_buffer(void) {
     ve_tls_config cfg;
     ve_tls_config_init(&cfg);
+    test_disable_background_threads(&cfg);
     cfg.endpoint = "https://example.com";
     cfg.region = "cn-beijing";
     cfg.topic_id = "t";

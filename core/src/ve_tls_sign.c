@@ -21,6 +21,14 @@
 #define VE_TLS_HAVE_THREAD_LOCAL 0
 #endif
 
+static int ve_tls_gmtime_utc(const time_t * t, struct tm * out) {
+#if defined(_WIN32)
+    return gmtime_s(out, t) == 0 ? 0 : -1;
+#else
+    return gmtime_r(t, out) ? 0 : -1;
+#endif
+}
+
 typedef struct {
     char * key;
     char * value;
@@ -533,7 +541,10 @@ static void ve_tls_format_xdate(char out[17]) {
     }
 #endif
     struct tm tmv;
-    gmtime_r(&t, &tmv);
+    if (ve_tls_gmtime_utc(&t, &tmv) != 0) {
+        memset(out, 0, 17);
+        return;
+    }
     strftime(out, 17, "%Y%m%dT%H%M%SZ", &tmv);
 #if VE_TLS_HAVE_THREAD_LOCAL
     cached_sec = t;

@@ -1,6 +1,6 @@
 # ve-tls-c-sdk
 
-`ve-tls-c-sdk` 是 Volcengine TLS Producer 的纯 C11 日志发送 SDK，面向 Linux 服务器和嵌入式 Linux 场景。SDK 提供异步写入、批量聚合、压缩、重试、背压控制和运行期观测能力，用于将业务日志稳定发送到 TLS。
+`ve-tls-c-sdk` 是 Volcengine TLS Producer 的纯 C11 日志发送 SDK，面向 Linux 服务器、嵌入式 Linux、macOS 和 Windows C core 场景。SDK 提供异步写入、批量聚合、压缩、重试、背压控制和运行期观测能力，用于将业务日志稳定发送到 TLS。
 
 ## 核心能力与最佳实践
 
@@ -44,6 +44,8 @@ ctest --test-dir build --output-on-failure
 | `VE_TLS_BUILD_TESTS` | `ON` | 构建并注册 `ve_tls_test_basic` |
 | `VE_TLS_BUILD_TOOLS` | `ON` | 构建 demo 和 benchmark 工具 |
 | `VE_TLS_ENABLE_ASAN` / `VE_TLS_ENABLE_UBSAN` | `OFF` | Sanitizer |
+
+平台支持矩阵和 Windows 构建说明见 [docs/platform-support.md](docs/platform-support.md)。
 
 ## 快速开始
 

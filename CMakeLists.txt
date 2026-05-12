@@ -16,6 +16,20 @@ option(VE_TLS_ENABLE_UBSAN "Enable undefined behavior sanitizer" OFF)
 
 add_library(ve_tls_core)
 
+if(WIN32)
+    set(VE_TLS_DEFAULT_ADAPTER_SOURCES
+        adapters/src/ve_tls_adapter_win32.c
+        adapters/src/ve_tls_platform_win32.c
+    )
+elseif(VE_TLS_ENABLE_PTHREAD)
+    set(VE_TLS_DEFAULT_ADAPTER_SOURCES
+        adapters/src/ve_tls_adapter_posix.c
+        adapters/src/ve_tls_platform_pthread.c
+    )
+else()
+    message(FATAL_ERROR "VE_TLS_ENABLE_PTHREAD=OFF requires a non-pthread platform adapter; only WIN32 is currently available.")
+endif()
+
 target_sources(ve_tls_core PRIVATE
     core/src/ve_tls_producer.c
     core/src/producer/ve_tls_producer_queue.c
@@ -35,8 +49,7 @@ target_sources(ve_tls_core PRIVATE
     core/src/ve_tls_error.c
     core/src/ve_tls_hash.c
     core/src/ve_tls_sign.c
-    adapters/src/ve_tls_adapter_posix.c
-    adapters/src/ve_tls_platform_pthread.c
+    ${VE_TLS_DEFAULT_ADAPTER_SOURCES}
 )
 
 if(VE_TLS_ENABLE_CURL)
@@ -66,7 +79,16 @@ target_include_directories(ve_tls_core PUBLIC
     adapters/include
 )
 
-if(VE_TLS_ENABLE_PTHREAD)
+if(MSVC)
+    target_include_directories(ve_tls_core PUBLIC compat/msvc)
+    target_compile_definitions(ve_tls_core PUBLIC _CRT_SECURE_NO_WARNINGS)
+    target_compile_options(ve_tls_core PUBLIC /FIve_tls_msvc_compat.h)
+    if(CMAKE_C_COMPILER_ID STREQUAL "MSVC")
+        target_compile_options(ve_tls_core PUBLIC /experimental:c11atomics)
+    endif()
+endif()
+
+if(VE_TLS_ENABLE_PTHREAD AND NOT WIN32)
     set(THREADS_PREFER_PTHREAD_FLAG ON)
     find_package(Threads REQUIRED)
     target_link_libraries(ve_tls_core PRIVATE Threads::Threads)
@@ -88,6 +110,9 @@ if(VE_TLS_BUILD_TOOLS AND NOT ANDROID)
 
     add_executable(ve_tls_benchmark_tls tools/benchmark_tls.c)
     target_link_libraries(ve_tls_benchmark_tls PRIVATE ve_tls_core)
+    if(WIN32)
+        target_link_libraries(ve_tls_benchmark_tls PRIVATE psapi)
+    endif()
 
     add_executable(ve_tls_gen_raw_log tools/gen_raw_log.c)
     target_link_libraries(ve_tls_gen_raw_log PRIVATE ve_tls_core)

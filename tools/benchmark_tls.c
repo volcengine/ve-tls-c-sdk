@@ -6,11 +6,19 @@
 #include <strings.h>
 #include <stdint.h>
 #include <time.h>
+
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <psapi.h>
+#else
 #include <unistd.h>
 #include <sys/resource.h>
-
 #if defined(__APPLE__)
 #include <sys/time.h>
+#endif
 #endif
 
 static uint64_t g_send_ok = 0;
@@ -22,7 +30,17 @@ static uint64_t g_fail_payload_too_large = 0;
 static uint64_t g_fail_other = 0;
 
 static int64_t now_us(void) {
-#if defined(__APPLE__)
+#if defined(_WIN32)
+    static LARGE_INTEGER freq;
+    static int freq_ready = 0;
+    LARGE_INTEGER now;
+    if (!freq_ready) {
+        QueryPerformanceFrequency(&freq);
+        freq_ready = 1;
+    }
+    QueryPerformanceCounter(&now);
+    return (int64_t)((now.QuadPart * 1000000LL) / freq.QuadPart);
+#elif defined(__APPLE__)
     struct timeval tv;
     gettimeofday(&tv, NULL);
     return (int64_t)tv.tv_sec * 1000000LL + (int64_t)tv.tv_usec;
@@ -33,8 +51,73 @@ static int64_t now_us(void) {
 #endif
 }
 
+#if !defined(_WIN32)
 static double tv_to_s(struct timeval tv) {
     return (double)tv.tv_sec + (double)tv.tv_usec / 1000000.0;
+}
+#endif
+
+typedef struct {
+    double user_s;
+    double sys_s;
+    double rss_mb;
+    long cpu_count;
+} usage_snapshot;
+
+#if defined(_WIN32)
+static double filetime_to_s(FILETIME ft) {
+    ULARGE_INTEGER u;
+    u.LowPart = ft.dwLowDateTime;
+    u.HighPart = ft.dwHighDateTime;
+    return (double)u.QuadPart / 10000000.0;
+}
+#endif
+
+static void usage_snapshot_now(usage_snapshot * out) {
+    memset(out, 0, sizeof(*out));
+#if defined(_WIN32)
+    FILETIME create_time;
+    FILETIME exit_time;
+    FILETIME kernel_time;
+    FILETIME user_time;
+    SYSTEM_INFO si;
+    PROCESS_MEMORY_COUNTERS pmc;
+    if (GetProcessTimes(GetCurrentProcess(), &create_time, &exit_time, &kernel_time, &user_time)) {
+        out->user_s = filetime_to_s(user_time);
+        out->sys_s = filetime_to_s(kernel_time);
+    }
+    GetSystemInfo(&si);
+    out->cpu_count = si.dwNumberOfProcessors > 0 ? (long)si.dwNumberOfProcessors : 1;
+    memset(&pmc, 0, sizeof(pmc));
+    if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc))) {
+        out->rss_mb = (double)pmc.PeakWorkingSetSize / 1024.0 / 1024.0;
+    }
+#else
+    struct rusage ru;
+    memset(&ru, 0, sizeof(ru));
+    getrusage(RUSAGE_SELF, &ru);
+    out->user_s = tv_to_s(ru.ru_utime);
+    out->sys_s = tv_to_s(ru.ru_stime);
+    out->cpu_count = sysconf(_SC_NPROCESSORS_ONLN);
+    if (out->cpu_count < 1) out->cpu_count = 1;
+#if defined(__APPLE__)
+    out->rss_mb = (double)ru.ru_maxrss / 1024.0 / 1024.0;
+#else
+    out->rss_mb = (double)ru.ru_maxrss / 1024.0;
+#endif
+#endif
+    if (out->cpu_count < 1) out->cpu_count = 1;
+}
+
+static void sleep_us(int64_t us) {
+    if (us <= 0) {
+        return;
+    }
+#if defined(_WIN32)
+    Sleep((DWORD)((us + 999) / 1000));
+#else
+    usleep((useconds_t)us);
+#endif
 }
 
 static const char * env_str(const char * key, const char * defv) {
@@ -299,9 +382,8 @@ int main(int argc, char ** argv) {
     uint64_t last_send_raw = 0;
     uint64_t last_send_comp = 0;
 
-    struct rusage ru0;
-    memset(&ru0, 0, sizeof(ru0));
-    getrusage(RUSAGE_SELF, &ru0);
+    usage_snapshot usage0;
+    usage_snapshot_now(&usage0);
     int64_t wall_start_us = now_us();
 
     for (int i = 0; i < send_sec; i++) {
@@ -374,7 +456,7 @@ int main(int argc, char ** argv) {
         total_enqueue_us += end_us - start_us;
         int64_t spend = end_us - start_us;
         if (spend < 1000000) {
-            usleep((useconds_t)(1000000 - spend));
+            sleep_us(1000000 - spend);
         }
     }
 
@@ -392,21 +474,15 @@ int main(int argc, char ** argv) {
     int64_t wall_end_us = now_us();
     double wall_s = (double)(wall_end_us - wall_start_us) / 1000000.0;
 
-    struct rusage ru1;
-    memset(&ru1, 0, sizeof(ru1));
-    getrusage(RUSAGE_SELF, &ru1);
-    double user_s = tv_to_s(ru1.ru_utime) - tv_to_s(ru0.ru_utime);
-    double sys_s = tv_to_s(ru1.ru_stime) - tv_to_s(ru0.ru_stime);
+    usage_snapshot usage1;
+    usage_snapshot_now(&usage1);
+    double user_s = usage1.user_s - usage0.user_s;
+    double sys_s = usage1.sys_s - usage0.sys_s;
     double cpu_s = user_s + sys_s;
-    long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
-    if (ncpu < 1) ncpu = 1;
+    long ncpu = usage1.cpu_count;
     double cpu_cores = wall_s > 0 ? cpu_s / wall_s : 0.0;
     double cpu_pct_total = wall_s > 0 ? (cpu_s / (wall_s * (double)ncpu)) * 100.0 : 0.0;
-#if defined(__APPLE__)
-    double rss_mb = (double)ru1.ru_maxrss / 1024.0 / 1024.0;
-#else
-    double rss_mb = (double)ru1.ru_maxrss / 1024.0;
-#endif
+    double rss_mb = usage1.rss_mb;
 
     fprintf(stderr, "summary profile=%s target_rate=%d logs_per_s seconds=%d enqueue_ok=%llu enqueue_drop=%llu enqueue_other=%llu avg_enqueue_us=%.2f\n",
         profile,
