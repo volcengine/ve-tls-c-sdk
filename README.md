@@ -209,3 +209,7 @@ TLS_BENCH_MODE=curl TLS_MAX_BUFFER_BYTES=268435456 TLS_CLOSE_TIMEOUT_MS=300000 .
 - [错误模型](docs/error-model.md)
 - [指标与观测](docs/metrics.md)
 - [安全建议](docs/security.md)
+
+## Security and privacy
+This project takes security seriously. 
+For vulnerability reporting and supported versions, see [SECURITY.md](SECURITY.md)
