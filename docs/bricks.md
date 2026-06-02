@@ -1,6 +1,6 @@
 # Bricks
 
-`ve_tls_bricks_core` 是 `codex/bricks-tiny-core` 分支的主产品：一个极小的 TLS PutLogs request packer。它接收 LogGroupList protobuf body，输出调用方可直接发送的 HTTP method、URL、headers 和 body。它不发送网络请求。
+`ve_tls_bricks_core` 是 `bricks` 分支的主产品：一个极小的 TLS PutLogs request packer。它接收 LogGroupList protobuf body，输出调用方可直接发送的 HTTP method、URL、headers 和 body。它不发送网络请求。
 
 这个目标适合资源受限设备、已有 HTTP 栈的嵌入式环境、以及希望把传输和重试策略留在业务侧的场景。它不是完整 Producer 的替代品：完整 Producer 的异步队列、后台线程、重试、背压、metrics、callback、动态凭证和环境生命周期都不在 Bricks core 内。
 

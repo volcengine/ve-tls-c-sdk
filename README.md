@@ -1,6 +1,6 @@
 # ve-tls-c-sdk
 
-`codex/bricks-tiny-core` 分支包含两个 profile：完整异步 Producer，以及本分支新增的 Bricks tiny request packer。Bricks 是分支重点：它把一段已经编码好的 LogGroupList protobuf body 打包成可发送的 `POST /PutLogs?TopicId=...` 请求，包含 URL、请求头、TLS V4 签名和请求 body；HTTP 发送、重试、队列、背压、指标和凭证刷新都由调用方负责。
+`bricks` 分支包含两个 profile：完整异步 Producer，以及本分支新增的 Bricks tiny request packer。Bricks 是分支重点：它把一段已经编码好的 LogGroupList protobuf body 打包成可发送的 `POST /PutLogs?TopicId=...` 请求，包含 URL、请求头、TLS V4 签名和请求 body；HTTP 发送、重试、队列、背压、指标和凭证刷新都由调用方负责。
 
 ## 核心能力与最佳实践
 
