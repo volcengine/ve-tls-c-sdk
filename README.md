@@ -1,6 +1,6 @@
 # ve-tls-c-sdk
 
-`bricks` 分支包含两个 profile：完整异步 Producer，以及本分支新增的 Bricks tiny request packer。Bricks 是分支重点：它把一段已经编码好的 LogGroupList protobuf body 打包成可发送的 `POST /PutLogs?TopicId=...` 请求，包含 URL、请求头、TLS V4 签名和请求 body；HTTP 发送、重试、队列、背压、指标和凭证刷新都由调用方负责。
+`bricks` 分支包含两个 profile：完整异步 Producer 和 Bricks tiny request packer。Bricks 接收已经编码好的 LogGroupList protobuf body，打包成可发送的 `POST /PutLogs?TopicId=...` 请求，包含 URL、请求头、TLS V4 签名和请求 body。HTTP 发送、重试、队列、背压、指标和凭证刷新由调用方负责。
 
 ## 核心能力与最佳实践
 
@@ -238,7 +238,7 @@ VE_TLS_COMPRESS_TYPE=none \
 
 ## 性能与体积
 
-2026-06-02 在开发机 Linux x86_64 / Debian / GCC 12.2.0 / commit `ce5dfcc` 实测：
+以下数据来自 Linux x86_64 / Debian / GCC 12.2.0 环境，主要用于给体积和本地 pack 成本一个量级参考：
 
 | 目标 | 构建参数 | 文件大小 |
 | --- | --- | ---: |
@@ -260,9 +260,9 @@ CPU-only benchmark：
 
 更多体积和调优数据见 [docs/bricks.md](docs/bricks.md) 与 [docs/tuning.md](docs/tuning.md)。
 
-## 真实环境验证
+## 真实发送验证
 
-同一开发机上，读取真实 TLS BOE 环境变量并绕过代理后实测：
+使用真实 TLS endpoint 和临时凭证跑过顺序发送，结果如下：
 
 | 场景 | 结果 |
 | --- | --- |
@@ -270,7 +270,7 @@ CPU-only benchmark：
 | `compress_type=lz4`, 单次发送 | `curl=0`, `http=200`, request body `77 bytes`, latency `158.703 ms` |
 | `compress_type=lz4`, 顺序 300 次 | `300/300` 成功，`27.79 req/s`, 平均 `35.973 ms`, min `7.289 ms`, max `244.350 ms` |
 
-该数据验证 Bricks 生成的 protobuf body、TLS V4 签名、签名头和 curl 样例 transport 可被服务端接受。它不是并发压测；当前 demo 是顺序发送工具。
+这组结果说明 Bricks 生成的 protobuf body、TLS V4 签名、签名头和 curl 样例 transport 可以被服务端接受。它不是并发压测；当前 demo 是顺序发送工具。
 
 ## 退出语义与可靠性边界
 

@@ -58,7 +58,7 @@ Bricks core 看不到 HTTP code。`ve_tls_bricks_demo_real` 只把 libcurl 结�
 - `EHOSTUNREACH`
 - `ENETUNREACH`
 
-证书校验失败、代理鉴权失败、DNS 配置错误是否重试，应由调用方按接入环境判断。开发机实测中默认代理曾对 TLS endpoint CONNECT 返回 403；这种情况应修正代理或 `no_proxy`，不是盲目重试。
+证书校验失败、代理鉴权失败、DNS 配置错误是否重试，应由调用方按接入环境判断。配置类错误通常应先修配置，不要靠重试掩盖。
 
 ## 停止条件
 

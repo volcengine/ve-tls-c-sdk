@@ -140,7 +140,7 @@ set +a
 TLS_BENCH_MODE=curl TLS_CLOSE_TIMEOUT_MS=300000 ./build/ve_tls_benchmark_tls 10000 10 tls200
 ```
 
-历史 Full Producer 真实发送参考数据仍可用于理解完整 profile 的量级，但不是 Bricks tiny core 的指标。Bricks 文档只引用当前分支已复测的 Bricks 数据。
+Full Producer 的真实网络数据需要按接入环境重新跑。不要把 Full Producer 的吞吐表直接套到 Bricks tiny core 上。
 
 Bricks 真实发送 demo：
 
@@ -163,7 +163,7 @@ VE_TLS_COMPRESS_TYPE=lz4 \
 ./build-bricks-real/ve_tls_bricks_demo_real --count 300 --timeout-ms 15000 --quiet
 ```
 
-当前开发机顺序发送实测：
+顺序发送参考结果：
 
 | 场景 | 成功率 | 吞吐/延迟 |
 | --- | ---: | --- |

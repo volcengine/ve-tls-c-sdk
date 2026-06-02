@@ -1,10 +1,10 @@
 # Bricks
 
-`ve_tls_bricks_core` 是 `bricks` 分支的主产品：一个极小的 TLS PutLogs request packer。它接收 LogGroupList protobuf body，输出调用方可直接发送的 HTTP method、URL、headers 和 body。它不发送网络请求。
+`ve_tls_bricks_core` 是 `bricks` 分支里的 tiny profile。它接收 LogGroupList protobuf body，输出调用方可直接发送的 HTTP method、URL、headers 和 body。它不发送网络请求。
 
 这个目标适合资源受限设备、已有 HTTP 栈的嵌入式环境、以及希望把传输和重试策略留在业务侧的场景。它不是完整 Producer 的替代品：完整 Producer 的异步队列、后台线程、重试、背压、metrics、callback、动态凭证和环境生命周期都不在 Bricks core 内。
 
-## Build
+## 构建
 
 最小构建：
 
@@ -43,7 +43,7 @@ cmake --build build-bricks-real --target ve_tls_bricks_demo_real -j
 - 调用方自己持有 protobuf body，直到发送完成
 - 编译可执行文件时使用 `-ffunction-sections -fdata-sections`，链接时使用 `-Wl,--gc-sections -s`
 
-## Scope
+## 能力边界
 
 Bricks core 包含：
 
@@ -72,7 +72,7 @@ Bricks core 不包含：
 
 `req.headers` 是以 `\n` 分隔的 `Key: Value` 文本。使用 libcurl 发送时要保留空值签名头，例如 `x-tls-hashkey: `。libcurl 会把 `Header:` 解释成删除 header，因此 demo 会把空值 header 转成 `Header;`。
 
-## SLS Bricks Reference
+## SLS Bricks 对照
 
 Aliyun SLS `bricks-https` 的思路是把 SDK 缩到 request packing 和少量 protobuf builder，HTTP、retry、drop、MD5/HMAC/time hook 都交给 sample 或调用方。
 
@@ -85,23 +85,22 @@ TLS Bricks 借鉴了这个边界，但没有完全复制：
 
 因此，和 SLS bricks 的“极限最小数字”只能作为方向参考，不能直接等价对比。TLS Bricks 的硬约束是：core 中没有 producer、pthread、curl、retry、metrics、persistence 和 file runtime 符号。
 
-## Size And Perf Baseline
+## 体积与性能参考
 
-实测环境：
+参考环境：
 
-- 日期：2026-06-02
-- 分支提交：`ce5dfcc`
-- 开发机：Linux x86_64 / Debian / GCC 12.2.0 / CMake 3.25.1
+- Linux x86_64 / Debian
+- GCC 12.2.0 / CMake 3.25.1
 - 默认 size report：`CMAKE_BUILD_TYPE=MinSizeRel`
 - 裁剪可执行文件：`-Os -ffunction-sections -fdata-sections -Wl,--gc-sections -s`
 
 复现命令：
 
 ```sh
-./tools/bricks_size_report.sh /tmp/ve-tls-c-sdk-doc-size-none
-VE_TLS_SIZE_BRICKS_ENABLE_LZ4=ON ./tools/bricks_size_report.sh /tmp/ve-tls-c-sdk-doc-size-lz4
+./tools/bricks_size_report.sh /tmp/ve-tls-bricks-size-none
+VE_TLS_SIZE_BRICKS_ENABLE_LZ4=ON ./tools/bricks_size_report.sh /tmp/ve-tls-bricks-size-lz4
 
-cmake -S . -B /tmp/ve-tls-c-sdk-doc-bench \
+cmake -S . -B /tmp/ve-tls-bricks-bench \
   -DCMAKE_BUILD_TYPE=MinSizeRel \
   -DVE_TLS_BUILD_BRICKS=ON \
   -DVE_TLS_BUILD_TOOLS=ON \
@@ -109,8 +108,8 @@ cmake -S . -B /tmp/ve-tls-c-sdk-doc-bench \
   -DVE_TLS_ENABLE_CURL=OFF \
   -DVE_TLS_BRICKS_ENABLE_LZ4=OFF \
   -DVE_TLS_BRICKS_ENABLE_ZLIB=OFF
-cmake --build /tmp/ve-tls-c-sdk-doc-bench --target ve_tls_bricks_bench -j
-/tmp/ve-tls-c-sdk-doc-bench/ve_tls_bricks_bench --iterations 100000 --logs 10 --message-bytes 256 --compress-type none --copy-body 0 --track-alloc 1
+cmake --build /tmp/ve-tls-bricks-bench --target ve_tls_bricks_bench -j
+/tmp/ve-tls-bricks-bench/ve_tls_bricks_bench --iterations 100000 --logs 10 --message-bytes 256 --compress-type none --copy-body 0 --track-alloc 1
 ```
 
 静态库体积：
@@ -143,7 +142,7 @@ CPU-only benchmark：
 
 `sdk_heap_peak_bytes` 通过 `ve_tls_alloc_set_hooks()` 统计，只覆盖 TLS SDK allocator；不包含进程、loader、libc 或调用方 transport 的内存。
 
-## Real Environment Validation
+## 真实发送验证
 
 真实发送 demo：
 
@@ -157,7 +156,7 @@ VE_TLS_COMPRESS_TYPE=none \
 build-bricks-real/ve_tls_bricks_demo_real --count 1 --timeout-ms 15000
 ```
 
-2026-06-02 在开发机访问 Guilin BOE TLS endpoint，绕过默认代理后实测：
+使用真实 TLS endpoint 和临时凭证跑过下面几组顺序发送：
 
 | run | success | elapsed / latency | request bytes | response bytes |
 | --- | ---: | ---: | ---: | ---: |
@@ -165,10 +164,10 @@ build-bricks-real/ve_tls_bricks_demo_real --count 1 --timeout-ms 15000
 | `lz4`, single request | `1/1`, `http=200` | `158.703 ms` | `77` | `0` |
 | `lz4`, sequential 300 requests | `300/300` | `10793.774 ms`, avg `35.973 ms`, min `7.289 ms`, max `244.350 ms` | `23592` | `0` |
 
-这证明 Bricks 生成的 protobuf body、TLS V4 signature、signed headers 和 curl sample transport 能被服务端接受。
+这说明 Bricks 生成的 protobuf body、TLS V4 signature、signed headers 和 curl sample transport 能被服务端接受。
 
 边界：
 
 - 当前 `ve_tls_bricks_demo_real` 是顺序发送工具，不是并发压测工具。
 - 真实网络 latency 受 endpoint、代理、TLS 握手复用、网络抖动影响；CPU-only pack 成本以 `ve_tls_bricks_bench` 为准。
-- 真实发送时如果机器默认代理拦截 TLS endpoint，需要按接入环境正确配置 `no_proxy` 或显式绕过代理。
+- 如果接入环境有代理，确认 TLS endpoint 的代理策略。代理配置错误时，失败会出现在调用方 transport 层。
