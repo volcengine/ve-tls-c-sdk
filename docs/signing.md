@@ -19,6 +19,3 @@
 ## 内容摘要
 - body 存在时支持 Content-MD5（与 TLS 服务侧兼容）
 - X-Content-Sha256 参与签名
-
-## 预签名 URL（可选）
-- 支持生成带签名的 URL（用于特殊场景）
