@@ -4335,8 +4335,12 @@ static int test_env_destroy_timeout_then_recover(void) {
     cfg.access_key_id = "ak";
     cfg.access_key_secret = "sk";
     cfg.retry_policy.max_attempts = 1;
-    cfg.http_client.do_request = test_http_do;
+    cfg.flush_interval_ms = 0;
+    cfg.log_count_per_package = 1;
+    cfg.compress_type = "none";
+    cfg.http_client.do_request = test_http_slow_ok_do;
     cfg.http_client.free_response = test_http_free;
+    cfg.http_client.user_data = &cfg.platform;
     cfg.use_global_env = 1;
 
     ve_tls_producer * p = ve_tls_producer_create(&cfg);
