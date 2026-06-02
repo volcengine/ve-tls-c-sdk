@@ -1,19 +1,23 @@
 # ve-tls-c-sdk
 
-`ve-tls-c-sdk` 是 Volcengine TLS Producer 的纯 C11 日志发送 SDK，面向 Linux 服务器和嵌入式 Linux 场景。SDK 提供异步写入、批量聚合、压缩、重试、背压控制和运行期观测能力，用于将业务日志稳定发送到 TLS。
+`codex/bricks-tiny-core` 分支包含两个 profile：完整异步 Producer，以及本分支新增的 Bricks tiny request packer。Bricks 是分支重点：它把一段已经编码好的 LogGroupList protobuf body 打包成可发送的 `POST /PutLogs?TopicId=...` 请求，包含 URL、请求头、TLS V4 签名和请求 body；HTTP 发送、重试、队列、背压、指标和凭证刷新都由调用方负责。
 
 ## 核心能力与最佳实践
 
-- 异步 Producer：业务线程调用写入接口后进入内存队列，后台线程负责聚合、压缩、签名、发送和重试。建议按进程或业务日志流复用长生命周期 producer，不要按单条日志或单个请求频繁创建销毁。
-- 批量聚合：支持按 `flush_interval_ms`、`log_count_per_package`、`log_bytes_per_package` 触发发送，减少 HTTP 请求数和签名开销。低延迟场景降低 flush interval，高吞吐场景增大单批大小并配合更多发送线程。
-- 压缩发送：支持 `lz4`、`zlib` 和不压缩。默认优先使用 `lz4`，适合日志文本这类高重复内容；只有在 CPU 极紧张且日志本身不可压缩时，才建议压测比较 `none`。
-- HashKey 有序：同一 hashKey 内保持发送顺序，不同 hashKey 可并行聚合和发送。需要分区内有序时使用稳定 hashKey；不需要顺序时可不传 hashKey，让 SDK 追求整体吞吐。
-- 背压控制：写入队列支持 `DROP` / `BLOCK`，发送队列支持 `DROP` / `BLOCK` / `DROP_SAMPLED`。实时观测类日志通常选择丢弃优先，关键业务日志应选择阻塞并设置有限超时，避免无限阻塞业务线程。
-- 有界资源：`max_buffer_bytes` 统一约束写入队列、发送队列预留、inflight 批次和构建缓冲。嵌入式或小规格容器应先定内存预算，再让 SDK 派生包大小、线程数和队列容量。
-- 重试治理：内置指数退避、可重试错误识别、全局/按 key 限流与熔断。建议把 `requests_failed_total`、`retries_total`、回调里的 HTTP code 和 request_id 接入业务监控。
-- 动态配置：支持运行期更新 endpoint、region、topic 以及静态 AK/SK/token。使用临时凭证时优先接入 `credentials_provider`，避免在业务日志中打印 AK/SK/token。
-- 可观测性：支持结构化发送回调、累计 metrics、metrics sink、buffered bytes 查询和 `*_with_id` 写入接口。建议在发送回调中记录 result、request_id、error_code、HTTP code 和 log_id 范围，便于定位批次级问题。
-- 可控退出：`ve_tls_producer_close()` 会停止接收新日志并等待队列 drain，`ve_tls_producer_destroy()` 负责释放资源。生产服务收到退出信号后应先停止产生日志，再 close，最后 destroy。
+- Full Producer：保留 `ve_tls_core` 的异步写入、聚合、压缩、HTTP 发送、重试、背压、metrics、callback 和受控退出能力。需要 SDK 接管完整发送链路时使用它。
+- Tiny core：`ve_tls_bricks_core` 只链接 `alloc/hash/sign/proto/compress/bricks` 这几类源文件，不链接 producer、pthread、curl、retry、metrics、persistence 或 env runtime。
+- Pack-only：公开入口是 `ve_tls_bricks_pack_request()`，输出 `method`、`url`、换行分隔的 headers、body 指针和元数据。SDK 不发网络请求。
+- TLS V4 签名内置：SDK 生成 `X-Date`、`X-Content-Sha256`、`Authorization`，并支持可选 `X-Security-Token`。
+- Protobuf helper 可选使用：调用方可以使用 `ve_tls_proto_encode_log*()` / `ve_tls_proto_encode_log_group_list*()` 生成 body，也可以自己提供已编码 body。
+- body 零拷贝：`compress_type=none` 且 `body_no_copy=1` 时，返回 request 的 body 指向调用方传入 buffer，`ve_tls_bricks_request_free()` 不释放该 body。
+- 可选压缩：Bricks 默认关闭 LZ4/ZLIB，最小二进制建议保持 `none`；需要压缩时显式打开 `VE_TLS_BRICKS_ENABLE_LZ4` 或 `VE_TLS_BRICKS_ENABLE_ZLIB`。
+- 真实发送 demo 独立：`ve_tls_bricks_demo_real` 只作为 libcurl 样例存在，curl 不进入 `ve_tls_bricks_core`。
+- 明确边界：Bricks profile 不提供异步队列、后台线程、批量调度、重试、限流、熔断、metrics、send callback、动态凭证 provider、本地落盘恢复或全局 env。
+
+| Profile | 适用场景 | SDK 负责 | 调用方负责 |
+| --- | --- | --- | --- |
+| Full Producer | 希望 SDK 接管发送链路的 Linux 服务 | 队列、聚合、压缩、签名、HTTP、重试、背压、metrics、callback | 配置、业务日志、进程退出顺序 |
+| Bricks tiny core | 资源受限设备、已有 HTTP 栈、需要极小二进制 | protobuf helper、可选压缩、TLS V4 签名、request packing | HTTP、retry、队列、并发、凭证刷新、metrics、可靠性 |
 
 ## 安装与构建
 
@@ -21,31 +25,61 @@
 
 - CMake 3.16+
 - C11 编译器
-- pthread，默认开启
-- libcurl，用于 HTTP 网络发送
-- lz4 默认内置，zlib 可选
+- tiny core：默认只需要 libc；Linux 下链接 `m`
+- 真实发送 demo：额外需要 libcurl
+- 可选压缩：LZ4 使用仓库内 `third_party/lz4`，ZLIB 需要系统 zlib
 
-生产构建推荐显式启用 libcurl HTTP adapter：
+Full Producer 构建：
 
 ```sh
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DVE_TLS_ENABLE_CURL=ON
+cmake -S . -B build \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DVE_TLS_ENABLE_CURL=ON
 cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
+最小 Bricks 构建：
+
+```sh
+cmake -S . -B build-bricks \
+  -DCMAKE_BUILD_TYPE=MinSizeRel \
+  -DVE_TLS_BUILD_BRICKS=ON \
+  -DVE_TLS_ENABLE_CURL=OFF \
+  -DVE_TLS_BRICKS_ENABLE_LZ4=OFF \
+  -DVE_TLS_BRICKS_ENABLE_ZLIB=OFF
+cmake --build build-bricks --target ve_tls_bricks_core -j
+```
+
+真实发送 demo 构建：
+
+```sh
+cmake -S . -B build-bricks-real \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DVE_TLS_BUILD_BRICKS=ON \
+  -DVE_TLS_BUILD_TOOLS=ON \
+  -DVE_TLS_BUILD_TESTS=OFF \
+  -DVE_TLS_ENABLE_CURL=ON \
+  -DVE_TLS_BRICKS_ENABLE_LZ4=ON \
+  -DVE_TLS_BRICKS_ENABLE_ZLIB=OFF
+cmake --build build-bricks-real --target ve_tls_bricks_demo_real -j
+```
+
 常用 CMake 选项：
 
-| 选项 | 默认值 | 说明 |
+| 选项 | 默认值 | Bricks 语义 |
 | --- | --- | --- |
-| `VE_TLS_ENABLE_PTHREAD` | `ON` | pthread 运行时 |
-| `VE_TLS_ENABLE_CURL` | `OFF` | libcurl HTTP adapter；生产网络发送建议显式开启 |
-| `VE_TLS_ENABLE_LZ4` | `ON` | 内置 lz4 压缩 |
-| `VE_TLS_ENABLE_ZLIB` | `OFF` | zlib 压缩 |
+| `VE_TLS_BUILD_BRICKS` | `ON` | 构建 `ve_tls_bricks_core` |
+| `VE_TLS_BRICKS_ENABLE_LZ4` | `OFF` | 只给 Bricks target 启用 LZ4 |
+| `VE_TLS_BRICKS_ENABLE_ZLIB` | `OFF` | 只给 Bricks target 启用 ZLIB |
+| `VE_TLS_ENABLE_CURL` | `OFF` | 只影响完整 core 和 demo；Bricks core 不链接 curl |
+| `VE_TLS_BUILD_TOOLS` | `ON` | 构建 `ve_tls_bricks_bench`；curl 开启时构建 `ve_tls_bricks_demo_real` |
 | `VE_TLS_BUILD_TESTS` | `ON` | 构建并注册 `ve_tls_test_basic` |
-| `VE_TLS_BUILD_TOOLS` | `ON` | 构建 demo 和 benchmark 工具 |
 | `VE_TLS_ENABLE_ASAN` / `VE_TLS_ENABLE_UBSAN` | `OFF` | Sanitizer |
 
 ## 快速开始
+
+Full Producer：
 
 ```c
 #include "ve_tls_producer.h"
@@ -60,53 +94,98 @@ int main(void) {
     cfg.access_key_secret = "your-sk";
 
     ve_tls_producer * p = ve_tls_producer_create(&cfg);
-    if (!p) {
-        return 1;
-    }
+    if (!p) return 1;
 
-    ve_tls_kv kvs[1] = {{"k", "v"}};
-    if (ve_tls_producer_add_log_kv(p, 0, kvs, 1, 1) != VE_TLS_OK) {
-        ve_tls_producer_destroy(p);
-        return 2;
+    ve_tls_kv kvs[1] = {{"message", "hello"}};
+    ve_tls_result rc = ve_tls_producer_add_log_kv(p, 0, kvs, 1, 1);
+    if (rc == VE_TLS_OK) {
+        rc = ve_tls_producer_close(p, 3000);
     }
-
-    ve_tls_result rc = ve_tls_producer_close(p, 3000);
     ve_tls_producer_destroy(p);
-    return rc == VE_TLS_OK ? 0 : 3;
+    return rc == VE_TLS_OK ? 0 : 2;
+}
+```
+
+Bricks tiny core：
+
+```c
+#include "ve_tls_bricks.h"
+#include "ve_tls_proto.h"
+
+#include <string.h>
+
+int main(void) {
+    ve_tls_kv kv = {"message", "hello"};
+    ve_tls_bytes log;
+    ve_tls_bytes group;
+    ve_tls_bricks_config cfg;
+    ve_tls_bricks_request req;
+
+    memset(&log, 0, sizeof(log));
+    memset(&group, 0, sizeof(group));
+    memset(&cfg, 0, sizeof(cfg));
+    memset(&req, 0, sizeof(req));
+
+    if (ve_tls_proto_encode_log(1710000000000LL, &kv, 1, &log) != 0) return 1;
+    if (ve_tls_proto_encode_log_group_list(&log, 1, "source", "file", &group) != 0) return 2;
+
+    cfg.endpoint = "https://tls-cn-beijing.volces.com";
+    cfg.region = "cn-beijing";
+    cfg.topic_id = "your-topic-id";
+    cfg.api_version = "0.3.0";
+    cfg.access_key_id = "your-ak";
+    cfg.access_key_secret = "your-sk";
+    cfg.security_token = NULL;
+    cfg.compress_type = "none";
+    cfg.hash_key = "";
+    cfg.body_no_copy = 1;
+
+    if (ve_tls_bricks_pack_request(&cfg, group.data, group.size, 1,
+                                   1710000000000LL, 1710000000000LL, &req) != 0) {
+        ve_tls_bytes_free(&group);
+        ve_tls_bytes_free(&log);
+        return 3;
+    }
+
+    /*
+     * 调用方在这里发送：
+     * method: req.method
+     * url: req.url
+     * headers: req.headers, each line is "Key: Value\n"
+     * body: req.body, req.body_size
+     */
+
+    ve_tls_bricks_request_free(&req);
+    ve_tls_bytes_free(&group);
+    ve_tls_bytes_free(&log);
+    return 0;
 }
 ```
 
 ## 配置参数
 
-所有参数通过 `ve_tls_config` 设置，先调用 `ve_tls_config_init()` 获取默认值，再覆盖需要的字段。
+Full Producer 使用 `ve_tls_config`，字段覆盖目标、鉴权、聚合、队列、重试、网络、metrics 和 callback。Bricks 使用 `ve_tls_bricks_config`，所有字段由调用方直接赋值。
 
-| 参数 | 说明 | 常见取值 |
+| 字段 | 必填 | 说明 |
 | --- | --- | --- |
-| `endpoint` | TLS endpoint | `https://...` |
-| `region` | TLS region | `cn-beijing` |
-| `topic_id` | 目标 topic | 字符串 |
-| `access_key_id` / `access_key_secret` | 静态 AK/SK | 字符串 |
-| `security_token` | 临时凭证 token | 可选 |
-| `credentials_provider` | 动态凭证刷新函数 | 可选 |
-| `compress_type` | 压缩类型 | `lz4` / `zlib` / `none` |
-| `max_buffer_bytes` | Producer 总缓存预算 | 默认 `64MB` |
-| `log_bytes_per_package` | 单批日志字节阈值 | 默认按内存预算派生 |
-| `log_count_per_package` | 单批日志条数阈值 | 默认 `4096` |
-| `flush_interval_ms` | 聚合超时时间 | 默认 `1000` |
-| `send_thread_count` | 发送线程数 | 默认按内存预算派生 |
-| `pack_thread_count` | 打包线程数 | 默认跟随发送线程数 |
-| `send_queue_size` | manager 到 sender 的队列容量 | 默认按内存预算派生 |
-| `buffer_full_policy` | 写入队列满策略 | `DROP` / `BLOCK` |
-| `send_queue_full_policy` | send_queue 满策略 | `DROP` / `BLOCK` / `DROP_SAMPLED` |
-| `connect_timeout_ms` | 连接超时 | 默认 `10000` |
-| `request_timeout_ms` | 单请求超时 | 默认 `50000` |
-| `tls_verify_peer` / `tls_verify_host` | TLS 校验 | 默认开启 |
+| `endpoint` | 是 | TLS endpoint，例如 `https://tls-cn-beijing.volces.com` |
+| `region` | 是 | 签名 scope 中的 region |
+| `topic_id` | 是 | 写入目标 topic，进入 query `TopicId=` |
+| `api_version` | 否 | 默认使用 SDK API version；通常填 `0.3.0` |
+| `access_key_id` / `access_key_secret` | 是 | 静态 AK/SK |
+| `security_token` | 否 | 临时凭证 token |
+| `compress_type` | 否 | `none` / `lz4` / `zlib`；默认视为 `none` |
+| `hash_key` | 否 | 进入 `x-tls-hashkey`，空值也会参与签名 |
+| `xdate` | 否 | 固定签名时间，主要用于测试；为空则由签名模块生成 |
+| `body_no_copy` | 否 | `compress_type=none` 时允许返回 body 借用调用方 buffer |
 
-完整配置字段见 [docs/config-fields.md](docs/config-fields.md)，调优建议见 [docs/tuning.md](docs/tuning.md)。
+`ve_tls_bricks_pack_request()` 的 `log_count`、`earliest_log_time_ms`、`latest_log_time_ms` 会写入 `log-count`、`earliest-log-time`、`latest-log-time` 请求头。
+
+完整字段说明见 [docs/config-fields.md](docs/config-fields.md)。
 
 ## 写入接口
 
-常用写入方式：
+Full Producer 常用写入方式：
 
 - KV 写入：`ve_tls_producer_add_log_kv()`。
 - Raw 写入：`ve_tls_producer_add_log_raw()`。
@@ -115,7 +194,7 @@ int main(void) {
 - 返回 log_id：使用 `*_with_id` 变体。
 - 固定 key 模板：`ve_tls_template_create()` + `ve_tls_template_add_values()`。
 
-运行期能力：
+Full Producer 运行期能力：
 
 - 更新目标：`ve_tls_producer_update_endpoint()`。
 - 更新静态凭证：`ve_tls_producer_update_static_credentials()`。
@@ -123,85 +202,87 @@ int main(void) {
 - 查询缓存估算值：`ve_tls_producer_get_buffered_bytes()`。
 - 设置发送回调：`ve_tls_producer_set_send_done_v2()`。
 
+Bricks 没有“写入 SDK 内部队列”的接口。它的入口是：
+
+- `ve_tls_proto_encode_log*()`：可选，用于生成单条 log protobuf。
+- `ve_tls_proto_encode_log_group_list*()`：可选，用于生成 LogGroupList protobuf body。
+- `ve_tls_bricks_pack_request()`：把 raw LogGroupList body 打成 PutLogs request。
+- `ve_tls_bricks_request_free()`：释放 pack 结果。
+
 ## Demo
 
-最小真实发送 demo：
+Full Producer demo：
 
 ```sh
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DVE_TLS_ENABLE_CURL=ON
-cmake --build build -j
-
 VE_TLS_ENDPOINT=https://tls-cn-beijing.volces.com \
 VE_TLS_REGION=cn-beijing \
 VE_TLS_TOPIC_ID=your-topic-id \
 VE_TLS_ACCESS_KEY_ID=your-ak \
 VE_TLS_ACCESS_KEY_SECRET=your-sk \
-./build/ve_tls_demo
+./build/ve_tls_demo_real --count 1 --wait-ms 15000
 ```
 
-完整 demo：
+Bricks 真实发送 demo 从环境变量读取 endpoint、topic 和凭证：
 
 ```sh
-./build/ve_tls_demo_real --config tools/real_demo.env --duration-s 60 --wait-ms 3000
+VE_TLS_ENDPOINT=https://tls-cn-beijing.volces.com \
+VE_TLS_REGION=cn-beijing \
+VE_TLS_TOPIC_ID=your-topic-id \
+VE_TLS_ACCESS_KEY_ID=your-ak \
+VE_TLS_ACCESS_KEY_SECRET=your-sk \
+VE_TLS_COMPRESS_TYPE=none \
+./build-bricks-real/ve_tls_bricks_demo_real --count 1 --timeout-ms 15000
 ```
 
-## 性能测试
+如果用 libcurl 直接发送 Bricks 输出的 headers，注意保留空值签名头。`x-tls-hashkey: ` 即使为空也参与签名；libcurl 中不能把它变成删除 header 的 `Header:` 语义，demo 会把空值 header 转成 `Header;`。
 
-真实环境 benchmark 使用 `ve_tls_benchmark_tls`，会通过 libcurl 向实际 TLS endpoint 发送日志。运行前先准备包含 endpoint、topic、AK/SK 或临时凭证的 env 文件，不要把凭证写入命令行或提交到仓库。
+## 性能与体积
 
-```sh
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DVE_TLS_ENABLE_CURL=ON
-cmake --build build -j --target ve_tls_benchmark_tls
+2026-06-02 在开发机 Linux x86_64 / Debian / GCC 12.2.0 / commit `ce5dfcc` 实测：
 
-set -a
-. /path/to/real_demo.env
-set +a
+| 目标 | 构建参数 | 文件大小 |
+| --- | --- | ---: |
+| `libve_tls_core.a` | `MinSizeRel`, full core, LZ4 on | `201030 bytes` |
+| `libve_tls_bricks_core.a` | `MinSizeRel`, Bricks LZ4 off | `40298 bytes` |
+| `libve_tls_bricks_core.a` | `MinSizeRel`, Bricks LZ4 on | `70784 bytes` |
+| pack-only 最小可执行文件 | `-Os -ffunction-sections -fdata-sections -Wl,--gc-sections -s` | `27024 bytes` |
+| proto+pack 最小可执行文件 | 同上 | `31120 bytes` |
+| `ve_tls_bricks_demo_real` | Release, curl + LZ4 | `133304 bytes` |
 
-for profile in tls200 tls700; do
-  TLS_BENCH_MODE=curl TLS_CLOSE_TIMEOUT_MS=300000 ./build/ve_tls_benchmark_tls 10000 10 "$profile"
-  TLS_BENCH_MODE=curl TLS_CLOSE_TIMEOUT_MS=300000 ./build/ve_tls_benchmark_tls 30000 10 "$profile"
-  TLS_BENCH_MODE=curl TLS_CLOSE_TIMEOUT_MS=300000 ./build/ve_tls_benchmark_tls 50000 10 "$profile"
-done
+`nm -g` forbidden-symbol 检查确认 `ve_tls_bricks_core` 中没有 `pthread`、`curl`、`ve_tls_producer`、`ve_tls_env`、retry、metrics、persistence、file runtime 符号。
 
-TLS_BENCH_MODE=curl TLS_MAX_BUFFER_BYTES=268435456 TLS_CLOSE_TIMEOUT_MS=300000 ./build/ve_tls_benchmark_tls 10000 10 tls5120
-TLS_BENCH_MODE=curl TLS_MAX_BUFFER_BYTES=268435456 TLS_CLOSE_TIMEOUT_MS=300000 ./build/ve_tls_benchmark_tls 30000 10 tls5120
-TLS_BENCH_MODE=curl TLS_MAX_BUFFER_BYTES=268435456 TLS_CLOSE_TIMEOUT_MS=300000 ./build/ve_tls_benchmark_tls 50000 10 tls5120
-```
+CPU-only benchmark：
 
-真实发送参考数据：
+| 场景 | 结果 |
+| --- | --- |
+| `100000 x 10 logs x 256B`, `none`, zero-copy | `41.139 us/req`, `24307.85 req/s`, `65.47 MiB/s`, SDK heap peak `13312 bytes` |
+| `10000 x 1 log x 16B`, `none`, zero-copy | `12.074 us/req`, `82821.22 req/s`, SDK heap peak `2736 bytes` |
 
-- 环境：Linux x86_64 / Debian 5.15 / 16 vCPU Intel Xeon Platinum 8260 / libcurl 7.88.1 / Release / `VE_TLS_ENABLE_CURL=ON` / 真实 TLS endpoint。
-- 配置：`send_thread_count=10`、`pack_thread_count=10`、`send_queue_size=10000`、`flush_interval_ms=1000`、`log_bytes_per_package=4MB`、`log_count_per_package=4096`、`compress_type=lz4`、`request_timeout_ms=50000`。
-- 说明：记录目标写入速率下的成功率、请求量、CPU、RSS 和 drain 时间；`tls5120` 高倍率使用 `256MB` 内存预算，实际业务日志应按自己的字段、压缩率和限流策略复测。
+更多体积和调优数据见 [docs/bricks.md](docs/bricks.md) 与 [docs/tuning.md](docs/tuning.md)。
 
-| Profile | 目标写入速率 | 内存预算 | 日志数 | 入队丢弃 | 请求数 | 请求失败 | 重试 | 平均入队耗时 | close 耗时 | 峰值 buffer | CPU cores | CPU total | RSS |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `tls200` | `10000 logs/s` | `64MB` | `100000` | `0` | `25` | `0` | `0` | `0.33us/log` | `149.73ms` | `2.35MB` | `0.10` | `0.61%` | `39.28MB` |
-| `tls200` | `30000 logs/s` | `64MB` | `300000` | `0` | `74` | `0` | `0` | `0.32us/log` | `438.89ms` | `5.77MB` | `0.35` | `2.20%` | `40.45MB` |
-| `tls200` | `50000 logs/s` | `64MB` | `500000` | `0` | `123` | `0` | `0` | `0.31us/log` | `123.53ms` | `9.13MB` | `0.56` | `3.50%` | `56.41MB` |
-| `tls700` | `10000 logs/s` | `64MB` | `100000` | `0` | `25` | `0` | `0` | `0.65us/log` | `122.02ms` | `9.87MB` | `0.13` | `0.78%` | `96.02MB` |
-| `tls700` | `30000 logs/s` | `64MB` | `300000` | `0` | `74` | `0` | `0` | `0.60us/log` | `116.07ms` | `25.88MB` | `0.36` | `2.23%` | `118.77MB` |
-| `tls700` | `50000 logs/s` | `64MB` | `500000` | `0` | `123` | `0` | `0` | `0.56us/log` | `125.33ms` | `37.95MB` | `0.58` | `3.65%` | `138.46MB` |
-| `tls5120` | `10000 logs/s` | `256MB` | `100000` | `0` | `123` | `0` | `0` | `2.66us/log` | `3.85ms` | `53.02MB` | `0.60` | `3.73%` | `182.48MB` |
-| `tls5120` | `30000 logs/s` | `256MB` | `300000` | `0` | `370` | `0` | `0` | `2.37us/log` | `10.90ms` | `172.03MB` | `0.72` | `4.49%` | `268.09MB` |
-| `tls5120` | `50000 logs/s` | `256MB` | `500000` | `0` | `616` | `0` | `0` | `2.65us/log` | `109.90ms` | `247.26MB` | `0.88` | `5.52%` | `345.91MB` |
+## 真实环境验证
 
-更多参数和场景建议见 [docs/tuning.md](docs/tuning.md)。
+同一开发机上，读取真实 TLS BOE 环境变量并绕过代理后实测：
 
-## 退出语义
+| 场景 | 结果 |
+| --- | --- |
+| `compress_type=none`, 单次发送 | `curl=0`, `http=200`, request body `86 bytes`, latency `178.984 ms` |
+| `compress_type=lz4`, 单次发送 | `curl=0`, `http=200`, request body `77 bytes`, latency `158.703 ms` |
+| `compress_type=lz4`, 顺序 300 次 | `300/300` 成功，`27.79 req/s`, 平均 `35.973 ms`, min `7.289 ms`, max `244.350 ms` |
 
-- `ve_tls_producer_close(p, timeout_ms)`：停止接收新写入，触发 flush，等待队列和在途发送 drain；超时返回 `VE_TLS_TIMEOUT`。
-- `ve_tls_producer_destroy(p)`：停止 worker/sender 并释放资源，允许丢弃未处理数据。
-- 推荐顺序：先停止业务侧产生日志，再 `close`，最后 `destroy`。
+该数据验证 Bricks 生成的 protobuf body、TLS V4 签名、签名头和 curl 样例 transport 可被服务端接受。它不是并发压测；当前 demo 是顺序发送工具。
 
-## 可靠性边界
+## 退出语义与可靠性边界
 
-该 SDK 是内存队列 Producer。它能提供正常进程内的 drain、重试和背压治理，但不保证进程崩溃后的本地恢复。
+Full Producer 的推荐退出顺序是：先停止业务侧产生日志，再 `ve_tls_producer_close()` 等待 drain，最后 `ve_tls_producer_destroy()` 释放资源。
 
-如果业务要求进程崩溃后继续发送未完成日志，应在业务侧使用外部持久化或重放机制。
+Bricks 没有 producer 生命周期。调用方只需要在发送完成后调用 `ve_tls_bricks_request_free()`，并按 body ownership 规则管理传入的 protobuf buffer。
+
+Bricks 不提供进程崩溃后的本地恢复，也不保证请求重试成功。需要可靠投递时，调用方必须在 Bricks 外部实现持久化、重放、重试、限流和监控。
 
 ## 文档
 
+- [Bricks 设计、体积和真实验证](docs/bricks.md)
 - [配置字段](docs/config-fields.md)
 - [调优与性能测试](docs/tuning.md)
 - [重试策略](docs/retry-policy.md)
