@@ -116,7 +116,7 @@ void ve_tls_producer_config_init(ve_tls_config * config) {
     config->key_breaker_fail_threshold = 0;
     config->key_breaker_open_ms = 30000;
     config->connect_timeout_ms = 10000;
-    config->request_timeout_ms = 10000;
+    config->request_timeout_ms = 50000;
     config->tls_verify_peer = 1;
     config->tls_verify_host = 1;
     config->http_debug = 0;

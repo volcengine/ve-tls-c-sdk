@@ -136,7 +136,7 @@ int main(int argc, char ** argv) {
     file_name = env_str("VE_TLS_FILE_NAME", "tools/putlogsv2_demo.c");
     context_flow = env_str("VE_TLS_CONTEXT_FLOW", "putlogsv2-demo");
     api_version = env_str("VE_TLS_API_VERSION", VE_TLS_C_SDK_API_VERSION);
-    request_timeout_ms = env_i32("VE_TLS_REQUEST_TIMEOUT_MS", 10000);
+    request_timeout_ms = env_i32("VE_TLS_REQUEST_TIMEOUT_MS", 50000);
     connect_timeout_ms = env_i32("VE_TLS_CONNECT_TIMEOUT_MS", 10000);
     http_debug = env_i32("VE_TLS_HTTP_DEBUG", 0);
 

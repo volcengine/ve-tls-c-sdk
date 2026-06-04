@@ -193,6 +193,18 @@ static size_t ve_tls_log_msg_size_lens(int64_t time_ms, uint32_t time_ns, int32_
     return n;
 }
 
+size_t ve_tls_log_builder_estimate_kv_lens_size(int64_t time_ms, uint32_t time_ns, int32_t has_time_ns, const size_t * key_lens, const size_t * val_lens, size_t kv_count) {
+    size_t msg_size = ve_tls_log_msg_size_lens(time_ms, time_ns, has_time_ns, key_lens, val_lens, kv_count);
+    size_t entry_size = 1;
+    if (msg_size <= UINT32_MAX) {
+        entry_size += ve_tls_varint_u32_size((uint32_t)msg_size);
+    } else {
+        entry_size += ve_tls_varint_u64_size((uint64_t)msg_size);
+    }
+    entry_size += msg_size;
+    return entry_size;
+}
+
 ve_tls_log_group_builder * ve_tls_log_builder_create(const char * norm_key) {
     ve_tls_log_group_builder * b = (ve_tls_log_group_builder *)ve_tls_calloc(1, sizeof(*b));
     if (!b) {

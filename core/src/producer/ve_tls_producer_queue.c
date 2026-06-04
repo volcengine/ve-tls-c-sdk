@@ -54,7 +54,7 @@ static int ve_tls_queue_ensure(ve_tls_producer * producer) {
     return 0;
 }
 
-int ve_tls_queue_push_owned(ve_tls_producer * producer, unsigned char * data, size_t size, int64_t id, int64_t time_ms, uint32_t time_ns, int32_t has_time_ns, char * hash_key) {
+static int ve_tls_queue_push_owned_internal(ve_tls_producer * producer, unsigned char * data, size_t size, int64_t id, int64_t time_ms, uint32_t time_ns, int32_t has_time_ns, char * hash_key, int count_bytes) {
     if (!producer || !data || size == 0) {
         return -1;
     }
@@ -72,8 +72,18 @@ int ve_tls_queue_push_owned(ve_tls_producer * producer, unsigned char * data, si
     producer->queue[producer->queue_tail] = item;
     producer->queue_tail = (producer->queue_tail + 1) % producer->queue_cap;
     producer->queue_count++;
-    producer->queue_bytes += size;
+    if (count_bytes) {
+        producer->queue_bytes += size;
+    }
     return 0;
+}
+
+int ve_tls_queue_push_owned(ve_tls_producer * producer, unsigned char * data, size_t size, int64_t id, int64_t time_ms, uint32_t time_ns, int32_t has_time_ns, char * hash_key) {
+    return ve_tls_queue_push_owned_internal(producer, data, size, id, time_ms, time_ns, has_time_ns, hash_key, 1);
+}
+
+int ve_tls_queue_push_reserved_owned(ve_tls_producer * producer, unsigned char * data, size_t size, int64_t id, int64_t time_ms, uint32_t time_ns, int32_t has_time_ns, char * hash_key) {
+    return ve_tls_queue_push_owned_internal(producer, data, size, id, time_ms, time_ns, has_time_ns, hash_key, 0);
 }
 
 int ve_tls_queue_push(ve_tls_producer * producer, const unsigned char * data, size_t size, int64_t id, int64_t time_ms, uint32_t time_ns, int32_t has_time_ns, const char * hash_key) {

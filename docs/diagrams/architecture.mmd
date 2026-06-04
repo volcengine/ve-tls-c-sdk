@@ -1,0 +1,70 @@
+---
+title: ve-tls-c-sdk persistent architecture
+---
+%%{init: {"theme":"base","themeVariables":{"background":"#f7f9fc","fontFamily":"Noto Sans CJK SC, Source Han Sans SC, Microsoft YaHei, Arial, sans-serif","primaryTextColor":"#263238","lineColor":"#455a64","clusterBkg":"#ffffff","clusterBorder":"#c8d3dc"}}}%%
+flowchart LR
+    subgraph clients["接入方"]
+        APP["业务线程<br/>调用 add_log / flush / close"]:::client
+        CREDS["凭证 Provider<br/>刷新 AK/SK/token"]:::client
+        OPS["Demo / Bench<br/>真实发送与恢复验证"]:::client
+    end
+
+    subgraph api["C API"]
+        CFG["配置与生命周期<br/>create / update / close"]:::api
+        WRITE["日志写入<br/>KV / Raw / Template / hashKey"]:::api
+        RECOVER["恢复入口<br/>ve_tls_producer_recover"]:::api
+        OBS["观测入口<br/>metrics / callback"]:::api
+    end
+
+    subgraph core["Producer Core"]
+        SNAP["Runtime Snapshot<br/>隔离运行期配置"]:::core
+        BUDGET["内存预算<br/>max_buffer_bytes"]:::core
+        INQ["Ingress Queue<br/>写入侧背压"]:::core
+        PACK["Proto + Compress<br/>聚合、编码、压缩"]:::core
+        OUTQ["Send Queue<br/>发送侧背压"]:::core
+        SEND["Sender Worker<br/>签名、重试、限流"]:::core
+    end
+
+    subgraph persistent["Persistent Store"]
+        LEASE["lease<br/>owner 与 stale takeover"]:::store
+        SEG["segments<br/>append-before-send"]:::store
+        CKPT["checkpoint<br/>ack 进度"]:::store
+        RECQ["recover replay<br/>checkpoint 之后重放"]:::store
+    end
+
+    subgraph external["外部依赖"]
+        CODEC["lz4 / zlib / none"]:::external
+        HTTP["curl adapter<br/>HTTPS PutLogs"]:::external
+        REMOTE["TLS 服务"]:::external
+    end
+
+    APP --> CFG
+    APP --> WRITE
+    CREDS -.-> CFG
+    OPS --> WRITE
+    OBS -.-> APP
+
+    CFG --> SNAP
+    WRITE --> BUDGET
+    BUDGET --> SEG
+    SEG --> INQ
+    RECOVER --> RECQ
+    CKPT --> RECQ
+    RECQ --> INQ
+
+    INQ --> PACK
+    PACK --> OUTQ
+    PACK -.-> CODEC
+    OUTQ --> SEND
+    SEND --> HTTP
+    HTTP --> REMOTE
+    SEND --> CKPT
+    LEASE -.-> SEG
+    SNAP -.-> SEND
+    SEND -.-> OBS
+
+    classDef client fill:#eef5ff,stroke:#6b93c8,stroke-width:2px,color:#16324f;
+    classDef api fill:#ffffff,stroke:#4f7cac,stroke-width:2px,color:#1f3b57;
+    classDef core fill:#fff8eb,stroke:#d08b2f,stroke-width:2px,color:#5c3b00;
+    classDef store fill:#f1f8f2,stroke:#6aa96f,stroke-width:2px,color:#214d25;
+    classDef external fill:#f6f0ff,stroke:#8a6bb8,stroke-width:2px,color:#37215d;

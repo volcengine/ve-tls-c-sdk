@@ -596,7 +596,7 @@ int main(int argc, char ** argv) {
     cfg.send_thread_count = send_thread_count > 0 ? send_thread_count : 1;
     cfg.flush_interval_ms = flush_interval_ms;
     cfg.log_count_per_package = log_count_per_package;
-    cfg.request_timeout_ms = get_i32(&conf, "VE_TLS_REQUEST_TIMEOUT_MS", 10000);
+    cfg.request_timeout_ms = get_i32(&conf, "VE_TLS_REQUEST_TIMEOUT_MS", 50000);
     cfg.connect_timeout_ms = get_i32(&conf, "VE_TLS_CONNECT_TIMEOUT_MS", 10000);
     cfg.send_queue_size = get_i32(&conf, "VE_TLS_SEND_QUEUE_SIZE", 4096);
     cfg.send_queue_block_timeout_ms = get_i32(&conf, "VE_TLS_SEND_QUEUE_BLOCK_TIMEOUT_MS", 100);

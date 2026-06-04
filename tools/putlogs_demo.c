@@ -131,7 +131,7 @@ int main(int argc, char ** argv) {
     message = env_str("VE_TLS_DEMO_MESSAGE", "hello from direct PutLogs demo");
     source = env_str("VE_TLS_SOURCE", "ve-tls-c-sdk");
     file_name = env_str("VE_TLS_FILE_NAME", "tools/putlogs_demo.c");
-    request_timeout_ms = env_i32("VE_TLS_REQUEST_TIMEOUT_MS", 10000);
+    request_timeout_ms = env_i32("VE_TLS_REQUEST_TIMEOUT_MS", 50000);
     connect_timeout_ms = env_i32("VE_TLS_CONNECT_TIMEOUT_MS", 10000);
     http_debug = env_i32("VE_TLS_HTTP_DEBUG", 0);
 

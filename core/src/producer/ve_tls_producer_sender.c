@@ -1027,7 +1027,7 @@ static int ve_tls_send_put_logs(ve_tls_producer * producer, const char * access_
     req.headers = signed_headers;
     req.body = body;
     req.body_size = body_size;
-    req.timeout_ms = cfg->request_timeout_ms > 0 ? cfg->request_timeout_ms : 10000;
+    req.timeout_ms = cfg->request_timeout_ms > 0 ? cfg->request_timeout_ms : 50000;
     req.connect_timeout_ms = cfg->connect_timeout_ms > 0 ? cfg->connect_timeout_ms : 10000;
     req.tls_verify_peer = cfg->tls_verify_peer;
     req.tls_verify_host = cfg->tls_verify_host;

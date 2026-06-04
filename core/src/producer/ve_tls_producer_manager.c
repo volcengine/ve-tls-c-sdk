@@ -100,6 +100,14 @@ static int ve_tls_should_skip_compress(const char * compress_type, size_t body_s
     return 0;
 }
 
+static size_t ve_tls_manager_compress_scratch_bound(size_t body_size) {
+    size_t extra = body_size / 8 + 4096;
+    if (body_size > (size_t)-1 - extra) {
+        return (size_t)-1;
+    }
+    return body_size + extra;
+}
+
 static int ve_tls_manager_prepare_send_task(ve_tls_producer * producer, ve_tls_send_task * t, const char ** err_code, const char ** err_msg) {
     if (!producer || !t || !t->body || t->body_size == 0) {
         if (err_code) *err_code = "ClientError";
@@ -134,7 +142,15 @@ static int ve_tls_manager_prepare_send_task(ve_tls_producer * producer, ve_tls_s
         if (!t->precompressed || t->precompressed_size == 0) {
             ve_tls_bytes c;
             memset(&c, 0, sizeof(c));
+            size_t scratch = ve_tls_manager_compress_scratch_bound(t->body_size);
+            int scratch_rc = (scratch == (size_t)-1) ? -1 : ve_tls_producer_reserve_scratch_bytes(producer, scratch);
+            if (scratch_rc != 0) {
+                if (err_code) *err_code = (scratch_rc == -2) ? "ProducerClosed" : (scratch_rc == -3) ? "BufferFullTimeout" : "BufferFull";
+                if (err_msg) *err_msg = "buffer budget exceeded before compression";
+                return -1;
+            }
             int c_rc = ve_tls_compress_apply(compress_type, t->body, t->body_size, &c);
+            ve_tls_producer_release_scratch_bytes(producer, scratch);
             if (c_rc != 0 || !c.data || c.size == 0) {
                 if (err_msg) *err_msg = (c_rc == -1) ? "compress failed" : "unsupported compress_type";
                 ve_tls_bytes_free(&c);
@@ -731,7 +747,22 @@ void * ve_tls_worker_main(void * arg) {
                     ve_tls_bytes c = {0};
                     int c_rc = -2;
                     if (max_comp > 0) {
+                        size_t scratch = ve_tls_manager_compress_scratch_bound(body.size);
+                        int scratch_rc = (scratch == (size_t)-1) ? -1 : ve_tls_producer_reserve_scratch_bytes(producer, scratch);
+                        if (scratch_rc != 0) {
+                            ve_tls_manager_drop_range(
+                                producer,
+                                g->bytes,
+                                g->start_id,
+                                g->end_id,
+                                (scratch_rc == -2) ? "ProducerClosed" : (scratch_rc == -3) ? "BufferFullTimeout" : "BufferFull",
+                                "buffer budget exceeded before compression");
+                            ve_tls_bytes_free(&body);
+                            stack_len = 0;
+                            break;
+                        }
                         c_rc = ve_tls_compress_apply(producer->config.compress_type, body.data, body.size, &c);
+                        ve_tls_producer_release_scratch_bytes(producer, scratch);
                         if (c_rc == 0 && c.data && c.size > 0) {
                             send_size = c.size;
                         } else if (c_rc == -2) {

@@ -172,6 +172,7 @@ struct ve_tls_producer {
     size_t send_queue_bytes;
     size_t inflight_bytes;
     size_t send_reserved_bytes;
+    size_t scratch_bytes;
     size_t tls_bytes;
     ve_tls_log_group_builder * sealed_head;
     ve_tls_log_group_builder * sealed_tail;
@@ -239,6 +240,8 @@ int ve_tls_producer_reserve_send_task_bytes(ve_tls_producer * producer, const ve
 void ve_tls_producer_release_send_queue_task_bytes(ve_tls_producer * producer, const ve_tls_send_task * task);
 void ve_tls_producer_move_send_task_to_inflight(ve_tls_producer * producer, const ve_tls_send_task * task);
 void ve_tls_producer_release_inflight_task_bytes(ve_tls_producer * producer, const ve_tls_send_task * task);
+int ve_tls_producer_reserve_scratch_bytes(ve_tls_producer * producer, size_t bytes);
+void ve_tls_producer_release_scratch_bytes(ve_tls_producer * producer, size_t bytes);
 int ve_tls_latency_bucket_index(int64_t ms);
 void ve_tls_rate_limit_wait(ve_tls_producer * producer, size_t bytes);
 void ve_tls_breaker_wait_open(ve_tls_producer * producer);
@@ -253,12 +256,14 @@ int ve_tls_persistent_heartbeat_if_due(ve_tls_persistent * persistent, int force
 void ve_tls_queue_free_all(ve_tls_producer * producer);
 int ve_tls_queue_push(ve_tls_producer * producer, const unsigned char * data, size_t size, int64_t id, int64_t time_ms, uint32_t time_ns, int32_t has_time_ns, const char * hash_key);
 int ve_tls_queue_push_owned(ve_tls_producer * producer, unsigned char * data, size_t size, int64_t id, int64_t time_ms, uint32_t time_ns, int32_t has_time_ns, char * hash_key);
+int ve_tls_queue_push_reserved_owned(ve_tls_producer * producer, unsigned char * data, size_t size, int64_t id, int64_t time_ms, uint32_t time_ns, int32_t has_time_ns, char * hash_key);
 int ve_tls_queue_pop(ve_tls_producer * producer, ve_tls_log_item * out);
 void ve_tls_item_free(ve_tls_log_item * item);
 void ve_tls_send_task_free(ve_tls_send_task * t);
 
 ve_tls_log_group_builder * ve_tls_log_builder_create(const char * norm_key);
 void ve_tls_log_builder_free(ve_tls_log_group_builder * b);
+size_t ve_tls_log_builder_estimate_kv_lens_size(int64_t time_ms, uint32_t time_ns, int32_t has_time_ns, const size_t * key_lens, const size_t * val_lens, size_t kv_count);
 int ve_tls_log_builder_add_kv_lens(ve_tls_log_group_builder * b, int64_t id, int64_t time_ms, uint32_t time_ns, int32_t has_time_ns, const ve_tls_kv * kvs, const size_t * key_lens, const size_t * val_lens, size_t kv_count);
 int ve_tls_log_builder_append(ve_tls_log_group_builder * b, const unsigned char * logs, size_t logs_len, int32_t log_count, int64_t earliest, int64_t latest, int64_t start_id, int64_t end_id, int64_t last_time_ms, uint32_t last_time_ns, int32_t last_has_time_ns);
 void ve_tls_log_builder_shrink_if_needed(ve_tls_log_group_builder * b, size_t shrink_threshold, size_t shrink_to);

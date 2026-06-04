@@ -13,7 +13,7 @@ out/
 .vscode/
 .idea/
 cospec/
-**/docs/*
+backup_docs/
 build_*/
 .local/
 tools/real_demo.env
