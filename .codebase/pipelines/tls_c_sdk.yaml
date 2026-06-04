@@ -1,0 +1,57 @@
+name: tls-c-sdk
+trigger:
+  change:
+  manual:
+jobs:
+  unit_test_coverage:
+    name: UT Coverage
+    image: hub.byted.org/base/tls_build_cpp_ci_ci:tls_gcc11_with_ninja 
+    working-directory: tls-c-sdk
+    runs-on:
+      env: boe
+      spec: c1.2xlarge
+    steps:
+      - uses: actions/checkout
+        inputs:
+          ref: ${{Head.Branch}}
+          depth: 1
+      - name: Print basic info
+        commands:
+          - whoami
+          - pwd
+          - ls
+          - date
+          - cmake --version
+          - ctest --version
+          - gcc --version
+          - lcov --version || true
+      - id: unit_test_coverage
+        uses: actions/codecov
+        inputs:
+          language: cpp
+          driver: custom
+          commands:
+            - rm -rf build-coverage coverage
+            - cmake -E make_directory build-coverage
+            - cmake -E chdir build-coverage cmake .. -DCMAKE_BUILD_TYPE=Debug -DVE_TLS_BUILD_TESTS=ON -DVE_TLS_BUILD_TOOLS=OFF -DVE_TLS_ENABLE_CURL=OFF -DVE_TLS_ENABLE_LZ4=ON -DCMAKE_C_COMPILER=gcc -DCMAKE_C_FLAGS="--coverage -O0 -g" -DCMAKE_EXE_LINKER_FLAGS="--coverage"
+            - cmake --build build-coverage -j
+            - cmake -E chdir build-coverage ctest --output-on-failure
+            - mkdir -p coverage
+            - lcov --capture --directory build-coverage --output-file coverage/coverage.raw.info
+            - lcov --remove coverage/coverage.raw.info "*/tests/*" "*/tools/*" "*/third_party/*" "*/adapters/*" "*/build-coverage/*" --output-file coverage/coverage.info
+            - lcov --list coverage/coverage.info
+          config:
+            include_files:
+              - "core/src/**"
+              - "core/include/**"
+            exclude_files:
+              - "tests/**"
+              - "tools/**"
+              - "third_party/**"
+              - "adapters/**"
+            line_percent: 0
+            diff_percent: 60
+          outcome:
+            coverage_format: lcov
+            coverage_paths:
+              - "coverage/coverage.info"

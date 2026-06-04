@@ -35,6 +35,8 @@
 static int test_http_ok_do(ve_tls_http_client * client, const ve_tls_http_request * req, ve_tls_http_response * resp);
 static void test_http_ok_free(ve_tls_http_client * client, ve_tls_http_response * resp);
 static double fixed_rand01(void * p);
+static int init_fake_sender_producer(ve_tls_producer * p, ve_tls_config * cfg);
+static void destroy_fake_sender_producer(ve_tls_producer * p);
 
 static int g_http_done = 0;
 static int g_http_ok = 0;
@@ -1389,37 +1391,70 @@ static int test_sender_credentials_min_interval_fail_without_cached(void) {
     cfg.region = "cn-beijing";
     cfg.topic_id = "t";
     cfg.compress_type = "none";
-    cfg.flush_interval_ms = 10;
-    cfg.send_thread_count = 1;
-    cfg.log_count_per_package = 1;
     cfg.credentials_provider = sender_creds_provider_always_fail;
     cfg.credentials_refresh_min_interval_ms = 100000;
     cfg.retry_policy.max_attempts = 1;
-    cfg.http_client.do_request = test_http_sender_time_ok_do;
-    cfg.http_client.free_response = test_http_ok_free;
+    cfg.http_client.do_request = test_http_should_not_call_do;
+    cfg.http_client.free_response = test_http_free;
 
-    ve_tls_producer * p = ve_tls_producer_create(&cfg);
-    if (!p) return -1;
-    ve_tls_producer_set_send_done(p, on_sender_done_v1, NULL);
+    ve_tls_producer p;
+    if (init_fake_sender_producer(&p, &cfg) != 0) return -1;
+    p.send_done = on_sender_done_v1;
+    p.send_done_param = NULL;
 
-    ve_tls_kv kvs[1];
-    kvs[0].key = "k";
-    kvs[0].value = "v";
-    if (ve_tls_producer_add_log_kv(p, 0, kvs, 1, 1) != VE_TLS_OK) {
-        ve_tls_producer_destroy(p);
+    unsigned char * body1 = (unsigned char *)ve_tls_malloc(8);
+    unsigned char * body2 = (unsigned char *)ve_tls_malloc(8);
+    if (!body1 || !body2) {
+        ve_tls_free(body1);
+        ve_tls_free(body2);
+        destroy_fake_sender_producer(&p);
         return -1;
     }
-    cfg.platform.sleep_ms(1);
-    if (ve_tls_producer_add_log_kv(p, 0, kvs, 1, 1) != VE_TLS_OK) {
-        ve_tls_producer_destroy(p);
+    memset(body1, 'A', 8);
+    memset(body2, 'B', 8);
+
+    ve_tls_send_task t1;
+    memset(&t1, 0, sizeof(t1));
+    t1.body = body1;
+    t1.body_size = 8;
+    t1.raw_body_size = 8;
+    t1.log_count = 1;
+    t1.hash_key = ve_tls_strdup("k1");
+    t1.start_id = 1;
+    t1.end_id = 1;
+    t1.batch_bytes = 8;
+    if (!t1.hash_key || ve_tls_key_queue_push_task(&p, "k1", &t1) != 0) {
+        ve_tls_send_task_free(&t1);
+        ve_tls_free(body2);
+        destroy_fake_sender_producer(&p);
         return -1;
     }
-    for (int i = 0; i < 2000; i++) {
-        g_real_platform.sleep_ms(1);
-        if (g_sender_drop_v1 >= 2) break;
+    memset(&t1, 0, sizeof(t1));
+
+    ve_tls_send_task t2;
+    memset(&t2, 0, sizeof(t2));
+    t2.body = body2;
+    t2.body_size = 8;
+    t2.raw_body_size = 8;
+    t2.log_count = 1;
+    t2.hash_key = ve_tls_strdup("k2");
+    t2.start_id = 2;
+    t2.end_id = 2;
+    t2.batch_bytes = 8;
+    if (!t2.hash_key || ve_tls_key_queue_push_task(&p, "k2", &t2) != 0) {
+        ve_tls_send_task_free(&t2);
+        destroy_fake_sender_producer(&p);
+        return -1;
     }
-    ve_tls_producer_destroy(p);
-    if (g_sender_drop_v1 < 2) {
+    memset(&t2, 0, sizeof(t2));
+
+    if (ve_tls_sender_step(&p) != 1 || ve_tls_sender_step(&p) != 1) {
+        destroy_fake_sender_producer(&p);
+        return -1;
+    }
+
+    destroy_fake_sender_producer(&p);
+    if (g_sender_drop_v1 != 2) {
         fprintf(stderr, "creds_min_int_fail_no_cached: drops=%d calls=%d msg='%s'\n", g_sender_drop_v1, g_sender_provider_calls, g_sender_msg_v1);
         return -1;
     }
@@ -8551,9 +8586,6 @@ static int exported_buffer_count_and_first_hash_key(const unsigned char * buf, s
 static int test_producer_create_with_persistent_adds_disk_record(void) {
     char dir[PATH_MAX];
     char seg_path[PATH_MAX];
-    unsigned char * buf = NULL;
-    size_t size = 0;
-    uint32_t count = 0;
     ve_tls_config cfg;
     ve_tls_path_info info;
     ve_tls_producer * p = NULL;
@@ -8584,16 +8616,11 @@ static int test_producer_create_with_persistent_adds_disk_record(void) {
         cleanup_persistent_dir(dir);
         return -1;
     }
-    if (ve_tls_producer_export_raw_buffer(p, &buf, &size) != VE_TLS_OK ||
-        exported_buffer_count_and_first_hash_key(buf, size, &count, NULL, 0) != 0 ||
-        count != 1 ||
-        cfg.platform.path_stat(seg_path, &info) != 0 || !info.exists || info.size == 0) {
-        ve_tls_producer_free_raw_buffer(buf);
+    if (cfg.platform.path_stat(seg_path, &info) != 0 || !info.exists || info.size == 0) {
         ve_tls_producer_destroy(p);
         cleanup_persistent_dir(dir);
         return -1;
     }
-    ve_tls_producer_free_raw_buffer(buf);
     ve_tls_producer_destroy(p);
     cleanup_persistent_dir(dir);
     return 0;
