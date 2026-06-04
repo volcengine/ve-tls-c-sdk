@@ -1,35 +1,51 @@
-# 重试策略规范
+# 重试策略
 
-## 范围
-本文件定义 C SDK 的重试策略，并说明 Producer 异步队列中的批次重试模型。
+SDK 的重试分两层：请求级重试策略和 Producer 批次重试队列。
 
-## RetryPolicy（面向请求）
-- 指数退避（Exponential Backoff）
-- 抖动（Randomization Factor）
-- 最大间隔（Max Interval）
-- 总耗时上限（Total Timeout）
-- 最大尝试次数（Max Attempts）
+## 请求级策略
 
-## 可重试条件
-### HTTP 可重试
-- 429
-- 500/502/503
+`ve_tls_retry_policy` 控制单个 HTTP 请求的重试节奏：
 
-### 网络可重试
-- 超时（net.Error.Timeout）
+- `initial_interval_ms`：首次退避时间。
+- `max_interval_ms`：单次退避上限。
+- `multiplier`：退避倍数。
+- `randomization_factor`：随机抖动比例。
+- `total_timeout_ms`：整次请求的总耗时上限。
+- `max_attempts`：最大尝试次数。小于等于 `0` 时只受 `total_timeout_ms` 限制。
+
+## 可重试错误
+
+HTTP 状态码：
+
+- `429`
+- `500`
+- `502`
+- `503`
+
+常见网络错误：
+
+- 超时
 - EOF
-- 连接异常：ECONNRESET/EPIPE/ETIMEDOUT/ECONNREFUSED/EHOSTUNREACH/ENETUNREACH 等
+- `ECONNRESET`
+- `EPIPE`
+- `ETIMEDOUT`
+- `ECONNREFUSED`
+- `EHOSTUNREACH`
+- `ENETUNREACH`
+
+不在可重试列表里的错误会直接进入最终失败回调。
 
 ## 停止条件
-- 超出 Total Timeout
-- 达到 Max Attempts（若 MaxAttempts<=0，则仅受 TotalTimeout 限制）
-- 错误不满足可重试条件
 
-## 约束语义
-- 总重试上下文限制整次请求耗时
-- 单次尝试上下文限制一次 HTTP 请求耗时，避免错误 cancel 传播影响请求结果判定
+重试会在以下情况停止：
 
-## Producer 重试（面向批次）
-- 不重试：命中 NoRetryStatusCodeList、已 shutdown、达到最大重试次数
-- 退避：首次 baseBackoff，后续每次增加随机增量并 clamp 到 maxBackoff
-- 队列：以 nextRetryMs 排序的延迟队列
+- 达到 `total_timeout_ms`。
+- 达到 `max_attempts`。
+- 错误不满足可重试条件。
+- Producer 已关闭。
+
+## Producer 批次重试
+
+发送失败但仍可重试时，批次会进入延迟队列。延迟队列按下一次重试时间排序，到期后重新交给 sender。
+
+达到最大重试次数、命中不可重试状态码或 producer 正在关闭时，批次不会再入队。最终结果会通过发送回调返回。
