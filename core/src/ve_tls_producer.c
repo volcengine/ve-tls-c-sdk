@@ -872,6 +872,21 @@ int ve_tls_ingress_task_merge_locked(ve_tls_producer * producer, const ve_tls_in
     return 0;
 }
 
+/* 归还 tls_bytes 预算并唤醒可能在 ve_tls_wait_buffer_space_locked() 上等待的线程。
+ * 调用方必须当前未持有 producer->mutex。 */
+static void ve_tls_release_tls_bytes(ve_tls_producer * producer, size_t bytes) {
+    if (!producer || bytes == 0) {
+        return;
+    }
+    __atomic_fetch_sub(&producer->tls_bytes, bytes, __ATOMIC_RELAXED);
+    if (!producer->mutex || !producer->cond) {
+        return;
+    }
+    producer->config.platform.mutex_lock(producer->mutex);
+    producer->config.platform.cond_broadcast(producer->cond);
+    producer->config.platform.mutex_unlock(producer->mutex);
+}
+
 static int ve_tls_tls_batch_flush_locked(ve_tls_producer * producer, const char * norm_key, ve_tls_log_group_builder * tb, int force_flush) {
     if (!producer || !tb || tb->log_count == 0 || tb->logs_len == 0) {
         return 0;
@@ -1005,7 +1020,7 @@ static int ve_tls_try_add_log_tls_batching(
     if (g_tls_batch.producer != producer || g_tls_batch.norm_key != norm_key) {
         if (g_tls_batch.producer && g_tls_batch.builder) {
             if (g_tls_batch.builder->logs_len > 0) {
-                __atomic_fetch_sub(&g_tls_batch.producer->tls_bytes, g_tls_batch.builder->logs_len, __ATOMIC_RELAXED);
+                ve_tls_release_tls_bytes(g_tls_batch.producer, g_tls_batch.builder->logs_len);
             }
             ve_tls_log_builder_free(g_tls_batch.builder);
         }
@@ -1014,7 +1029,7 @@ static int ve_tls_try_add_log_tls_batching(
         g_tls_batch.norm_key = norm_key;
         g_tls_batch.builder = ve_tls_log_builder_create(norm_key);
         if (!g_tls_batch.builder) {
-            __atomic_fetch_sub(&producer->tls_bytes, estimated, __ATOMIC_RELAXED);
+            ve_tls_release_tls_bytes(producer, estimated);
             *out_rc = VE_TLS_DROP_ERROR;
             return 1;
         }
@@ -1022,7 +1037,7 @@ static int ve_tls_try_add_log_tls_batching(
     }
 
     if (!g_tls_batch.builder) {
-        __atomic_fetch_sub(&producer->tls_bytes, estimated, __ATOMIC_RELAXED);
+        ve_tls_release_tls_bytes(producer, estimated);
         *out_rc = VE_TLS_DROP_ERROR;
         return 1;
     }
@@ -1032,7 +1047,7 @@ static int ve_tls_try_add_log_tls_batching(
         int closed = (producer->stop || !producer->accepting) ? 1 : 0;
         producer->config.platform.mutex_unlock(producer->mutex);
         if (closed) {
-            __atomic_fetch_sub(&producer->tls_bytes, estimated, __ATOMIC_RELAXED);
+            ve_tls_release_tls_bytes(producer, estimated);
             *out_rc = VE_TLS_CLOSED;
             return 1;
         }
@@ -1044,10 +1059,7 @@ static int ve_tls_try_add_log_tls_batching(
     }
     size_t prev_len = g_tls_batch.builder->logs_len;
     if (ve_tls_log_builder_add_kv_lens(g_tls_batch.builder, id, time_ms, time_ns, has_time_ns, kvs, key_lens, val_lens, kv_count) != 0) {
-        if (prev_len > 0) {
-            __atomic_fetch_sub(&producer->tls_bytes, prev_len, __ATOMIC_RELAXED);
-        }
-        __atomic_fetch_sub(&producer->tls_bytes, estimated, __ATOMIC_RELAXED);
+        ve_tls_release_tls_bytes(producer, prev_len + estimated);
         ve_tls_tls_batch_reset(g_tls_batch.builder);
         ve_tls_metric_inc_u64(&producer->m_logs_dropped_total, 1);
         ve_tls_metric_inc_u64(&producer->m_bytes_dropped_total, 0);
@@ -1060,7 +1072,7 @@ static int ve_tls_try_add_log_tls_batching(
     if (delta > estimated) {
         __atomic_fetch_add(&producer->tls_bytes, delta - estimated, __ATOMIC_RELAXED);
     } else if (estimated > delta) {
-        __atomic_fetch_sub(&producer->tls_bytes, estimated - delta, __ATOMIC_RELAXED);
+        ve_tls_release_tls_bytes(producer, estimated - delta);
     }
     ve_tls_metric_inc_u64(&producer->m_logs_enqueued_total, 1);
     ve_tls_metric_inc_u64(&producer->m_bytes_enqueued_total, delta);
@@ -1098,7 +1110,7 @@ static int ve_tls_try_add_log_tls_batching(
         producer->config.platform.mutex_unlock(producer->mutex);
         if (frc != 0) {
             if (g_tls_batch.builder->logs_len > 0) {
-                __atomic_fetch_sub(&producer->tls_bytes, g_tls_batch.builder->logs_len, __ATOMIC_RELAXED);
+                ve_tls_release_tls_bytes(producer, g_tls_batch.builder->logs_len);
             }
             ve_tls_tls_batch_reset(g_tls_batch.builder);
             if (frc == -2) {
@@ -1713,7 +1725,7 @@ void ve_tls_producer_destroy(ve_tls_producer * producer) {
     }
     if (g_tls_batch.producer == producer) {
         if (g_tls_batch.builder && g_tls_batch.builder->logs_len > 0) {
-            __atomic_fetch_sub(&producer->tls_bytes, g_tls_batch.builder->logs_len, __ATOMIC_RELAXED);
+            ve_tls_release_tls_bytes(producer, g_tls_batch.builder->logs_len);
         }
         ve_tls_log_builder_free(g_tls_batch.builder);
         memset(&g_tls_batch, 0, sizeof(g_tls_batch));
@@ -3065,8 +3077,7 @@ ve_tls_result ve_tls_producer_import_raw_buffer(ve_tls_producer * producer, cons
             producer->config.platform.mutex_unlock(producer->mutex);
             return VE_TLS_INVALID;
         }
-        if (producer->config.max_buffer_bytes > 0 &&
-            !ve_tls_size_fits_limit(producer->queue_bytes, (size_t)data_size, (size_t)producer->config.max_buffer_bytes)) {
+        if (!ve_tls_has_buffer_space_locked(producer, (size_t)data_size, 0)) {
             producer->config.platform.mutex_unlock(producer->mutex);
             return VE_TLS_DROP_ERROR;
         }
