@@ -175,10 +175,10 @@ static size_t ve_tls_log_content_field_size(size_t klen, size_t vlen) {
 }
 
 static size_t ve_tls_log_msg_size_lens(int64_t time_ms, uint32_t time_ns, int32_t has_time_ns, const size_t * key_lens, const size_t * val_lens, size_t kv_count) {
+    (void)time_ns;
     if (time_ms <= 0) {
         time_ms = 0;
         has_time_ns = 0;
-        time_ns = 0;
     }
     uint64_t t = (uint64_t)time_ms;
     size_t n = ve_tls_key_u32_size(1, 0) + ve_tls_varint_u64_size(t);
@@ -191,6 +191,18 @@ static size_t ve_tls_log_msg_size_lens(int64_t time_ms, uint32_t time_ns, int32_
         n += ve_tls_key_u32_size(3, 5) + 4;
     }
     return n;
+}
+
+size_t ve_tls_log_builder_estimate_kv_lens_size(int64_t time_ms, uint32_t time_ns, int32_t has_time_ns, const size_t * key_lens, const size_t * val_lens, size_t kv_count) {
+    size_t msg_size = ve_tls_log_msg_size_lens(time_ms, time_ns, has_time_ns, key_lens, val_lens, kv_count);
+    size_t entry_size = 1;
+    if (msg_size <= UINT32_MAX) {
+        entry_size += ve_tls_varint_u32_size((uint32_t)msg_size);
+    } else {
+        entry_size += ve_tls_varint_u64_size((uint64_t)msg_size);
+    }
+    entry_size += msg_size;
+    return entry_size;
 }
 
 ve_tls_log_group_builder * ve_tls_log_builder_create(const char * norm_key) {
@@ -289,13 +301,7 @@ int ve_tls_log_builder_add_kv_lens(ve_tls_log_group_builder * b, int64_t id, int
     }
 
     size_t msg_size = ve_tls_log_msg_size_lens(time_ms, time_ns, has_time_ns, key_lens, val_lens, kv_count);
-    size_t entry_size = 1;
-    if (msg_size <= UINT32_MAX) {
-        entry_size += ve_tls_varint_u32_size((uint32_t)msg_size);
-    } else {
-        entry_size += ve_tls_varint_u64_size((uint64_t)msg_size);
-    }
-    entry_size += msg_size;
+    size_t entry_size = ve_tls_log_builder_estimate_kv_lens_size(time_ms, time_ns, has_time_ns, key_lens, val_lens, kv_count);
     size_t need = b->logs_len + entry_size;
     if (ve_tls_bytes_reserve(&b->logs, &b->logs_cap, need) != 0) {
         return -1;

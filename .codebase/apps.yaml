@@ -1,0 +1,31 @@
+codecov:
+  status:
+    project: # 全量代码
+      default:
+        minimum_coverage: 60%
+        threshold: 0%
+        if_not_found: "error"
+        if_ci_failed: "error"
+#        base: "change"
+        paths:
+          - "core"
+          - "!tools"
+          - "!third_party"
+          # 移除不需要的mock
+    diff: # 增量代码
+      default:
+        minimum_coverage: 60%
+        threshold: 0%
+        if_not_found: "error"
+        if_ci_failed: "error"
+        line_limit: 10
+        paths:
+          - "core"
+          - "!tools"
+          - "!third_party"
+TLS 评审搭子:
+  target_branch_white_list:
+    - "main"
+    - "persisent"
+    - "live"
+    - "breaker"

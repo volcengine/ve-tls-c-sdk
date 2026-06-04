@@ -7,7 +7,7 @@
 ### 内存预算
 
 - `max_buffer_bytes` 是 producer 总缓存预算，不只是写入队列上限。
-- 预算覆盖写入队列、send queue 预留、inflight 批次和构建阶段缓冲。
+- 预算覆盖写入队列、send queue 预留、inflight 批次、TLS batching 和压缩 scratch。
 - `log_bytes_per_package` 不能超过 `max_buffer_bytes / 2`。包太大会挤压队列和 inflight 空间。
 
 ### 聚合
@@ -23,6 +23,9 @@
 - `send_queue_full_policy=DROP`：manager 无法入 send queue 时丢批。
 - `send_queue_full_policy=BLOCK`：manager 等待 send queue 空位，适合低并发、不丢优先的场景。
 - `send_queue_full_policy=DROP_SAMPLED`：按采样间隔丢弃，用于写入高峰下的折中策略。
+- `breaker_ingress_policy=ALLOW`：默认行为；全局 breaker open 时仍允许写入侧排队，后台发送侧等待半开。
+- `breaker_ingress_policy=FAIL_FAST`：全局 breaker open 时写入接口直接返回 `VE_TLS_DROP_ERROR`，不复制日志、不进入队列。
+- `breaker_ingress_policy=DROP_WITH_CALLBACK`：全局 breaker open 时不入队，写入接口返回 `VE_TLS_DROP_ERROR`，并通过发送回调上报 `CircuitOpen`。
 
 ## 默认派生档位
 
