@@ -68,6 +68,7 @@
 | `breaker_fail_threshold` | 全局熔断失败阈值。 |
 | `breaker_open_ms` | 全局熔断打开时间。 |
 | `breaker_half_open_max_inflight` | 半开状态允许的并发请求数。 |
+| `breaker_ingress_policy` | 全局 breaker open 时的写入侧策略：`ALLOW`、`FAIL_FAST` 或 `DROP_WITH_CALLBACK`。 |
 | `key_queue_max_active` | 活跃 hashKey 队列数量上限。 |
 | `key_queue_bucket_count` | hashKey 队列哈希桶数量。 |
 | `key_queue_idle_ttl_ms` | 空闲 hashKey 队列保留时间。 |

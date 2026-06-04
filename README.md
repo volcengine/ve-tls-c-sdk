@@ -11,7 +11,7 @@
 - 压缩：支持 `lz4`、`zlib` 和 `none`。日志文本通常优先使用 `lz4`。
 - hashKey 顺序：同一 hashKey 内按顺序发送，不同 hashKey 可并行处理。需要分区内有序时传稳定 hashKey；不需要顺序时可以不传。
 - 背压：写入队列支持 `DROP` / `BLOCK`，发送队列支持 `DROP` / `BLOCK` / `DROP_SAMPLED`。实时观测日志通常选择丢弃优先，关键日志建议选择阻塞并设置有限超时。
-- 有界内存：`max_buffer_bytes` 约束写入队列、发送队列预留、inflight 批次和构建缓冲。小内存设备应先定预算，再调包大小和线程数。
+- 有界内存：`max_buffer_bytes` 约束写入队列、发送队列预留、inflight 批次、TLS batching 和压缩 scratch。小内存设备应先定预算，再调包大小和线程数。
 - 临时凭证：支持 `credentials_provider`，SDK 会在凭证接近过期时刷新。不要在日志中打印 AK/SK/token。
 - 观测与退出：提供发送回调、累计 metrics、metrics sink、buffered bytes 查询，以及 `close` / `destroy` 两阶段退出。
 
@@ -100,6 +100,7 @@ int main(void) {
 | `send_queue_size` | manager 到 sender 的队列容量 | 默认按内存预算派生 |
 | `buffer_full_policy` | 写入队列满策略 | `DROP` / `BLOCK` |
 | `send_queue_full_policy` | send queue 满策略 | `DROP` / `BLOCK` / `DROP_SAMPLED` |
+| `breaker_ingress_policy` | 全局 breaker open 时写入侧策略 | `ALLOW` / `FAIL_FAST` / `DROP_WITH_CALLBACK` |
 | `connect_timeout_ms` | 连接超时 | 默认 `10000` |
 | `request_timeout_ms` | 单请求超时 | 默认 `50000` |
 | `tls_verify_peer` / `tls_verify_host` | TLS 证书校验 | 默认开启 |

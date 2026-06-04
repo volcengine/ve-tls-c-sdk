@@ -3253,6 +3253,181 @@ static int test_ingress_budget_blocks_before_send_budget_is_exhausted(void) {
     return reserve_rc == 0 ? 0 : -1;
 }
 
+static int test_raw_add_log_budget_full_drops_before_copy_alloc(void) {
+    ve_tls_config cfg;
+    ve_tls_config_init(&cfg);
+    cfg.endpoint = "https://example.com";
+    cfg.region = "cn-beijing";
+    cfg.topic_id = "t";
+    cfg.access_key_id = "ak";
+    cfg.access_key_secret = "sk";
+    cfg.flush_interval_ms = 0;
+    cfg.ordered_send = 1;
+    cfg.max_buffer_bytes = 8;
+    cfg.buffer_full_policy = VE_TLS_BUFFER_FULL_DROP;
+    cfg.send_queue_size = 4;
+
+    ve_tls_producer p;
+    if (init_fake_sender_producer(&p, &cfg) != 0) return -1;
+    p.queue_bytes = 8;
+
+    ve_tls_alloc_hooks saved;
+    memset(&saved, 0, sizeof(saved));
+    ve_tls_alloc_get_hooks(&saved);
+    alloc_fail_state st;
+    memset(&st, 0, sizeof(st));
+    set_alloc_fail_after(&st, 1000);
+
+    ve_tls_result rc = ve_tls_producer_add_log_raw(&p, "0123456789", 10, 0);
+
+    ve_tls_alloc_set_hooks(&saved);
+    int ok = (rc == VE_TLS_DROP_ERROR && st.calls == 0 && p.queue_bytes == 8);
+    destroy_fake_sender_producer(&p);
+    return ok ? 0 : -1;
+}
+
+static int test_kv_add_log_budget_full_drops_before_builder_grow(void) {
+    ve_tls_config cfg;
+    ve_tls_config_init(&cfg);
+    cfg.endpoint = "https://example.com";
+    cfg.region = "cn-beijing";
+    cfg.topic_id = "t";
+    cfg.access_key_id = "ak";
+    cfg.access_key_secret = "sk";
+    cfg.flush_interval_ms = 0;
+    cfg.ordered_send = 1;
+    cfg.max_buffer_bytes = 128;
+    cfg.buffer_full_policy = VE_TLS_BUFFER_FULL_DROP;
+    cfg.send_queue_size = 4;
+
+    ve_tls_producer p;
+    if (init_fake_sender_producer(&p, &cfg) != 0) return -1;
+    p.send_reserved_bytes = 64;
+    p.queue_bytes = 60;
+
+    ve_tls_kv kvs[1];
+    kvs[0].key = "k";
+    kvs[0].value = "value-that-needs-more-than-four-bytes";
+    ve_tls_result rc = ve_tls_producer_add_log_kv(&p, 1710000000000LL, kvs, 1, 0);
+    int ok = (rc == VE_TLS_DROP_ERROR && p.queue_bytes == 60 && p.key_queue_count == 0);
+    destroy_fake_sender_producer(&p);
+    return ok ? 0 : -1;
+}
+
+static int test_breaker_ingress_fail_fast_rejects_before_queue(void) {
+    ve_tls_config cfg;
+    ve_tls_config_init(&cfg);
+    cfg.endpoint = "https://example.com";
+    cfg.region = "cn-beijing";
+    cfg.topic_id = "t";
+    cfg.access_key_id = "ak";
+    cfg.access_key_secret = "sk";
+    cfg.flush_interval_ms = 0;
+    cfg.ordered_send = 1;
+    cfg.breaker_fail_threshold = 1;
+    cfg.breaker_ingress_policy = VE_TLS_BREAKER_INGRESS_FAIL_FAST;
+
+    ve_tls_producer p;
+    if (init_fake_sender_producer(&p, &cfg) != 0) return -1;
+    p.breaker_open_until_ms = (cfg.platform.time_ms ? cfg.platform.time_ms() : 0) + 30000;
+
+    ve_tls_result rc = ve_tls_producer_add_log_raw(&p, "abc", 3, 0);
+    int ok = (rc == VE_TLS_DROP_ERROR && p.queue_count == 0 && p.queue_bytes == 0);
+    destroy_fake_sender_producer(&p);
+    return ok ? 0 : -1;
+}
+
+static int g_breaker_ingress_drop_cb = 0;
+static char g_breaker_ingress_drop_code[64];
+
+static void on_breaker_ingress_drop_v2(
+    ve_tls_result result,
+    size_t log_bytes,
+    size_t compressed_bytes,
+    const ve_tls_error * error,
+    const unsigned char * raw_buffer,
+    void * user_param,
+    int64_t start_id,
+    int64_t end_id) {
+    (void)compressed_bytes;
+    (void)raw_buffer;
+    (void)user_param;
+    if (result == VE_TLS_DROP_ERROR && log_bytes > 0 && start_id == end_id) {
+        g_breaker_ingress_drop_cb++;
+        if (error && error->error_code) {
+            snprintf(g_breaker_ingress_drop_code, sizeof(g_breaker_ingress_drop_code), "%s", error->error_code);
+        }
+    }
+}
+
+static int test_breaker_ingress_drop_with_callback_reports_drop_without_queue(void) {
+    g_breaker_ingress_drop_cb = 0;
+    memset(g_breaker_ingress_drop_code, 0, sizeof(g_breaker_ingress_drop_code));
+
+    ve_tls_config cfg;
+    ve_tls_config_init(&cfg);
+    cfg.endpoint = "https://example.com";
+    cfg.region = "cn-beijing";
+    cfg.topic_id = "t";
+    cfg.access_key_id = "ak";
+    cfg.access_key_secret = "sk";
+    cfg.flush_interval_ms = 0;
+    cfg.ordered_send = 1;
+    cfg.breaker_fail_threshold = 1;
+    cfg.breaker_ingress_policy = VE_TLS_BREAKER_INGRESS_DROP_WITH_CALLBACK;
+
+    ve_tls_producer p;
+    if (init_fake_sender_producer(&p, &cfg) != 0) return -1;
+    p.send_done_v2 = on_breaker_ingress_drop_v2;
+    p.breaker_open_until_ms = (cfg.platform.time_ms ? cfg.platform.time_ms() : 0) + 30000;
+
+    ve_tls_kv kvs[1];
+    kvs[0].key = "k";
+    kvs[0].value = "v";
+    ve_tls_result rc = ve_tls_producer_add_log_kv(&p, 1710000000000LL, kvs, 1, 0);
+    int ok = (rc == VE_TLS_DROP_ERROR &&
+              p.queue_count == 0 &&
+              p.queue_bytes == 0 &&
+              g_breaker_ingress_drop_cb == 1 &&
+              strcmp(g_breaker_ingress_drop_code, "CircuitOpen") == 0);
+    destroy_fake_sender_producer(&p);
+    return ok ? 0 : -1;
+}
+
+static int test_scratch_budget_is_counted_against_max_buffer_bytes(void) {
+    ve_tls_config cfg;
+    ve_tls_config_init(&cfg);
+    cfg.endpoint = "https://example.com";
+    cfg.region = "cn-beijing";
+    cfg.topic_id = "t";
+    cfg.access_key_id = "ak";
+    cfg.access_key_secret = "sk";
+    cfg.max_buffer_bytes = 64;
+    cfg.buffer_full_policy = VE_TLS_BUFFER_FULL_DROP;
+
+    ve_tls_producer p;
+    if (init_fake_sender_producer(&p, &cfg) != 0) return -1;
+    p.queue_bytes = 60;
+
+    int fail_rc = ve_tls_producer_reserve_scratch_bytes(&p, 8);
+    if (fail_rc == 0 || p.scratch_bytes != 0) {
+        destroy_fake_sender_producer(&p);
+        return -1;
+    }
+    int huge_rc = ve_tls_producer_reserve_scratch_bytes(&p, (size_t)-1);
+    if (huge_rc == 0 || p.scratch_bytes != 0) {
+        p.scratch_bytes = 0;
+        destroy_fake_sender_producer(&p);
+        return -1;
+    }
+    int ok_rc = ve_tls_producer_reserve_scratch_bytes(&p, 4);
+    size_t buffered = ve_tls_producer_get_buffered_bytes(&p);
+    ve_tls_producer_release_scratch_bytes(&p, 4);
+    int ok = (ok_rc == 0 && buffered == 64 && p.scratch_bytes == 0);
+    destroy_fake_sender_producer(&p);
+    return ok ? 0 : -1;
+}
+
 static int test_worker_pack_stage_unsupported_compress_drops_before_enqueue(void) {
     g_worker_pack_drop = 0;
     memset(g_worker_pack_drop_msg, 0, sizeof(g_worker_pack_drop_msg));
@@ -4909,7 +5084,9 @@ static int test_alloc_hooks_and_small_edge_cases(void) {
 static int test_config_init_request_timeout_default_is_50s(void) {
     ve_tls_config cfg;
     ve_tls_config_init(&cfg);
-    return (cfg.request_timeout_ms == 50000 && cfg.connect_timeout_ms == 10000) ? 0 : -1;
+    return (cfg.request_timeout_ms == 50000 &&
+            cfg.connect_timeout_ms == 10000 &&
+            cfg.breaker_ingress_policy == VE_TLS_BREAKER_INGRESS_ALLOW) ? 0 : -1;
 }
 
 static int test_producer_derived_defaults_follow_memory_budget(void) {
@@ -7890,6 +8067,11 @@ int main(void) {
     RUN(108, test_worker_send_queue_block_timeout_path());
     RUN(130, test_send_queue_bytes_count_against_max_buffer_budget());
     RUN(131, test_ingress_budget_blocks_before_send_budget_is_exhausted());
+    RUN(139, test_raw_add_log_budget_full_drops_before_copy_alloc());
+    RUN(140, test_kv_add_log_budget_full_drops_before_builder_grow());
+    RUN(141, test_breaker_ingress_fail_fast_rejects_before_queue());
+    RUN(142, test_breaker_ingress_drop_with_callback_reports_drop_without_queue());
+    RUN(143, test_scratch_budget_is_counted_against_max_buffer_bytes());
     RUN(120, test_worker_pack_stage_unsupported_compress_drops_before_enqueue());
     RUN(8, test_manager_callback_no_raw_buffer_on_compress_error());
     RUN(9, test_time_parts_roundtrip_in_raw_buffer());

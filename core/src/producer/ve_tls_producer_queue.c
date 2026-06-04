@@ -76,6 +76,27 @@ int ve_tls_queue_push_owned(ve_tls_producer * producer, unsigned char * data, si
     return 0;
 }
 
+int ve_tls_queue_push_reserved_owned(ve_tls_producer * producer, unsigned char * data, size_t size, int64_t id, int64_t time_ms, uint32_t time_ns, int32_t has_time_ns, char * hash_key) {
+    if (!producer || !data || size == 0) {
+        return -1;
+    }
+    if (ve_tls_queue_ensure(producer) != 0) {
+        return -1;
+    }
+    ve_tls_log_item item;
+    item.id = id;
+    item.time_ms = time_ms;
+    item.time_ns = time_ns;
+    item.has_time_ns = has_time_ns;
+    item.hash_key = hash_key;
+    item.data = data;
+    item.size = size;
+    producer->queue[producer->queue_tail] = item;
+    producer->queue_tail = (producer->queue_tail + 1) % producer->queue_cap;
+    producer->queue_count++;
+    return 0;
+}
+
 int ve_tls_queue_push(ve_tls_producer * producer, const unsigned char * data, size_t size, int64_t id, int64_t time_ms, uint32_t time_ns, int32_t has_time_ns, const char * hash_key) {
     unsigned char * copy = (unsigned char *)ve_tls_malloc(size);
     if (!copy) {

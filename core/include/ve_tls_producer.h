@@ -32,6 +32,12 @@ typedef enum {
     VE_TLS_BUFFER_FULL_BLOCK = 1
 } ve_tls_buffer_full_policy;
 
+typedef enum {
+    VE_TLS_BREAKER_INGRESS_ALLOW = 0,
+    VE_TLS_BREAKER_INGRESS_FAIL_FAST = 1,
+    VE_TLS_BREAKER_INGRESS_DROP_WITH_CALLBACK = 2
+} ve_tls_breaker_ingress_policy;
+
 typedef struct {
     const char * key;
     const char * value;
@@ -81,6 +87,7 @@ typedef struct {
     int32_t breaker_fail_threshold;
     int32_t breaker_open_ms;
     int32_t breaker_half_open_max_inflight;
+    ve_tls_breaker_ingress_policy breaker_ingress_policy;
     int32_t max_buffer_bytes;
     ve_tls_buffer_full_policy buffer_full_policy;
     int32_t buffer_full_block_timeout_ms;

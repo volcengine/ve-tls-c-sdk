@@ -24,7 +24,7 @@ SDK 提供两类观测入口：累计快照和事件回调。
 
 ## 建议维度
 
-- drop reason：buffer full、send queue full、alloc failed、closed、invalid input。
+- drop reason：buffer full、send queue full、alloc failed、closed、circuit open、invalid input。
 - HTTP code：2xx、4xx、429、5xx。
 - retryable：true / false。
 - hashKey：只建议采样或记录 top-N，避免高基数拖垮上层指标系统。
