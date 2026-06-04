@@ -93,6 +93,7 @@ void ve_tls_producer_config_init(ve_tls_config * config) {
     config->breaker_fail_threshold = 0;
     config->breaker_open_ms = 30000;
     config->breaker_half_open_max_inflight = 1;
+    config->breaker_ingress_policy = VE_TLS_BREAKER_INGRESS_ALLOW;
     config->max_buffer_bytes = VE_TLS_DEFAULT_MAX_BUFFER_BYTES;
     config->buffer_full_policy = VE_TLS_BUFFER_FULL_DROP;
     config->buffer_full_block_timeout_ms = 0;

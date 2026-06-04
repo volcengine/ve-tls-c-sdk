@@ -2,6 +2,8 @@
 
 `ve-tls-c-sdk` 是 Volcengine TLS Producer 的纯 C11 日志发送 SDK，面向 Linux 服务器、嵌入式 Linux、macOS 和 Windows C core 场景。SDK 提供异步写入、批量聚合、压缩、重试、背压控制和运行期观测能力，用于将业务日志稳定发送到 TLS。
 
+`live` 分支的目标很简单：核心 Producer 能力跟 `main` 保持一致，同时补齐桌面和通用 C core 的编译覆盖。Android 和 iOS 不在这个分支处理，移动端桥接 SDK 由 persistent/mobile 方向维护。需要极低 binary 和内存占用的场景应看 `bricks` 分支；`live` 不做极致裁剪。
+
 ## 核心能力与最佳实践
 
 - 异步 Producer：业务线程调用写入接口后进入内存队列，后台线程负责聚合、压缩、签名、发送和重试。建议按进程或业务日志流复用长生命周期 producer，不要按单条日志或单个请求频繁创建销毁。
@@ -9,7 +11,7 @@
 - 压缩发送：支持 `lz4`、`zlib` 和不压缩。默认优先使用 `lz4`，适合日志文本这类高重复内容；只有在 CPU 极紧张且日志本身不可压缩时，才建议压测比较 `none`。
 - HashKey 有序：同一 hashKey 内保持发送顺序，不同 hashKey 可并行聚合和发送。需要分区内有序时使用稳定 hashKey；不需要顺序时可不传 hashKey，让 SDK 追求整体吞吐。
 - 背压控制：写入队列支持 `DROP` / `BLOCK`，发送队列支持 `DROP` / `BLOCK` / `DROP_SAMPLED`。实时观测类日志通常选择丢弃优先，关键业务日志应选择阻塞并设置有限超时，避免无限阻塞业务线程。
-- 有界资源：`max_buffer_bytes` 统一约束写入队列、发送队列预留、inflight 批次和构建缓冲。嵌入式或小规格容器应先定内存预算，再让 SDK 派生包大小、线程数和队列容量。
+- 有界资源：`max_buffer_bytes` 统一约束写入队列、发送队列预留、inflight 批次、TLS batching 和压缩 scratch。嵌入式或小规格容器应先定内存预算，再让 SDK 派生包大小、线程数和队列容量。
 - 重试治理：内置指数退避、可重试错误识别、全局/按 key 限流与熔断。建议把 `requests_failed_total`、`retries_total`、回调里的 HTTP code 和 request_id 接入业务监控。
 - 动态配置：支持运行期更新 endpoint、region、topic 以及静态 AK/SK/token。使用临时凭证时优先接入 `credentials_provider`，避免在业务日志中打印 AK/SK/token。
 - 可观测性：支持结构化发送回调、累计 metrics、metrics sink、buffered bytes 查询和 `*_with_id` 写入接口。建议在发送回调中记录 result、request_id、error_code、HTTP code 和 log_id 范围，便于定位批次级问题。
@@ -45,7 +47,7 @@ ctest --test-dir build --output-on-failure
 | `VE_TLS_BUILD_TOOLS` | `ON` | 构建 demo 和 benchmark 工具 |
 | `VE_TLS_ENABLE_ASAN` / `VE_TLS_ENABLE_UBSAN` | `OFF` | Sanitizer |
 
-平台支持矩阵和 Windows 构建说明见 [docs/platform-support.md](docs/platform-support.md)。
+平台支持矩阵和 Windows 构建说明见 [docs/platform-support.md](docs/platform-support.md)。Windows curl 构建可使用 MSYS2 curl 或 vcpkg `curl:x64-windows`，MSVC/clang-cl 需要保留对应 runtime DLL 目录在 `PATH` 中。
 
 ## 快速开始
 
@@ -100,6 +102,7 @@ int main(void) {
 | `send_queue_size` | manager 到 sender 的队列容量 | 默认按内存预算派生 |
 | `buffer_full_policy` | 写入队列满策略 | `DROP` / `BLOCK` |
 | `send_queue_full_policy` | send_queue 满策略 | `DROP` / `BLOCK` / `DROP_SAMPLED` |
+| `breaker_ingress_policy` | 全局 breaker open 时写入侧策略 | `ALLOW` / `FAIL_FAST` / `DROP_WITH_CALLBACK` |
 | `connect_timeout_ms` | 连接超时 | 默认 `10000` |
 | `request_timeout_ms` | 单请求超时 | 默认 `50000` |
 | `tls_verify_peer` / `tls_verify_host` | TLS 校验 | 默认开启 |
@@ -202,6 +205,12 @@ TLS_BENCH_MODE=curl TLS_MAX_BUFFER_BYTES=268435456 TLS_CLOSE_TIMEOUT_MS=300000 .
 
 如果业务要求进程崩溃后继续发送未完成日志，应在业务侧使用外部持久化或重放机制。
 
+## 安全与披露
+
+不要把 AK/SK/security_token 写进源码、README 命令行、benchmark 输出或业务日志。真实发送测试请使用进程环境变量或本地 env 文件，并确认文件没有提交到仓库。
+
+SDK 使用侧的安全建议见 [docs/security.md](docs/security.md)。如果你发现漏洞或疑似安全问题，请按 [SECURITY.md](SECURITY.md) 里的流程联系安全团队，不要创建公开 GitHub Issue。
+
 ## 文档
 
 - [配置字段](docs/config-fields.md)
@@ -211,3 +220,4 @@ TLS_BENCH_MODE=curl TLS_MAX_BUFFER_BYTES=268435456 TLS_CLOSE_TIMEOUT_MS=300000 .
 - [错误模型](docs/error-model.md)
 - [指标与观测](docs/metrics.md)
 - [安全建议](docs/security.md)
+- [安全披露](SECURITY.md)

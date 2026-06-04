@@ -9,6 +9,12 @@ endif()
 if(NOT DEFINED test_exe)
   message(FATAL_ERROR "test_exe is required")
 endif()
+if(NOT DEFINED ctest_tool)
+  find_program(ctest_tool NAMES ctest)
+endif()
+if(NOT ctest_tool)
+  message(FATAL_ERROR "ctest not found")
+endif()
 
 set(profraw_glob "${bin_dir}/coverage-*.profraw")
 file(GLOB existing_profraw "${profraw_glob}")
@@ -17,7 +23,7 @@ foreach(f IN LISTS existing_profraw)
 endforeach()
 
 execute_process(
-  COMMAND ${CMAKE_COMMAND} -E env LLVM_PROFILE_FILE=${bin_dir}/coverage-%p.profraw ctest -V
+  COMMAND ${CMAKE_COMMAND} -E env LLVM_PROFILE_FILE=${bin_dir}/coverage-%p.profraw ${ctest_tool} -V
   WORKING_DIRECTORY ${bin_dir}
   RESULT_VARIABLE ctest_rc
 )
@@ -25,8 +31,18 @@ if(NOT ctest_rc EQUAL 0)
   message(FATAL_ERROR "ctest failed: ${ctest_rc}")
 endif()
 
-execute_process(COMMAND xcrun -f llvm-profdata OUTPUT_VARIABLE profdata_tool OUTPUT_STRIP_TRAILING_WHITESPACE)
-execute_process(COMMAND xcrun -f llvm-cov OUTPUT_VARIABLE cov_tool OUTPUT_STRIP_TRAILING_WHITESPACE)
+find_program(profdata_tool NAMES llvm-profdata)
+find_program(cov_tool NAMES llvm-cov)
+if((NOT profdata_tool OR NOT cov_tool) AND APPLE)
+  execute_process(COMMAND xcrun -f llvm-profdata OUTPUT_VARIABLE profdata_tool OUTPUT_STRIP_TRAILING_WHITESPACE)
+  execute_process(COMMAND xcrun -f llvm-cov OUTPUT_VARIABLE cov_tool OUTPUT_STRIP_TRAILING_WHITESPACE)
+endif()
+if(NOT profdata_tool)
+  message(FATAL_ERROR "llvm-profdata not found")
+endif()
+if(NOT cov_tool)
+  message(FATAL_ERROR "llvm-cov not found")
+endif()
 
 file(GLOB profraws "${profraw_glob}")
 list(LENGTH profraws profraw_count)

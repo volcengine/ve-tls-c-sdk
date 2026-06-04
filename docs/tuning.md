@@ -1,13 +1,13 @@
 # 调优指南
 
-本文面向 `main` 的 Linux 通用 Producer：内存队列、异步发送、无本地落盘恢复。
+本文面向 `live` 分支的 C Producer：内存队列、异步发送、无本地落盘恢复。Linux、macOS 和 Windows 使用同一套资源预算和队列语义；平台差异主要在网络 adapter、线程实现和进程资源统计。
 
 ## 关键参数
 
 ### 内存预算
 
 - `max_buffer_bytes` 是 producer 总体缓存预算，不只是写入队列上限。
-- 预算覆盖写入队列、send_queue 预留、inflight 批次以及构建阶段缓冲。
+- 预算覆盖写入队列、send_queue 预留、inflight 批次、TLS batching 以及压缩 scratch。
 - 包大小过大时会挤压队列与 inflight 空间；`log_bytes_per_package` 不能超过 `max_buffer_bytes / 2`。
 
 ### 聚合
@@ -23,6 +23,8 @@
 - `send_queue_full_policy=DROP`：manager 无法入 send_queue 时丢批。
 - `send_queue_full_policy=BLOCK`：manager 等待 send_queue 空位，适合“不丢优先”的低并发场景。
 - `send_queue_full_policy=DROP_SAMPLED`：按采样比例丢弃，用于写入高峰下折中。
+- `breaker_ingress_policy=ALLOW`：全局 breaker open 时仍允许写入排队，保持默认兼容行为。
+- `breaker_ingress_policy=FAIL_FAST` / `DROP_WITH_CALLBACK`：全局 breaker open 时在写入侧直接失败或带回调丢弃，适合低资源和故障风暴场景。
 
 ## 默认派生档位
 
@@ -45,7 +47,7 @@
 - `send_queue_size=16`
 - `buffer_full_policy=DROP` 或 `BLOCK` 加有限超时
 
-### 通用 Linux 服务
+### 通用服务
 
 - `max_buffer_bytes=64MB`
 - 使用派生默认值：`2MB` 包、`2` 个发送/打包线程、`send_queue_size=40`
@@ -101,6 +103,8 @@ TLS_BENCH_MODE=curl TLS_MAX_BUFFER_BYTES=268435456 TLS_CLOSE_TIMEOUT_MS=300000 .
 | `tls5120` | `50000 logs/s` | `256MB` | `500000` | `0` | `616` | `0` | `0` | `2.65us/log` | `109.90ms` | `247.26MB` | `0.88` | `5.52%` | `345.91MB` |
 
 测试环境为 Linux x86_64 / Debian 5.15 / 16 vCPU Intel Xeon Platinum 8260 / libcurl 7.88.1 / Release / 真实 TLS endpoint，配置为 `send_thread_count=10`、`pack_thread_count=10`、`send_queue_size=10000`、`flush_interval_ms=1000`、`compress_type=lz4`。`CPU cores` 表示进程消耗的平均核心数，`CPU total` 表示占整机 16 vCPU 的比例。实际业务日志应按自己的字段和压缩率复测。
+
+Windows 和 macOS 的真实发送验证记录在 [platform-support.md](platform-support.md)。同一参数在不同平台上的 RSS 口径不完全一致：POSIX 使用 `getrusage`，Windows 使用 `GetProcessMemoryInfo`。
 
 ### 本地开销 benchmark
 

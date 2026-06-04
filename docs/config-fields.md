@@ -1,6 +1,6 @@
 # 配置字段清单
 
-本文档面向 Linux 通用 Producer，列出公开建议使用的配置字段。
+本文档面向 `live` 分支的 C Producer，覆盖 Linux、macOS 和 Windows C core 场景。字段本身不绑定平台；HTTP 发送能力由构建时选择的 adapter 决定。
 
 ## 目标与鉴权
 
@@ -62,6 +62,7 @@
 - `breaker_fail_threshold`
 - `breaker_open_ms`
 - `breaker_half_open_max_inflight`
+- `breaker_ingress_policy`
 - `key_queue_max_active`
 - `key_queue_bucket_count`
 - `key_queue_idle_ttl_ms`

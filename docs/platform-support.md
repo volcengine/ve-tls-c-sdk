@@ -1,6 +1,8 @@
 # Platform Support
 
-`live` keeps the producer feature set aligned with `main` and focuses on desktop/general C core build coverage. Android and iOS are intentionally out of this branch: mobile bridge SDK work belongs to the persistent/mobile SDK track.
+`live` is the desktop and general C core branch. It keeps Producer behavior close to `main` and adds build coverage for macOS and Windows toolchains. Android and iOS stay out of this branch; the persistent/mobile SDK track owns bridge work.
+
+The build directory names below are the names used during validation. They are examples, not required paths.
 
 ## Support Matrix
 

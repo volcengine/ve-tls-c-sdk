@@ -161,7 +161,7 @@ if(VE_TLS_ENABLE_COVERAGE AND (CMAKE_C_COMPILER_ID MATCHES "Clang"))
     endforeach()
     if(TARGET ve_tls_test_basic)
         add_custom_target(ve_tls_coverage
-            COMMAND ${CMAKE_COMMAND} -Dbin_dir=${CMAKE_BINARY_DIR} -Dtest_exe=$<TARGET_FILE:ve_tls_test_basic> -P ${CMAKE_SOURCE_DIR}/cmake/coverage.cmake
+            COMMAND ${CMAKE_COMMAND} -Dbin_dir=${CMAKE_BINARY_DIR} -Dtest_exe=$<TARGET_FILE:ve_tls_test_basic> -Dctest_tool=${CMAKE_CTEST_COMMAND} -P ${CMAKE_SOURCE_DIR}/cmake/coverage.cmake
             WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
         )
     endif()
