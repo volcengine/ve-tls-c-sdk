@@ -108,6 +108,7 @@ Full Producer 字段：
 - `breaker_fail_threshold`
 - `breaker_open_ms`
 - `breaker_half_open_max_inflight`
+- `breaker_ingress_policy`
 - `key_queue_max_active`
 - `key_queue_bucket_count`
 - `key_queue_idle_ttl_ms`
@@ -115,6 +116,14 @@ Full Producer 字段：
 - `key_rate_limit_bps`
 - `key_breaker_fail_threshold`
 - `key_breaker_open_ms`
+
+`breaker_ingress_policy` 只影响全局 breaker open 后的写入入口：
+
+| 值 | 写入侧行为 |
+| --- | --- |
+| `VE_TLS_BREAKER_INGRESS_ALLOW` | 继续接收入队，保持历史默认行为 |
+| `VE_TLS_BREAKER_INGRESS_FAIL_FAST` | 不入队，写入接口返回 `VE_TLS_DROP_ERROR` |
+| `VE_TLS_BREAKER_INGRESS_DROP_WITH_CALLBACK` | 不入队，写入接口返回 `VE_TLS_DROP_ERROR`，并触发 `send_done_v2` 丢弃回调 |
 
 Bricks 不实现限流或熔断。真实接入中应在调用方 transport 层按 endpoint、topic、hash key 或业务队列维度实现。
 

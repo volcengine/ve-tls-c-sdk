@@ -164,7 +164,7 @@ build-bricks-real/ve_tls_bricks_demo_real --count 1 --timeout-ms 15000
 | `lz4`, single request | `1/1`, `http=200` | `158.703 ms` | `77` | `0` |
 | `lz4`, sequential 300 requests | `300/300` | `10793.774 ms`, avg `35.973 ms`, min `7.289 ms`, max `244.350 ms` | `23592` | `0` |
 
-这说明 Bricks 生成的 protobuf body、TLS V4 signature、signed headers 和 curl sample transport 能被服务端接受。
+结果表明，Bricks 生成的 protobuf body、TLS V4 signature、signed headers 和 curl sample transport 能被服务端接受。
 
 边界：
 

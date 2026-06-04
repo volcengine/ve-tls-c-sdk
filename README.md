@@ -2,9 +2,11 @@
 
 `bricks` 分支包含两个 profile：完整异步 Producer 和 Bricks tiny request packer。Bricks 接收已经编码好的 LogGroupList protobuf body，打包成可发送的 `POST /PutLogs?TopicId=...` 请求，包含 URL、请求头、TLS V4 签名和请求 body。HTTP 发送、重试、队列、背压、指标和凭证刷新由调用方负责。
 
-## 核心能力与最佳实践
+## 两个 profile
 
 - Full Producer：保留 `ve_tls_core` 的异步写入、聚合、压缩、HTTP 发送、重试、背压、metrics、callback 和受控退出能力。需要 SDK 接管完整发送链路时使用它。
+- Full Producer 内存预算：`max_buffer_bytes` 覆盖写入队列、send queue 预留、inflight 批次、TLS batching 和压缩 scratch。
+- Full Producer 熔断入口：`breaker_ingress_policy` 控制全局 breaker open 时写入侧行为，可选择继续入队、快速失败或丢弃并触发回调。
 - Tiny core：`ve_tls_bricks_core` 只链接 `alloc/hash/sign/proto/compress/bricks` 这几类源文件，不链接 producer、pthread、curl、retry、metrics、persistence 或 env runtime。
 - Pack-only：公开入口是 `ve_tls_bricks_pack_request()`，输出 `method`、`url`、换行分隔的 headers、body 指针和元数据。SDK 不发网络请求。
 - TLS V4 签名内置：SDK 生成 `X-Date`、`X-Content-Sha256`、`Authorization`，并支持可选 `X-Security-Token`。
@@ -12,7 +14,7 @@
 - body 零拷贝：`compress_type=none` 且 `body_no_copy=1` 时，返回 request 的 body 指向调用方传入 buffer，`ve_tls_bricks_request_free()` 不释放该 body。
 - 可选压缩：Bricks 默认关闭 LZ4/ZLIB，最小二进制建议保持 `none`；需要压缩时显式打开 `VE_TLS_BRICKS_ENABLE_LZ4` 或 `VE_TLS_BRICKS_ENABLE_ZLIB`。
 - 真实发送 demo 独立：`ve_tls_bricks_demo_real` 只作为 libcurl 样例存在，curl 不进入 `ve_tls_bricks_core`。
-- 明确边界：Bricks profile 不提供异步队列、后台线程、批量调度、重试、限流、熔断、metrics、send callback、动态凭证 provider、本地落盘恢复或全局 env。
+- Bricks 边界：Bricks profile 不提供异步队列、后台线程、批量调度、重试、限流、熔断、metrics、send callback、动态凭证 provider、本地落盘恢复或全局 env。
 
 | Profile | 适用场景 | SDK 负责 | 调用方负责 |
 | --- | --- | --- | --- |
@@ -166,6 +168,8 @@ int main(void) {
 
 Full Producer 使用 `ve_tls_config`，字段覆盖目标、鉴权、聚合、队列、重试、网络、metrics 和 callback。Bricks 使用 `ve_tls_bricks_config`，所有字段由调用方直接赋值。
 
+下面只列 Bricks 的常用字段。Full Producer 的完整字段见 [docs/config-fields.md](docs/config-fields.md)。
+
 | 字段 | 必填 | 说明 |
 | --- | --- | --- |
 | `endpoint` | 是 | TLS endpoint，例如 `https://tls-cn-beijing.volces.com` |
@@ -290,3 +294,9 @@ Bricks 不提供进程崩溃后的本地恢复，也不保证请求重试成功�
 - [错误模型](docs/error-model.md)
 - [指标与观测](docs/metrics.md)
 - [安全建议](docs/security.md)
+- [安全漏洞报告](SECURITY.md)
+
+## Security and privacy
+
+This project takes security seriously.
+For vulnerability reporting and supported versions, see [SECURITY.md](SECURITY.md)

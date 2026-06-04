@@ -1,4 +1,4 @@
-# 错误模型规范
+# 错误模型
 
 ## 错误结构
 
@@ -11,6 +11,8 @@ Full Producer 的发送错误对象应包含：
 - retryable
 - result
 - log_id 范围
+
+写入接口也会直接返回错误。队列预算不足、全局 breaker 入口快速失败、或 `DROP_WITH_CALLBACK` 入口丢弃时，返回值是 `VE_TLS_DROP_ERROR`。`DROP_WITH_CALLBACK` 不是成功入队，不能返回 `VE_TLS_OK`。
 
 Bricks tiny core 没有发送错误对象，也没有 callback。公开错误面是 `ve_tls_bricks_pack_request()` 的 `int` 返回值，以及调用方 transport 自己产生的 HTTP/网络错误。
 
