@@ -1,28 +1,28 @@
-# 调优指南
+# 调优与性能测试
 
-本文面向 `main` 的 Linux 通用 Producer：内存队列、异步发送、无本地落盘恢复。
+本文面向 Linux Producer：进程内队列、异步发送、无本地落盘恢复。
 
 ## 关键参数
 
 ### 内存预算
 
-- `max_buffer_bytes` 是 producer 总体缓存预算，不只是写入队列上限。
-- 预算覆盖写入队列、send_queue 预留、inflight 批次以及构建阶段缓冲。
-- 包大小过大时会挤压队列与 inflight 空间；`log_bytes_per_package` 不能超过 `max_buffer_bytes / 2`。
+- `max_buffer_bytes` 是 producer 总缓存预算，不只是写入队列上限。
+- 预算覆盖写入队列、send queue 预留、inflight 批次和构建阶段缓冲。
+- `log_bytes_per_package` 不能超过 `max_buffer_bytes / 2`。包太大会挤压队列和 inflight 空间。
 
 ### 聚合
 
-- `flush_interval_ms` 越小延迟越低，请求数越多。
-- `log_count_per_package` 越大吞吐越好，但单批延迟和内存占用上升。
-- `log_bytes_per_package` 越大越能合并 IO，但在小内存场景会放大瞬时占用。
+- `flush_interval_ms` 越小，延迟越低，请求数越多。
+- `log_count_per_package` 越大，吞吐通常越好，但单批延迟和内存占用也会上升。
+- `log_bytes_per_package` 越大，越能合并 IO；小内存场景要控制瞬时占用。
 
 ### 队列与背压
 
 - `buffer_full_policy=DROP`：写入侧不阻塞，满时丢弃并计入 dropped。
-- `buffer_full_policy=BLOCK`：写入侧等待预算释放，必须设置正数 `buffer_full_block_timeout_ms`。
-- `send_queue_full_policy=DROP`：manager 无法入 send_queue 时丢批。
-- `send_queue_full_policy=BLOCK`：manager 等待 send_queue 空位，适合“不丢优先”的低并发场景。
-- `send_queue_full_policy=DROP_SAMPLED`：按采样比例丢弃，用于写入高峰下折中。
+- `buffer_full_policy=BLOCK`：写入侧等待预算释放，应设置正数 `buffer_full_block_timeout_ms`。
+- `send_queue_full_policy=DROP`：manager 无法入 send queue 时丢批。
+- `send_queue_full_policy=BLOCK`：manager 等待 send queue 空位，适合低并发、不丢优先的场景。
+- `send_queue_full_policy=DROP_SAMPLED`：按采样间隔丢弃，用于写入高峰下的折中策略。
 
 ## 默认派生档位
 
@@ -32,7 +32,7 @@
 | 通用服务器 | `64MB..256MB` | `2MB..4MB` | `2..4` | `8 + max_buffer/package` |
 | 高吞吐服务器 | `>256MB` | `4MB` | `8` | 上限 `128` |
 
-显式配置优先于派生值；如果你已经指定 `send_thread_count`、`pack_thread_count`、`log_bytes_per_package` 或 `send_queue_size`，producer 不会覆盖。
+显式配置优先于派生值。已经设置 `send_thread_count`、`pack_thread_count`、`log_bytes_per_package` 或 `send_queue_size` 时，producer 不会覆盖。
 
 ## 推荐配置
 
@@ -43,7 +43,7 @@
 - `send_thread_count=1`
 - `pack_thread_count=1`
 - `send_queue_size=16`
-- `buffer_full_policy=DROP` 或 `BLOCK` 加有限超时
+- `buffer_full_policy=DROP`，或 `BLOCK` 加有限超时
 
 ### 通用 Linux 服务
 
@@ -59,11 +59,9 @@
 - `send_thread_count=4..8`
 - `pack_thread_count=4..8`
 - `send_queue_full_policy=DROP_SAMPLED`
-- 必须通过真实环境压测确认 HTTP 限流、网络带宽和 request latency。
+- 用真实环境压测确认 HTTP 限流、网络带宽和 request latency。
 
-## 性能测试
-
-### 真实网络 benchmark
+## 真实网络 benchmark
 
 `ve_tls_benchmark_tls` 使用内置日志模板向真实 endpoint 发送数据，适合评估接入环境下的发送吞吐、请求数、失败率和资源占用。
 
@@ -86,7 +84,7 @@ TLS_BENCH_MODE=curl TLS_MAX_BUFFER_BYTES=268435456 TLS_CLOSE_TIMEOUT_MS=300000 .
 TLS_BENCH_MODE=curl TLS_MAX_BUFFER_BYTES=268435456 TLS_CLOSE_TIMEOUT_MS=300000 ./build/ve_tls_benchmark_tls 50000 10 tls5120
 ```
 
-真实发送参考数据：
+参考数据来自一次真实发送测试。环境：Linux x86_64 / Debian 5.15 / 16 vCPU Intel Xeon Platinum 8260 / libcurl 7.88.1 / Release / 真实 TLS endpoint。主要配置：`send_thread_count=10`、`pack_thread_count=10`、`send_queue_size=10000`、`flush_interval_ms=1000`、`compress_type=lz4`。
 
 | Profile | 目标写入速率 | 内存预算 | 日志数 | 入队丢弃 | 请求数 | 请求失败 | 重试 | 平均入队耗时 | close 耗时 | 峰值 buffer | CPU cores | CPU total | RSS |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -100,11 +98,11 @@ TLS_BENCH_MODE=curl TLS_MAX_BUFFER_BYTES=268435456 TLS_CLOSE_TIMEOUT_MS=300000 .
 | `tls5120` | `30000 logs/s` | `256MB` | `300000` | `0` | `370` | `0` | `0` | `2.37us/log` | `10.90ms` | `172.03MB` | `0.72` | `4.49%` | `268.09MB` |
 | `tls5120` | `50000 logs/s` | `256MB` | `500000` | `0` | `616` | `0` | `0` | `2.65us/log` | `109.90ms` | `247.26MB` | `0.88` | `5.52%` | `345.91MB` |
 
-测试环境为 Linux x86_64 / Debian 5.15 / 16 vCPU Intel Xeon Platinum 8260 / libcurl 7.88.1 / Release / 真实 TLS endpoint，配置为 `send_thread_count=10`、`pack_thread_count=10`、`send_queue_size=10000`、`flush_interval_ms=1000`、`compress_type=lz4`。`CPU cores` 表示进程消耗的平均核心数，`CPU total` 表示占整机 16 vCPU 的比例。实际业务日志应按自己的字段和压缩率复测。
+`CPU cores` 表示进程消耗的平均核心数，`CPU total` 表示占整机 16 vCPU 的比例。实际业务日志应按自己的字段、压缩率和限流策略复测。
 
-### 本地开销 benchmark
+## 本地开销 benchmark
 
-`ve_tls_bench` 使用进程内 mock HTTP 200 响应，只用于衡量 Producer 本地写入、聚合、压缩和发送调度开销。
+`ve_tls_bench` 使用进程内 mock HTTP 200 响应，只用于衡量本地写入、聚合、压缩和发送调度开销。
 
 ```sh
 cmake --build build -j --target ve_tls_bench
@@ -124,9 +122,9 @@ cmake --build build -j --target ve_tls_bench
 | `--compress-type` | `none` / `lz4` / `zlib` |
 | `--queue-full-policy` | `block` / `drop` / `drop_sampled` |
 | `--max-buffer-bytes` | Producer 缓存预算 |
-| `--send-queue-size` | send_queue 容量 |
+| `--send-queue-size` | send queue 容量 |
 
-本地 benchmark 输出关注：
+本地 benchmark 输出重点看：
 
 - `throughput logs_per_s`：写入吞吐。
 - `logs_dropped_total`：背压丢弃数量。
@@ -148,4 +146,4 @@ cmake --build build -j --target ve_tls_bench
 tools/performance_run.sh DURATION_S=10 RATE_LPS=0 MESSAGE_BYTES=256
 ```
 
-脚本会覆盖 raw/kv/template、不同 writer/sender 数、压缩类型和队列策略，并输出 Markdown 表格，便于保存到性能报告中。
+脚本会覆盖 raw/kv/template、不同 writer/sender 数、压缩类型和队列策略，并输出 Markdown 表格。

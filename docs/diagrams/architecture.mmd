@@ -1,0 +1,66 @@
+---
+title: ve-tls-c-sdk Architecture Overview
+---
+%%{init: {"theme":"base","flowchart":{"nodeSpacing":32,"rankSpacing":16},"themeCSS":"foreignObject { overflow: visible !important; }","themeVariables":{"background":"#f7f9fc","fontFamily":"Noto Sans CJK SC, Source Han Sans SC, Microsoft YaHei, Arial, sans-serif","primaryTextColor":"#263238","lineColor":"#455a64","clusterBkg":"#ffffff","clusterBorder":"#c8d3dc"}}}%%
+flowchart LR
+    subgraph clients["客户端 / 上游"]
+        CREDS["<b>凭证 Provider</b><br/>提供临时 AK/SK/token。"]:::client
+        APP["<b>业务应用 / 设备</b><br/>产生日志并提供业务配置。"]:::client
+        TOOLS["<b>Demo / Bench 工具</b><br/>演示发送、压测和 raw log。"]:::client
+    end
+
+    subgraph api["api_surface"]
+        OBS["<b>观测回调 API</b><br/>读取 metrics 并接收 send_done_v2。"]:::api
+        CFG["<b>配置生命周期 API</b><br/>初始化、创建、更新目标和关闭。"]:::api
+        WRITE["<b>日志写入 API</b><br/>接收 KV、Raw、模板和 hashKey。"]:::api
+    end
+
+    subgraph jobs["background_jobs"]
+        CORE["<b>Producer Core</b><br/>管理配置、内存预算和线程。"]:::job
+        BUILD["<b>Ingress Worker</b><br/>聚合 hashKey 并触发封包。"]:::job
+        PACK["<b>Proto / Compress</b><br/>编码 LogGroupList 并压缩。"]:::job
+        SEND["<b>Sender Worker</b><br/>签名、重试、限流并 PutLogs。"]:::job
+    end
+
+    subgraph data["数据库 / 中间件"]
+        SNAP["<b>Runtime Snapshot</b><br/>隔离运行期配置和共享环境。"]:::data
+        INQ["<b>Ingress Queue</b><br/>接收写入任务并承载入口背压。"]:::data
+        OUTQ["<b>Send Queue</b><br/>承接压缩批次并交给 sender。"]:::data
+        POOL["<b>Object Pool</b><br/>复用任务、header 和压缩缓冲。"]:::data
+    end
+
+    subgraph external["外部依赖"]
+        CODEC["<b>Codec Libs</b><br/>提供 lz4、zlib 或 none 压缩。"]:::external
+        NET["<b>HTTP / TLS PutLogs</b><br/>通过 client 发送 protobuf 批次。"]:::external
+    end
+
+    subgraph ops["运维基础设施"]
+        OPS["<b>Build / QA</b><br/>管理构建选项、测试和文档检查。"]:::ops
+    end
+
+    APP --> CFG
+    APP --> WRITE
+    TOOLS --> WRITE
+    CFG --> CORE
+    WRITE --> CORE
+    CORE --> INQ
+    INQ --> BUILD
+    BUILD --> PACK
+    PACK --> OUTQ
+    OUTQ --> SEND
+    SEND --> NET
+    CREDS -.-> CFG
+    OBS -.-> CORE
+    SNAP -.-> CORE
+    POOL -.-> PACK
+    PACK -.-> CODEC
+    OPS -.-> CFG
+
+    classDef client fill:#eef5ff,stroke:#6b93c8,stroke-width:2px,color:#16324f,font-size:18px,font-weight:600;
+    classDef api fill:#ffffff,stroke:#4f7cac,stroke-width:2px,color:#1f3b57,font-size:18px,font-weight:600;
+    classDef job fill:#fff8eb,stroke:#d08b2f,stroke-width:2px,color:#5c3b00,font-size:18px,font-weight:600;
+    classDef data fill:#f1f8f2,stroke:#6aa96f,stroke-width:2px,color:#214d25,font-size:18px,font-weight:600;
+    classDef external fill:#f6f0ff,stroke:#8a6bb8,stroke-width:2px,color:#37215d,font-size:18px,font-weight:600;
+    classDef ops fill:#f2f4f7,stroke:#7a8794,stroke-width:2px,color:#263238,font-size:18px,font-weight:600;
+    linkStyle 0,1,2,3,4,5,6,7,8,9,10 stroke:#344955,stroke-width:2.5px;
+    linkStyle 11,12,13,14,15,16 stroke:#7f5aa2,stroke-width:2.1px,stroke-dasharray:6 4;
