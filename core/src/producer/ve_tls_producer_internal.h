@@ -59,6 +59,11 @@ typedef struct {
     size_t precompressed_size;
     ve_tls_obj_pool * body_pool;
     ve_tls_obj_pool * precompressed_pool;
+    /* scratch 预算的"中转持有"：从 prepare 阶段的 scratch_bytes 占位，
+     * 直到 push 阶段把它原子迁移到 send_queue_bytes 为止。任何分支
+     * 在 task 销毁前未完成迁移时，必须由 send_task_free 兜底归还。 */
+    size_t scratch_held;
+    ve_tls_producer * scratch_owner;
 } ve_tls_send_task;
 
 typedef struct {
@@ -242,6 +247,7 @@ void ve_tls_producer_move_send_task_to_inflight(ve_tls_producer * producer, cons
 void ve_tls_producer_release_inflight_task_bytes(ve_tls_producer * producer, const ve_tls_send_task * task);
 int ve_tls_producer_reserve_scratch_bytes(ve_tls_producer * producer, size_t bytes);
 void ve_tls_producer_release_scratch_bytes(ve_tls_producer * producer, size_t bytes);
+int ve_tls_producer_swap_scratch_to_send_task_bytes(ve_tls_producer * producer, ve_tls_send_task * task);
 int ve_tls_latency_bucket_index(int64_t ms);
 void ve_tls_rate_limit_wait(ve_tls_producer * producer, size_t bytes);
 void ve_tls_breaker_wait_open(ve_tls_producer * producer);

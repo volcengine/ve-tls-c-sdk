@@ -150,8 +150,8 @@ static int ve_tls_manager_prepare_send_task(ve_tls_producer * producer, ve_tls_s
                 return -1;
             }
             int c_rc = ve_tls_compress_apply(compress_type, t->body, t->body_size, &c);
-            ve_tls_producer_release_scratch_bytes(producer, scratch);
             if (c_rc != 0 || !c.data || c.size == 0) {
+                ve_tls_producer_release_scratch_bytes(producer, scratch);
                 if (err_msg) *err_msg = (c_rc == -1) ? "compress failed" : "unsupported compress_type";
                 ve_tls_bytes_free(&c);
                 return -1;
@@ -160,6 +160,12 @@ static int ve_tls_manager_prepare_send_task(ve_tls_producer * producer, ve_tls_s
             t->precompressed_size = c.size;
             t->precompressed_pool = NULL;
             send_size = c.size;
+            /* 不立即释放 scratch：把这笔 scratch 预算"中转"挂到 task 上，
+             * 直到 push 阶段把它原子迁移到 send_queue_bytes 为止。这样可以
+             * 避免在 release_scratch 与 reserve_send_task_bytes 之间出现
+             * buffered_bytes 少计的窗口期，从而严格保护 max_buffer_bytes。 */
+            t->scratch_held = scratch;
+            t->scratch_owner = producer;
         }
     }
 
@@ -211,7 +217,7 @@ static int ve_tls_manager_push_send_task(ve_tls_producer * producer, ve_tls_send
             wait_ms = 0;
         }
     }
-    int reserve_rc = ve_tls_producer_reserve_send_task_bytes(producer, t);
+    int reserve_rc = ve_tls_producer_swap_scratch_to_send_task_bytes(producer, t);
     if (reserve_rc != 0) {
         if (reserve_rc == -3) {
             ve_tls_metrics_emit(producer, "send_budget_timeout_drop", 1, 0);

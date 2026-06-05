@@ -2119,6 +2119,49 @@ void ve_tls_producer_release_scratch_bytes(ve_tls_producer * producer, size_t by
     producer->config.platform.mutex_unlock(producer->mutex);
 }
 
+/* 把 task->scratch_held 中已计入 scratch_bytes 的预算原子迁移到 send_queue_bytes。
+ * - 若 send 比 held 更大，需要为差额申请额外预算（可能 wait/超时/拒绝）。
+ * - 若 send 比 held 更小或相等，差额回退到 scratch（实际只是从一个池转到另一个池，
+ *   总占用不增加），始终不会让 buffered_bytes 在窗口期内出现"少计"。
+ * - 成功后清零 task->scratch_held / scratch_owner，由 send_task_free 兜底逻辑跳过。 */
+int ve_tls_producer_swap_scratch_to_send_task_bytes(ve_tls_producer * producer, ve_tls_send_task * task) {
+    if (!producer || !producer->mutex || !task) {
+        return -1;
+    }
+    size_t send_bytes = ve_tls_send_task_memory_bytes(task);
+    size_t held = task->scratch_held;
+    if (send_bytes == 0 && held == 0) {
+        task->scratch_held = 0;
+        task->scratch_owner = NULL;
+        return 0;
+    }
+    producer->config.platform.mutex_lock(producer->mutex);
+    int rc = 0;
+    if (send_bytes > held) {
+        size_t need = send_bytes - held;
+        rc = ve_tls_wait_buffer_space_locked(producer, need, 1);
+        if (rc != 0) {
+            producer->config.platform.mutex_unlock(producer->mutex);
+            return rc;
+        }
+    }
+    /* 释放 held 的 scratch 占用 */
+    if (held > 0) {
+        if (producer->scratch_bytes >= held) {
+            producer->scratch_bytes -= held;
+        } else {
+            producer->scratch_bytes = 0;
+        }
+    }
+    /* 累加到 send_queue_bytes */
+    producer->send_queue_bytes += send_bytes;
+    producer->config.platform.cond_broadcast(producer->cond);
+    producer->config.platform.mutex_unlock(producer->mutex);
+    task->scratch_held = 0;
+    task->scratch_owner = NULL;
+    return 0;
+}
+
 ve_tls_result ve_tls_producer_add_log_raw(ve_tls_producer * producer, const char * log_buf, size_t log_size, int flush) {
     return ve_tls_producer_add_log_raw_time_parts(producer, 0, 0, 0, log_buf, log_size, flush);
 }

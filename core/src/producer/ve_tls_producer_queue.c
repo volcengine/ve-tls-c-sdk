@@ -143,6 +143,13 @@ void ve_tls_send_task_free(ve_tls_send_task * t) {
     if (!t) {
         return;
     }
+    /* 若 task 在 push 之前/失败时被销毁，必须把 prepare 阶段挂在这里的
+     * scratch 预算原子归还到 producer，否则 scratch_bytes 会永久泄漏。 */
+    if (t->scratch_held > 0 && t->scratch_owner) {
+        ve_tls_producer_release_scratch_bytes(t->scratch_owner, t->scratch_held);
+        t->scratch_held = 0;
+        t->scratch_owner = NULL;
+    }
     ve_tls_free(t->hash_key);
     if (t->precompressed) {
         if (t->precompressed_pool) {

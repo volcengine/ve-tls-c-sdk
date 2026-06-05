@@ -3459,6 +3459,76 @@ static int test_kv_add_log_budget_full_drops_before_builder_grow(void) {
     return ok ? 0 : -1;
 }
 
+static int test_scratch_swap_to_send_task_no_buffered_underreport(void) {
+    /* 回归：scratch 与 send_queue 之间必须原子转换，
+     * 任何中间观测点 buffered_bytes 都必须 >= 真实占用，绝不能"少计"。 */
+    ve_tls_config cfg;
+    ve_tls_config_init(&cfg);
+    cfg.endpoint = "https://example.com";
+    cfg.region = "cn-beijing";
+    cfg.topic_id = "t";
+    cfg.access_key_id = "ak";
+    cfg.access_key_secret = "sk";
+    cfg.max_buffer_bytes = 1024;
+    cfg.buffer_full_policy = VE_TLS_BUFFER_FULL_DROP;
+
+    ve_tls_producer p;
+    if (init_fake_sender_producer(&p, &cfg) != 0) return -1;
+
+    /* 模拟 prepare 阶段：占用 scratch 预算 256 字节 */
+    if (ve_tls_producer_reserve_scratch_bytes(&p, 256) != 0) {
+        destroy_fake_sender_producer(&p);
+        return -1;
+    }
+    size_t before = ve_tls_producer_get_buffered_bytes(&p);
+    if (before != 256 || p.scratch_bytes != 256 || p.send_queue_bytes != 0) {
+        ve_tls_producer_release_scratch_bytes(&p, 256);
+        destroy_fake_sender_producer(&p);
+        return -1;
+    }
+
+    /* 构造一个真实占用 200 字节 (precompressed) 的 task，挂上 scratch_held=256 */
+    ve_tls_send_task t;
+    memset(&t, 0, sizeof(t));
+    t.precompressed = (unsigned char *)malloc(200);
+    if (!t.precompressed) {
+        ve_tls_producer_release_scratch_bytes(&p, 256);
+        destroy_fake_sender_producer(&p);
+        return -1;
+    }
+    t.precompressed_size = 200;
+    t.scratch_held = 256;
+    t.scratch_owner = &p;
+
+    /* swap：send(200) <= held(256)，差额回退到 scratch_bytes 不变化 */
+    int rc = ve_tls_producer_swap_scratch_to_send_task_bytes(&p, &t);
+    size_t after = ve_tls_producer_get_buffered_bytes(&p);
+    int ok = (rc == 0
+              && t.scratch_held == 0 && t.scratch_owner == NULL
+              && p.scratch_bytes == 0
+              && p.send_queue_bytes == 200
+              && after == 200
+              && after >= 200);  /* 不"少计"实际占用 */
+
+    /* 用 send_task_free 清理：scratch_held 已为 0，应跳过 */
+    ve_tls_send_task_free(&t);
+    if (p.scratch_bytes != 0) ok = 0;
+    /* 模拟 push 完成：从 send_queue 释放 */
+    p.send_queue_bytes = 0;
+
+    /* 第二轮：模拟 push 失败前销毁 task，验证 send_task_free 兜底归还 scratch */
+    if (ve_tls_producer_reserve_scratch_bytes(&p, 128) != 0) ok = 0;
+    ve_tls_send_task t2;
+    memset(&t2, 0, sizeof(t2));
+    t2.scratch_held = 128;
+    t2.scratch_owner = &p;
+    ve_tls_send_task_free(&t2);
+    if (p.scratch_bytes != 0) ok = 0;
+
+    destroy_fake_sender_producer(&p);
+    return ok ? 0 : -1;
+}
+
 static int test_scratch_budget_is_counted_against_max_buffer_bytes(void) {
     ve_tls_config cfg;
     ve_tls_config_init(&cfg);
@@ -12632,6 +12702,7 @@ int main(void) {
     RUN(161, test_raw_add_log_budget_full_drops_before_copy_alloc());
     RUN(162, test_kv_add_log_budget_full_drops_before_builder_grow());
     RUN(163, test_scratch_budget_is_counted_against_max_buffer_bytes());
+    RUN(164, test_scratch_swap_to_send_task_no_buffered_underreport());
     RUN(120, test_worker_pack_stage_unsupported_compress_drops_before_enqueue());
     RUN(8, test_manager_callback_no_raw_buffer_on_compress_error());
     RUN(9, test_time_parts_roundtrip_in_raw_buffer());
