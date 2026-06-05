@@ -26,6 +26,6 @@ codecov:
 TLS 评审搭子:
   target_branch_white_list:
     - "main"
-    - "persisent"
+    - "persistent"
     - "live"
-    - "breaker"
+    - "bricks"

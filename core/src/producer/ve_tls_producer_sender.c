@@ -928,6 +928,7 @@ static int ve_tls_send_put_logs(ve_tls_producer * producer, const char * access_
         ve_tls_error_set_client(out_error, "invalid request");
         return -1;
     }
+    VE_TLS_ALLOC_SITE("sender_send_putlogs");
     int64_t cfg_version = __atomic_load_n(&producer->send_cfg_version, __ATOMIC_ACQUIRE);
     if (g_send_cfg_cache.producer != producer || g_send_cfg_cache.version != cfg_version) {
         int cfg_rc = ve_tls_send_cfg_cache_refresh(producer, &g_send_cfg_cache);

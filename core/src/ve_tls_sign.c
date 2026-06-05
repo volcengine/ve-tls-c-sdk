@@ -768,6 +768,7 @@ int ve_tls_sign_v4_append_at(
     if (!access_key_id || !access_key_secret || !region || !service || !method || !host || !path || !headers_out) {
         return -1;
     }
+    VE_TLS_ALLOC_SITE("sign_v4_emit");
     *headers_out = NULL;
     char xdate[17];
     if (xdate_override && strlen(xdate_override) == 16) {

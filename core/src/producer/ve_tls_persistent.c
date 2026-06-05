@@ -562,6 +562,7 @@ int ve_tls_persistent_open(ve_tls_persistent * persistent, const ve_tls_persiste
     if (!persistent || !options || !options->platform || !options->dir_path || options->dir_path[0] == 0) {
         return -1;
     }
+    VE_TLS_ALLOC_SITE("persistent_open");
     memset(persistent, 0, sizeof(*persistent));
     if (strlen(options->dir_path) >= sizeof(persistent->dir_path)) {
         return -1;

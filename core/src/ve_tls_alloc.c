@@ -5,6 +5,41 @@
 
 static ve_tls_alloc_hooks g_hooks;
 
+/* Per-thread fault injection state. */
+static __thread const char * g_site = NULL;
+static __thread const char * g_fault_tag = NULL;
+static __thread int g_fault_after = 0;
+static __thread int g_fault_count = 0;
+static __thread int g_fault_seen = 0;
+
+static int ve_tls_alloc_fault_should_fail(void) {
+    if (g_fault_tag == NULL) {
+        return 0;
+    }
+    if (g_site == NULL || strcmp(g_site, g_fault_tag) != 0) {
+        return 0;
+    }
+    g_fault_seen++;
+    if (g_fault_seen > g_fault_after && g_fault_count > 0) {
+        g_fault_count--;
+        return 1;
+    }
+    return 0;
+}
+
+void ve_tls_alloc_fault_inject(const char * tag, int fail_after, int fail_count) {
+    g_fault_tag = tag;
+    g_fault_after = fail_after < 0 ? 0 : fail_after;
+    g_fault_count = fail_count <= 0 ? 1 : fail_count;
+    g_fault_seen = 0;
+}
+
+const char * ve_tls_alloc_set_site(const char * site) {
+    const char * prev = g_site;
+    g_site = site;
+    return prev;
+}
+
 static void * ve_tls_default_malloc(size_t n, void * user_data) {
     (void)user_data;
     return malloc(n);
@@ -68,16 +103,25 @@ void ve_tls_alloc_get_hooks(ve_tls_alloc_hooks * out_hooks) {
 
 void * ve_tls_malloc(size_t n) {
     ve_tls_alloc_init_defaults_if_needed();
+    if (ve_tls_alloc_fault_should_fail()) {
+        return NULL;
+    }
     return g_hooks.malloc_fn(n, g_hooks.user_data);
 }
 
 void * ve_tls_calloc(size_t n, size_t size) {
     ve_tls_alloc_init_defaults_if_needed();
+    if (ve_tls_alloc_fault_should_fail()) {
+        return NULL;
+    }
     return g_hooks.calloc_fn(n, size, g_hooks.user_data);
 }
 
 void * ve_tls_realloc(void * p, size_t n) {
     ve_tls_alloc_init_defaults_if_needed();
+    if (ve_tls_alloc_fault_should_fail()) {
+        return NULL;
+    }
     return g_hooks.realloc_fn(p, n, g_hooks.user_data);
 }
 
@@ -88,5 +132,8 @@ void ve_tls_free(void * p) {
 
 char * ve_tls_strdup(const char * s) {
     ve_tls_alloc_init_defaults_if_needed();
+    if (ve_tls_alloc_fault_should_fail()) {
+        return NULL;
+    }
     return g_hooks.strdup_fn(s, g_hooks.user_data);
 }

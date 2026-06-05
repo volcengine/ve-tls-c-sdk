@@ -63,6 +63,7 @@ static void ve_tls_secure_free_str(char ** ps) {
 static int ve_tls_wait_buffer_space_locked(ve_tls_producer * producer, size_t need_bytes, int reserve_for_send);
 
 static int ve_tls_copy_log_tags(const ve_tls_kv * tags, size_t count, ve_tls_kv ** out_tags, size_t * out_count) {
+    VE_TLS_ALLOC_SITE("copy_log_tags");
     *out_tags = NULL;
     *out_count = 0;
     if (!tags || count == 0) {
@@ -308,6 +309,7 @@ static ve_tls_result ve_tls_enqueue_raw_owned_locked(
     int64_t * out_log_id,
     int reserved_bytes
 ) {
+    VE_TLS_ALLOC_SITE("hk_owned");
     char * hk_owned = NULL;
     int64_t id;
     if (!producer || !data || size == 0) {
@@ -413,6 +415,7 @@ static ve_tls_result ve_tls_enqueue_ingress_raw_owned_locked(
         ve_tls_free(data);
         return VE_TLS_INVALID;
     }
+    VE_TLS_ALLOC_SITE("ingress_owned");
     if (producer->stop || !producer->accepting) {
         ve_tls_free(data);
         return VE_TLS_CLOSED;
@@ -888,6 +891,7 @@ static void ve_tls_release_tls_bytes(ve_tls_producer * producer, size_t bytes) {
 }
 
 static int ve_tls_tls_batch_flush_locked(ve_tls_producer * producer, const char * norm_key, ve_tls_log_group_builder * tb, int force_flush) {
+    VE_TLS_ALLOC_SITE("tls_batch_flush");
     if (!producer || !tb || tb->log_count == 0 || tb->logs_len == 0) {
         return 0;
     }
@@ -1265,6 +1269,7 @@ ve_tls_producer * ve_tls_producer_create(const ve_tls_config * config) {
     if (!config) {
         return NULL;
     }
+    VE_TLS_ALLOC_SITE("producer_create");
     ve_tls_config effective = *config;
     ve_tls_producer_config_apply_runtime_defaults(&effective);
     if (!ve_tls_config_is_valid_for_create(&effective)) {
@@ -1483,6 +1488,7 @@ ve_tls_result ve_tls_producer_update_endpoint(ve_tls_producer * producer, const 
     if (!producer) {
         return VE_TLS_INVALID;
     }
+    VE_TLS_ALLOC_SITE("update_creds");
     if ((endpoint && !ve_tls_is_http_url(endpoint)) || (region && ve_tls_str_empty(region)) || (topic_id && ve_tls_str_empty(topic_id))) {
         return VE_TLS_INVALID;
     }
@@ -1539,6 +1545,7 @@ ve_tls_result ve_tls_producer_update_static_credentials(ve_tls_producer * produc
     if (!producer) {
         return VE_TLS_INVALID;
     }
+    VE_TLS_ALLOC_SITE("update_creds");
     if ((access_key_id && ve_tls_str_empty(access_key_id)) || (access_key_secret && ve_tls_str_empty(access_key_secret))) {
         return VE_TLS_INVALID;
     }
@@ -2477,6 +2484,7 @@ ve_tls_log_template * ve_tls_template_create(ve_tls_producer * producer, const c
     if (!producer || !keys || !key_lens || key_count == 0) {
         return NULL;
     }
+    VE_TLS_ALLOC_SITE("template_create");
     ve_tls_log_template * tpl = (ve_tls_log_template *)ve_tls_calloc(1, sizeof(*tpl));
     if (!tpl) {
         return NULL;
@@ -2769,6 +2777,7 @@ static int ve_tls_read_u8(const unsigned char * p, size_t size, size_t * off, un
 }
 
 ve_tls_result ve_tls_producer_export_raw_buffer(ve_tls_producer * producer, unsigned char ** out_buf, size_t * out_size) {
+    VE_TLS_ALLOC_SITE("export_raw_buffer");
     if (!producer || !out_buf || !out_size) {
         return VE_TLS_INVALID;
     }
@@ -3029,6 +3038,7 @@ ve_tls_result ve_tls_producer_export_raw_buffer(ve_tls_producer * producer, unsi
 }
 
 ve_tls_result ve_tls_producer_import_raw_buffer(ve_tls_producer * producer, const unsigned char * buf, size_t size) {
+    VE_TLS_ALLOC_SITE("import_raw_buffer");
     if (!producer || !buf || size < 4 + 4 + 4 + 8) {
         return VE_TLS_INVALID;
     }
