@@ -290,6 +290,7 @@ void ve_tls_key_map_free_all(ve_tls_producer * producer);
 ve_tls_key_queue * ve_tls_key_queue_get_or_create(ve_tls_producer * producer, const char * norm_key);
 int ve_tls_key_queue_push_task(ve_tls_producer * producer, const char * norm_key, const ve_tls_send_task * t);
 int ve_tls_key_queue_reserve(ve_tls_producer * producer, const char * norm_key);
+void ve_tls_key_queue_unreserve(ve_tls_producer * producer, const char * norm_key);
 int ve_tls_key_queue_pop_task(ve_tls_key_queue * q, ve_tls_send_task * out);
 int ve_tls_key_queue_push_front_task(ve_tls_key_queue * q, const ve_tls_send_task * t);
 void ve_tls_key_queue_finish(ve_tls_producer * producer, ve_tls_key_queue * q);

@@ -254,7 +254,9 @@ int ve_tls_send_queue_push(ve_tls_send_queue * q, const ve_tls_send_task * t, in
             q->platform->mutex_unlock(q->mutex);
             return -2;
         }
-        (void)q->platform->cond_timedwait_ms(q->not_full, q->mutex, remain);
+        (void)(q->platform->cond_timedwait_ms
+                   ? q->platform->cond_timedwait_ms(q->not_full, q->mutex, remain)
+                   : (q->platform->cond_wait(q->not_full, q->mutex), 0));
     }
     if (q->stop) {
         q->platform->mutex_unlock(q->mutex);
@@ -296,7 +298,9 @@ int ve_tls_send_queue_pop(ve_tls_send_queue * q, ve_tls_send_task * out, int wai
             q->platform->mutex_unlock(q->mutex);
             return -2;
         }
-        (void)q->platform->cond_timedwait_ms(q->not_empty, q->mutex, remain);
+        (void)(q->platform->cond_timedwait_ms
+                   ? q->platform->cond_timedwait_ms(q->not_empty, q->mutex, remain)
+                   : (q->platform->cond_wait(q->not_empty, q->mutex), 0));
     }
     if (q->count == 0) {
         q->platform->mutex_unlock(q->mutex);
@@ -745,10 +749,11 @@ static void ve_tls_key_queue_remove_and_free(ve_tls_producer * producer, ve_tls_
         prev = p;
     }
     if (q->q) {
-        for (size_t i = 0; i < q->cap; i++) {
-            ve_tls_free(q->q[i].hash_key);
-            ve_tls_free(q->q[i].precompressed);
-            ve_tls_free(q->q[i].body);
+        /* 统一走 ve_tls_send_task_free 以归还 scratch 预算与 obj_pool；裸 free 字段会泄漏配额。
+         * 仅遍历有效区间 [head, head+count)，环形缓冲外的槽已被 pop 时 memset 清零。 */
+        for (size_t i = 0; i < q->count; i++) {
+            size_t slot = (q->head + i) % q->cap;
+            ve_tls_send_task_free(&q->q[slot]);
         }
         ve_tls_free(q->q);
     }
@@ -782,6 +787,26 @@ int ve_tls_key_queue_push_task(ve_tls_producer * producer, const char * norm_key
 int ve_tls_key_queue_reserve(ve_tls_producer * producer, const char * norm_key) {
     ve_tls_key_queue * q = ve_tls_key_queue_get_or_create(producer, norm_key);
     return q ? 0 : -1;
+}
+
+void ve_tls_key_queue_unreserve(ve_tls_producer * producer, const char * norm_key) {
+    /* reserve 后续 push 失败的回滚路径：仅当目标 key_queue 真处于空闲、可释放状态时才移除。
+     * 兼容并发：其他线程可能已经向同名 key_queue 推入任务，此时不能误删。
+     * idle_ttl > 0 的部署最终会被 idle_cleanup 接管，但 ttl <= 0 会永久占用 max_active。 */
+    if (!producer || !producer->key_buckets || producer->key_bucket_count == 0 || !norm_key) {
+        return;
+    }
+    uint32_t h = ve_tls_hash32_fnv1a(norm_key);
+    size_t idx = (size_t)(h % (uint32_t)producer->key_bucket_count);
+    for (ve_tls_key_queue * p = producer->key_buckets[idx]; p; p = p->hnext) {
+        if (p->hash == h && strcmp(p->key, norm_key) == 0) {
+            if (p->count == 0 && !p->inflight && !p->ready && !p->delayed && !p->builder) {
+                ve_tls_idle_remove(producer, p);
+                ve_tls_key_queue_remove_and_free(producer, p);
+            }
+            return;
+        }
+    }
 }
 
 int ve_tls_key_queue_push_front_task(ve_tls_key_queue * q, const ve_tls_send_task * t) {
@@ -841,10 +866,10 @@ void ve_tls_key_map_free_all(ve_tls_producer * producer) {
         while (p) {
             ve_tls_key_queue * n = p->hnext;
             if (p->q) {
-                for (size_t j = 0; j < p->cap; j++) {
-                    ve_tls_free(p->q[j].hash_key);
-                    ve_tls_free(p->q[j].precompressed);
-                    ve_tls_free(p->q[j].body);
+                /* 同样统一走 send_task_free 归还 scratch/pool 配额。 */
+                for (size_t j = 0; j < p->count; j++) {
+                    size_t slot = (p->head + j) % p->cap;
+                    ve_tls_send_task_free(&p->q[slot]);
                 }
                 ve_tls_free(p->q);
             }

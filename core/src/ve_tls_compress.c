@@ -74,7 +74,7 @@ int ve_tls_compress_apply(const char * compress_type, const unsigned char * in, 
         strm.opaque = NULL;
         int rc = deflateInit(&strm, Z_DEFAULT_COMPRESSION);
         if (rc != Z_OK) {
-            deflateEnd(&strm);
+            /* zlib 契约：deflateInit 失败时 stream 未初始化，调用 deflateEnd 属于 UB。 */
             return -1;
         }
         uLong bound = deflateBound(&strm, (uLong)in_size);
@@ -161,7 +161,7 @@ int ve_tls_compress_apply_to_buffer(const char * compress_type, const unsigned c
         strm.opaque = NULL;
         int rc = deflateInit(&strm, Z_DEFAULT_COMPRESSION);
         if (rc != Z_OK) {
-            deflateEnd(&strm);
+            /* zlib 契约：deflateInit 失败时 stream 未初始化，调用 deflateEnd 属于 UB。 */
             return -1;
         }
         strm.next_in = (Bytef *)in;

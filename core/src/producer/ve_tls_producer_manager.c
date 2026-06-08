@@ -229,6 +229,13 @@ static int ve_tls_manager_push_send_task(ve_tls_producer * producer, ve_tls_send
             ve_tls_metrics_emit(producer, "send_budget_drop", 1, 0);
             ve_tls_manager_drop_range(producer, t->batch_bytes, t->start_id, t->end_id, "BufferFull", "buffer budget exceeded");
         }
+        if (!producer->fast_send) {
+            /* reserve 已增加 key_queue_count，需要在 push 失败路径回滚，避免 ttl<=0 时永久占用 max_active 名额。 */
+            const char * nk_rb = ve_tls_normalize_hash_key(producer, t->hash_key);
+            producer->config.platform.mutex_lock(producer->mutex);
+            ve_tls_key_queue_unreserve(producer, nk_rb);
+            producer->config.platform.mutex_unlock(producer->mutex);
+        }
         ve_tls_send_task_free(t);
         return -1;
     }
@@ -252,6 +259,12 @@ static int ve_tls_manager_push_send_task(ve_tls_producer * producer, ve_tls_send
                 ve_tls_metrics_emit(producer, "send_queue_drop", 1, 0);
                 ve_tls_manager_drop_range(producer, t->batch_bytes, t->start_id, t->end_id, "SendQueueFull", "send queue full");
             }
+        }
+        if (!producer->fast_send) {
+            const char * nk_rb = ve_tls_normalize_hash_key(producer, t->hash_key);
+            producer->config.platform.mutex_lock(producer->mutex);
+            ve_tls_key_queue_unreserve(producer, nk_rb);
+            producer->config.platform.mutex_unlock(producer->mutex);
         }
         ve_tls_send_task_free(t);
         return -1;

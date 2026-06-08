@@ -258,8 +258,13 @@ int main(int argc, char ** argv) {
         resp.request_id ? resp.request_id : "",
         body.size,
         VE_TLS_C_SDK_API_VERSION);
-    cfg.http_client.free_response(&cfg.http_client, &resp);
-    rc = resp.status_code == 200 ? 0 : 1;
+    {
+        /* free_response 会把 status_code 清 0；必须先快照 rc 再 free，
+         * 否则任何 200 OK 在这里都会被错判为失败。 */
+        int status = (int)resp.status_code;
+        cfg.http_client.free_response(&cfg.http_client, &resp);
+        rc = status == 200 ? 0 : 1;
+    }
 
 cleanup:
     free(query);

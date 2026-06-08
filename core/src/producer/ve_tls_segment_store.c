@@ -401,6 +401,7 @@ int ve_tls_segment_store_append(ve_tls_segment_store * store, const unsigned cha
 int ve_tls_segment_store_read(ve_tls_segment_store * store, uint32_t segment_id, uint64_t offset, unsigned char ** out_record, size_t * out_size, uint64_t * next_offset) {
     char path[640];
     ve_tls_file * file;
+    ve_tls_path_info info;
     if (!store || !store->platform || !out_record || !out_size) {
         return -1;
     }
@@ -409,12 +410,16 @@ int ve_tls_segment_store_read(ve_tls_segment_store * store, uint32_t segment_id,
     if (ve_tls_segment_store_get_segment_path(store, segment_id, path, sizeof(path)) != 0) {
         return -1;
     }
+    /* 先 stat 文件大小作为 limit，防止读取损坏 header 时按伪造的 total_len 大额分配。 */
+    if (store->platform->path_stat(path, &info) != 0 || !info.exists) {
+        return -1;
+    }
     file = store->platform->file_open(path, VE_TLS_FILE_OPEN_RDONLY, 0);
     if (!file) {
         return -1;
     }
     if (store->platform->file_seek(file, (int64_t)offset, VE_TLS_FILE_SEEK_SET) < 0 ||
-        read_record_from_current_position(store->platform, file, offset, UINT64_MAX, out_record, out_size, next_offset) != 0) {
+        read_record_from_current_position(store->platform, file, offset, info.size, out_record, out_size, next_offset) != 0) {
         store->platform->file_close(file);
         return -1;
     }

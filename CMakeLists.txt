@@ -119,16 +119,18 @@ endif()
 
 if(VE_TLS_BUILD_TESTS)
     enable_testing()
-    # 测试构建启用 alloc fault injection 自动恢复宏（依赖 GNU/Clang cleanup attr）；
-    # 公共头默认 no-op，避免下游编译器无法支持 cleanup 时被强制依赖编译器扩展。
-    target_compile_definitions(ve_tls_core PUBLIC VE_TLS_ENABLE_ALLOC_FAULT_INJECT=1)
+    # 测试构建启用 alloc fault injection；用 PRIVATE 限制只在 ve_tls_core
+    # 自身编译时打开，避免对下游消费者的二进制 ABI 形成隐式契约。
+    target_compile_definitions(ve_tls_core PRIVATE VE_TLS_ENABLE_ALLOC_FAULT_INJECT=1)
     add_executable(ve_tls_test_basic tests/test_basic.c)
     target_link_libraries(ve_tls_test_basic PRIVATE ve_tls_core)
     target_include_directories(ve_tls_test_basic PRIVATE core/src)
+    target_compile_definitions(ve_tls_test_basic PRIVATE VE_TLS_ENABLE_ALLOC_FAULT_INJECT=1)
     add_test(NAME ve_tls_test_basic COMMAND ve_tls_test_basic)
 
     add_executable(ve_tls_test_android_binding tests/test_android_binding.c)
     target_link_libraries(ve_tls_test_android_binding PRIVATE ve_tls_core)
+    target_compile_definitions(ve_tls_test_android_binding PRIVATE VE_TLS_ENABLE_ALLOC_FAULT_INJECT=1)
     add_test(NAME ve_tls_test_android_binding COMMAND ve_tls_test_android_binding)
     if(TARGET ve_tls_bench)
         add_test(NAME ve_tls_bench_help COMMAND ve_tls_bench --help)

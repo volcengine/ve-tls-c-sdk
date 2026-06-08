@@ -5,6 +5,14 @@
 #include <stdint.h>
 #include <string.h>
 
+#if defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 201112L)
+#define VE_TLS_RETRY_TLS _Thread_local
+#elif defined(__GNUC__) || defined(__clang__)
+#define VE_TLS_RETRY_TLS __thread
+#else
+#define VE_TLS_RETRY_TLS
+#endif
+
 void ve_tls_retry_policy_init(ve_tls_retry_policy * policy) {
     if (!policy) {
         return;
@@ -29,7 +37,8 @@ static uint64_t ve_tls_mix64(uint64_t x) {
 }
 
 static double ve_tls_rand01_fallback(void) {
-    static uint64_t s = 0;
+    /* 退避抖动随机源：thread-local 状态，避免多线程对静态 s 的非原子写造成偏差与 TSan 告警。 */
+    static VE_TLS_RETRY_TLS uint64_t s = 0;
     if (s == 0) {
         uintptr_t a = (uintptr_t)&s;
         uintptr_t b = (uintptr_t)&ve_tls_rand01_fallback;

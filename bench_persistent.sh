@@ -52,9 +52,9 @@ for profile in $PROFILES; do
       --persistent-dir "$DIR" \
       2>&1) || true
 
-    produce_lps=$(echo "$output" | grep -oP 'produce_lps=\K[0-9.]+' | head -1)
-    total_lps=$(echo "$output" | grep -oP 'total_lps=\K[0-9.]+' | head -1)
-    dropped=$(echo "$output" | grep -oP 'logs_dropped_total=\K[0-9]+' | head -1)
+    produce_lps=$(echo "$output" | awk 'match($0, /produce_lps=[0-9.]+/) { print substr($0, RSTART+13, RLENGTH-13); exit }')
+    total_lps=$(echo "$output" | awk 'match($0, /total_lps=[0-9.]+/) { print substr($0, RSTART+10, RLENGTH-10); exit }')
+    dropped=$(echo "$output" | awk 'match($0, /logs_dropped_total=[0-9]+/) { print substr($0, RSTART+19, RLENGTH-19); exit }')
 
     produce_arr+=("${produce_lps:-0}")
     total_arr+=("${total_lps:-0}")
@@ -86,8 +86,8 @@ for i in $(seq 1 $RUNS); do
     --duration-s 3 \
     2>&1) || true
 
-  produce_lps=$(echo "$output" | grep -oP 'produce_lps=\K[0-9.]+' | head -1)
-  total_lps=$(echo "$output" | grep -oP 'total_lps=\K[0-9.]+' | head -1)
+  produce_lps=$(echo "$output" | awk 'match($0, /produce_lps=[0-9.]+/) { print substr($0, RSTART+13, RLENGTH-13); exit }')
+  total_lps=$(echo "$output" | awk 'match($0, /total_lps=[0-9.]+/) { print substr($0, RSTART+10, RLENGTH-10); exit }')
 
   produce_arr+=("${produce_lps:-0}")
   total_arr+=("${total_lps:-0}")

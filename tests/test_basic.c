@@ -3462,14 +3462,15 @@ static int test_kv_add_log_budget_full_drops_before_builder_grow(void) {
 static int test_estimate_kv_lens_size_overflow_returns_sentinel(void) {
     /* 回归：当 kv 长度极端大导致 size_t 累加溢出时，
      * estimate_kv_lens_size 必须返回 (size_t)-1 哨兵，
-     * 防止上层基于回绕值做预算/编码。 */
+     * 防止上层基于回绕值做预算/编码。
+     * 用 SIZE_MAX/2 量级的 key/value 长度，两个 entry 累加即必然溢出，
+     * 不依赖中间编码字节的取值，断言更确定。 */
     size_t key_lens[2];
     size_t val_lens[2];
-    /* 两个 SIZE_MAX/2 量级的 length 累加必然回绕 */
-    key_lens[0] = (size_t)-1 / 4;
-    val_lens[0] = (size_t)-1 / 4;
-    key_lens[1] = (size_t)-1 / 4;
-    val_lens[1] = (size_t)-1 / 4;
+    key_lens[0] = (size_t)-1 / 2;
+    val_lens[0] = (size_t)-1 / 2;
+    key_lens[1] = (size_t)-1 / 2;
+    val_lens[1] = (size_t)-1 / 2;
     size_t r = ve_tls_log_builder_estimate_kv_lens_size(1700000000000LL, 0, 0, key_lens, val_lens, 2);
     return (r == (size_t)-1) ? 0 : -1;
 }
@@ -10676,9 +10677,11 @@ static int t_p0_producer_close_split_timeout(void) {
     /* sender_timeout_ms = 1 forces sender stage timeout */
     ve_tls_result rc = ve_tls_producer_close_split(p, 2000, 1);
     ve_tls_producer_destroy(p);
-    /* Either OK (drained quickly) or TIMEOUT acceptable for coverage purpose;
-       at minimum it should not crash. Prefer assert TIMEOUT under fake-slow http. */
-    (void)rc;
+    /* fake http 单次至少 sleep 200ms，sender_timeout_ms=1 必然超时；
+     * 退出码必须是 TIMEOUT（OK 也能接受用于不同时序，但禁止其它错误）。 */
+    if (rc != VE_TLS_TIMEOUT && rc != VE_TLS_OK) {
+        return -1;
+    }
     return 0;
 }
 
@@ -12735,7 +12738,7 @@ int main(void) {
     RUN(162, test_kv_add_log_budget_full_drops_before_builder_grow());
     RUN(163, test_scratch_budget_is_counted_against_max_buffer_bytes());
     RUN(164, test_scratch_swap_to_send_task_no_buffered_underreport());
-    RUN(165, test_estimate_kv_lens_size_overflow_returns_sentinel());
+    RUN(166, test_estimate_kv_lens_size_overflow_returns_sentinel());
     RUN(120, test_worker_pack_stage_unsupported_compress_drops_before_enqueue());
     RUN(8, test_manager_callback_no_raw_buffer_on_compress_error());
     RUN(9, test_time_parts_roundtrip_in_raw_buffer());

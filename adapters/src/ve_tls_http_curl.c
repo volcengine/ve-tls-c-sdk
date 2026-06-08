@@ -271,6 +271,9 @@ static int ve_tls_http_curl_do(ve_tls_http_client * client, const ve_tls_http_re
     resp->transport_code = 0;
     resp->transport_retryable = 0;
     resp->error_code = NULL;
+    /* 成功路径必须同时清空 error_message：调用方常复用 ve_tls_http_response，
+     * 残留旧错误信息会让上层误判本次成功请求"携带错误"。 */
+    resp->error_message = NULL;
     curl_slist_free_all(headers);
     return 0;
 }

@@ -142,8 +142,12 @@ static int http_ok_do(ve_tls_http_client * client, const ve_tls_http_request * r
     (void)client;
     (void)req;
     if (!resp) return -1;
+    /* 显式清零所有 free_response 会调用 free() 的指针字段，
+     * 避免栈上未初始化指针被 mock 回收时产生 UB。 */
     resp->status_code = 200;
     resp->request_id = strdup("rid-tls-mock");
+    resp->error_code = NULL;
+    resp->error_message = NULL;
     resp->body = NULL;
     resp->body_size = 0;
     return 0;

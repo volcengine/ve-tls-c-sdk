@@ -5,6 +5,19 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(VE_TLS_ENABLE_PTHREAD)
+#include <pthread.h>
+/* g_env_init_mu 仅用于串行化 ve_tls_env_init 的双检与状态切换，
+ * 关闭并发 init 时 g_env 中间态字段（mutex/cond/q/senders）半初始化窗口。
+ * 注意：destroy 路径不能持有此锁——init 失败会自调 destroy，否则自死锁。 */
+static pthread_mutex_t g_env_init_mu = PTHREAD_MUTEX_INITIALIZER;
+#define VE_TLS_ENV_INIT_LOCK()   pthread_mutex_lock(&g_env_init_mu)
+#define VE_TLS_ENV_INIT_UNLOCK() pthread_mutex_unlock(&g_env_init_mu)
+#else
+#define VE_TLS_ENV_INIT_LOCK()   ((void)0)
+#define VE_TLS_ENV_INIT_UNLOCK() ((void)0)
+#endif
+
 typedef struct {
     int inited;
     int stop;
@@ -129,7 +142,9 @@ ve_tls_result ve_tls_env_init(int32_t global_send_thread_count) {
     if (global_send_thread_count <= 0) {
         global_send_thread_count = 1;
     }
+    VE_TLS_ENV_INIT_LOCK();
     if (g_env.inited) {
+        VE_TLS_ENV_INIT_UNLOCK();
         return VE_TLS_OK;
     }
     memset(&g_env, 0, sizeof(g_env));
@@ -141,17 +156,24 @@ ve_tls_result ve_tls_env_init(int32_t global_send_thread_count) {
     g_env.sender_count = global_send_thread_count;
     g_env.senders = (ve_tls_thread **)ve_tls_calloc((size_t)g_env.sender_count, sizeof(ve_tls_thread *));
     if (!g_env.mutex || !g_env.cond || !g_env.q || !g_env.senders) {
+        /* 失败路径：destroy 不持 init 锁，先 unlock 再调 destroy 防止自死锁。
+         * inited 显式置 0 兜底，避免 destroy 内部依赖默认零值时的歧义。 */
+        g_env.inited = 0;
+        VE_TLS_ENV_INIT_UNLOCK();
         ve_tls_env_destroy(0);
         return VE_TLS_DROP_ERROR;
     }
     for (int32_t i = 0; i < g_env.sender_count; i++) {
         g_env.senders[i] = g_env.platform.thread_create(ve_tls_env_sender_main, NULL);
         if (!g_env.senders[i]) {
+            g_env.inited = 0;
+            VE_TLS_ENV_INIT_UNLOCK();
             ve_tls_env_destroy(0);
             return VE_TLS_DROP_ERROR;
         }
     }
     g_env.inited = 1;
+    VE_TLS_ENV_INIT_UNLOCK();
     return VE_TLS_OK;
 }
 

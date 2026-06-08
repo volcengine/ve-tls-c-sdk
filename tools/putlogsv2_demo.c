@@ -146,6 +146,10 @@ int main(int argc, char ** argv) {
     }
 
     now_ms = cfg.platform.time_ms ? cfg.platform.time_ms() : 0;
+    if (now_ms <= 0) {
+        fprintf(stderr, "platform.time_ms returned non-positive value (%lld); abort to avoid signing with epoch 0\n", (long long)now_ms);
+        goto cleanup;
+    }
     if (cfg.platform.time_unix_ns) {
         int64_t now_ns = cfg.platform.time_unix_ns();
         if (now_ns > 0) {

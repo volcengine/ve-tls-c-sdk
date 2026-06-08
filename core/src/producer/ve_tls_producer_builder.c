@@ -82,10 +82,18 @@ static size_t ve_tls_key_u32_size(uint32_t field_number, uint32_t wire_type) {
     return ve_tls_varint_u64_size(key);
 }
 
+/* 防溢出加法：a + b 若回绕则返回 (size_t)-1（哨兵）。
+ * 上层拿到 -1 必须直接拒绝该 log，避免基于回绕值做预算/编码。 */
+static size_t ve_tls_size_add_safe(size_t a, size_t b) {
+    if (a == (size_t)-1 || b == (size_t)-1) return (size_t)-1;
+    if (a > (size_t)-1 - b) return (size_t)-1;
+    return a + b;
+}
+
 static size_t ve_tls_bytes_field_size(uint32_t field_number, size_t n) {
     size_t k = ve_tls_key_u32_size(field_number, 2);
     size_t l = ve_tls_varint_u64_size((uint64_t)n);
-    return k + l + n;
+    return ve_tls_size_add_safe(ve_tls_size_add_safe(k, l), n);
 }
 
 static int ve_tls_wire_reserve(ve_tls_wire_buf * b, size_t n) {
@@ -166,20 +174,15 @@ static int ve_tls_wire_put_fixed32(ve_tls_wire_buf * b, uint32_t v) {
 }
 
 static size_t ve_tls_log_content_msg_size(size_t klen, size_t vlen) {
-    return ve_tls_bytes_field_size(1, klen) + ve_tls_bytes_field_size(2, vlen);
+    return ve_tls_size_add_safe(ve_tls_bytes_field_size(1, klen), ve_tls_bytes_field_size(2, vlen));
 }
 
 static size_t ve_tls_log_content_field_size(size_t klen, size_t vlen) {
     size_t msg = ve_tls_log_content_msg_size(klen, vlen);
-    return ve_tls_key_u32_size(2, 2) + ve_tls_varint_u64_size((uint64_t)msg) + msg;
-}
-
-/* 防溢出加法：a + b 若回绕则返回 (size_t)-1（哨兵）。
- * 上层拿到 -1 必须直接拒绝该 log，避免基于回绕值做预算/编码。 */
-static size_t ve_tls_size_add_safe(size_t a, size_t b) {
-    if (a == (size_t)-1 || b == (size_t)-1) return (size_t)-1;
-    if (a > (size_t)-1 - b) return (size_t)-1;
-    return a + b;
+    if (msg == (size_t)-1) return (size_t)-1;
+    return ve_tls_size_add_safe(
+        ve_tls_size_add_safe(ve_tls_key_u32_size(2, 2), ve_tls_varint_u64_size((uint64_t)msg)),
+        msg);
 }
 
 static size_t ve_tls_log_msg_size_lens(int64_t time_ms, uint32_t time_ns, int32_t has_time_ns, const size_t * key_lens, const size_t * val_lens, size_t kv_count) {
@@ -314,14 +317,25 @@ int ve_tls_log_builder_add_kv_lens(ve_tls_log_group_builder * b, int64_t id, int
     }
 
     size_t msg_size = ve_tls_log_msg_size_lens(time_ms, time_ns, has_time_ns, key_lens, val_lens, kv_count);
+    if (msg_size == (size_t)-1) {
+        /* 输入 kv 长度合计后会触发 size_t 回绕，立即拒绝；上层 enqueue 会据此返回 INVALID。 */
+        return -1;
+    }
     size_t entry_size = 1;
     if (msg_size <= UINT32_MAX) {
         entry_size += ve_tls_varint_u32_size((uint32_t)msg_size);
     } else {
         entry_size += ve_tls_varint_u64_size((uint64_t)msg_size);
     }
-    entry_size += msg_size;
-    size_t need = b->logs_len + entry_size;
+    /* entry_size += msg_size 必须经过饱和加法防止 wrap。 */
+    entry_size = ve_tls_size_add_safe(entry_size, msg_size);
+    if (entry_size == (size_t)-1) {
+        return -1;
+    }
+    size_t need = ve_tls_size_add_safe(b->logs_len, entry_size);
+    if (need == (size_t)-1) {
+        return -1;
+    }
     if (ve_tls_bytes_reserve(&b->logs, &b->logs_cap, need) != 0) {
         return -1;
     }
