@@ -2130,6 +2130,11 @@ int ve_tls_producer_swap_scratch_to_send_task_bytes(ve_tls_producer * producer, 
     }
     size_t send_bytes = ve_tls_send_task_memory_bytes(task);
     size_t held = task->scratch_held;
+    /* 硬契约：scratch 预算必须由本 producer 持有，禁止跨 producer 迁移；
+     * 任一不一致都直接拒绝，避免对错误对象扣账造成预算泄漏或错算。 */
+    if (held > 0 && task->scratch_owner != producer) {
+        return -1;
+    }
     if (send_bytes == 0 && held == 0) {
         task->scratch_held = 0;
         task->scratch_owner = NULL;

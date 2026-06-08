@@ -3487,10 +3487,12 @@ static int test_scratch_swap_to_send_task_no_buffered_underreport(void) {
         return -1;
     }
 
-    /* 构造一个真实占用 200 字节 (precompressed) 的 task，挂上 scratch_held=256 */
+    /* 构造一个真实占用 200 字节 (precompressed) 的 task，挂上 scratch_held=256。
+     * 必须用 ve_tls_malloc，与 ve_tls_send_task_free 走的 ve_tls_free 配对，
+     * 否则在启用 alloc hooks / fault inject 时会触发跨分配器释放崩溃。 */
     ve_tls_send_task t;
     memset(&t, 0, sizeof(t));
-    t.precompressed = (unsigned char *)malloc(200);
+    t.precompressed = (unsigned char *)ve_tls_malloc(200);
     if (!t.precompressed) {
         ve_tls_producer_release_scratch_bytes(&p, 256);
         destroy_fake_sender_producer(&p);
@@ -3524,6 +3526,21 @@ static int test_scratch_swap_to_send_task_no_buffered_underreport(void) {
     t2.scratch_owner = &p;
     ve_tls_send_task_free(&t2);
     if (p.scratch_bytes != 0) ok = 0;
+
+    /* 第三轮：跨 producer owner 必须被 swap 拒绝，避免对错误对象扣账。 */
+    if (ve_tls_producer_reserve_scratch_bytes(&p, 64) != 0) ok = 0;
+    ve_tls_producer other;
+    memset(&other, 0, sizeof(other));  /* 仅作为不同的 owner 指针使用 */
+    ve_tls_send_task t3;
+    memset(&t3, 0, sizeof(t3));
+    t3.scratch_held = 64;
+    t3.scratch_owner = &other;  /* 故意指向另一个 producer */
+    if (ve_tls_producer_swap_scratch_to_send_task_bytes(&p, &t3) == 0) ok = 0;
+    if (p.scratch_bytes != 64 || p.send_queue_bytes != 0) ok = 0;
+    /* 还原现场，避免影响后续 destroy */
+    t3.scratch_held = 0;
+    t3.scratch_owner = NULL;
+    ve_tls_producer_release_scratch_bytes(&p, 64);
 
     destroy_fake_sender_producer(&p);
     return ok ? 0 : -1;
@@ -11283,10 +11300,10 @@ static int t_p2_sign_v4_emit_fuzz(void) {
                                   body, sizeof(body),
                                   "Content-Type: application/x-protobuf\n",
                                   &out) != 0 || !out) {
-            free(out);
+            ve_tls_free(out);
             return -1;
         }
-        free(out);
+        ve_tls_free(out);
     }
     /* fuzz fail_after across [0, 80) (many small allocs) */
     for (int i = 0; i < 80; i++) {
@@ -11300,7 +11317,7 @@ static int t_p2_sign_v4_emit_fuzz(void) {
                                     "Content-Type: application/x-protobuf\nx-tls-apiversion: 0.3.0\n",
                                     &out);
         ve_tls_alloc_fault_inject(NULL, 0, 0);
-        free(out);
+        ve_tls_free(out);
     }
     /* Also exercise long-headers (heap canon path) */
     char big_headers[2048];
