@@ -5,6 +5,13 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(VE_TLS_ENABLE_PTHREAD)
+#include <pthread.h>
+/* g_env_init_mu 仅串行化 ve_tls_env_init/destroy 入口的 inited 检查与状态切换，
+ * 不参与运行时热路径（队列/通知由 g_env.mutex 保护）。 */
+static pthread_mutex_t g_env_init_mu = PTHREAD_MUTEX_INITIALIZER;
+#endif
+
 typedef struct {
     int inited;
     int stop;
@@ -129,7 +136,13 @@ ve_tls_result ve_tls_env_init(int32_t global_send_thread_count) {
     if (global_send_thread_count <= 0) {
         global_send_thread_count = 1;
     }
+#if defined(VE_TLS_ENABLE_PTHREAD)
+    pthread_mutex_lock(&g_env_init_mu);
+#endif
     if (g_env.inited) {
+#if defined(VE_TLS_ENABLE_PTHREAD)
+        pthread_mutex_unlock(&g_env_init_mu);
+#endif
         return VE_TLS_OK;
     }
     memset(&g_env, 0, sizeof(g_env));
@@ -141,17 +154,30 @@ ve_tls_result ve_tls_env_init(int32_t global_send_thread_count) {
     g_env.sender_count = global_send_thread_count;
     g_env.senders = (ve_tls_thread **)ve_tls_calloc((size_t)g_env.sender_count, sizeof(ve_tls_thread *));
     if (!g_env.mutex || !g_env.cond || !g_env.q || !g_env.senders) {
+        /* 失败路径：先把 inited 复位，再走 destroy 释放已分配资源；
+         * 否则下次 init 会被 inited==0 但部分字段为 NULL 的中间态欺骗。 */
+        g_env.inited = 0;
         ve_tls_env_destroy(0);
+#if defined(VE_TLS_ENABLE_PTHREAD)
+        pthread_mutex_unlock(&g_env_init_mu);
+#endif
         return VE_TLS_DROP_ERROR;
     }
     for (int32_t i = 0; i < g_env.sender_count; i++) {
         g_env.senders[i] = g_env.platform.thread_create(ve_tls_env_sender_main, NULL);
         if (!g_env.senders[i]) {
+            g_env.inited = 0;
             ve_tls_env_destroy(0);
+#if defined(VE_TLS_ENABLE_PTHREAD)
+            pthread_mutex_unlock(&g_env_init_mu);
+#endif
             return VE_TLS_DROP_ERROR;
         }
     }
     g_env.inited = 1;
+#if defined(VE_TLS_ENABLE_PTHREAD)
+    pthread_mutex_unlock(&g_env_init_mu);
+#endif
     return VE_TLS_OK;
 }
 

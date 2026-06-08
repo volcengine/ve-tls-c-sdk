@@ -301,7 +301,20 @@ int ve_tls_log_builder_add_kv_lens(ve_tls_log_group_builder * b, int64_t id, int
     }
 
     size_t msg_size = ve_tls_log_msg_size_lens(time_ms, time_ns, has_time_ns, key_lens, val_lens, kv_count);
+    if (msg_size == (size_t)-1) {
+        /* 防御性哨兵：当前 ve_tls_log_msg_size_lens 不会返回 (size_t)-1，
+         * 但若未来扩展为饱和加法，调用方提前拦截避免 entry_size += msg_size 回绕。 */
+        return -1;
+    }
     size_t entry_size = ve_tls_log_builder_estimate_kv_lens_size(time_ms, time_ns, has_time_ns, key_lens, val_lens, kv_count);
+    if (entry_size < msg_size) {
+        /* estimate 内部会做 entry_size += msg_size；若发生回绕则结果一定小于 msg_size。
+         * 这里抓住 wrap 后兜底 reserve 不会按伪小值申请远小于实际所需的缓冲。 */
+        return -1;
+    }
+    if (b->logs_len > (size_t)-1 - entry_size) {
+        return -1;
+    }
     size_t need = b->logs_len + entry_size;
     if (ve_tls_bytes_reserve(&b->logs, &b->logs_cap, need) != 0) {
         return -1;

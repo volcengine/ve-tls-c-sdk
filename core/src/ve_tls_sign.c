@@ -394,6 +394,20 @@ static int ve_tls_norm_path_query_for_sign(const char * path, const char * query
     return 0;
 }
 
+/* SDK 管理的头由签名流程自身产出，调用方若在 headers_in 中传入同名头，
+ * 会导致 canonical headers 中出现重复条目并使最终 HTTP 头部出现重复行。
+ * 在 parse 阶段过滤掉这些键，同时净化 canonical 与最终输出。 */
+static int ve_tls_is_sdk_managed_header_lower(const char * key_lower) {
+    if (!key_lower) {
+        return 0;
+    }
+    return strcmp(key_lower, "host") == 0 ||
+           strcmp(key_lower, "x-date") == 0 ||
+           strcmp(key_lower, "x-content-sha256") == 0 ||
+           strcmp(key_lower, "x-security-token") == 0 ||
+           strcmp(key_lower, "authorization") == 0;
+}
+
 static int ve_tls_parse_headers(const char * headers, ve_tls_kv_pair ** out_pairs, size_t * out_len, char ** out_arena, size_t reserve_pairs) {
     if (!out_pairs || !out_len || !out_arena) {
         return -1;
@@ -479,6 +493,12 @@ static int ve_tls_parse_headers(const char * headers, ve_tls_kv_pair ** out_pair
                 dst[i] = (char)tolower((unsigned char)kb[i]);
             }
             dst[k_len] = 0;
+            /* 拒绝 SDK 自身管理的头部（host/x-date/x-content-sha256/x-security-token/authorization），
+             * 防止与签名流程末尾追加的同名头部产生 canonical 重复，导致签名不一致。 */
+            if (ve_tls_is_sdk_managed_header_lower(dst)) {
+                p = nl ? (nl + 1) : end;
+                continue;
+            }
             dst += k_len + 1;
 
             pairs[idx].value = dst;
@@ -947,13 +967,62 @@ int ve_tls_sign_v4_append_at(
         goto cleanup;
     }
     if (headers_in && headers_in[0] != 0) {
-        if (ve_tls_buf_append(&out, &out_len, &out_cap, headers_in) != 0) {
-            goto cleanup;
-        }
-        if (out_len > 0 && out[out_len - 1] != '\n') {
-            if (ve_tls_buf_append(&out, &out_len, &out_cap, "\n") != 0) {
-                goto cleanup;
+        /* 逐行追加 headers_in，跳过 SDK 自身管理的头部，避免最终 HTTP 头部重复。 */
+        const char * hp = headers_in;
+        while (*hp) {
+            const char * nl = strchr(hp, '\n');
+            const char * end = nl ? nl : (hp + strlen(hp));
+            const char * colon = memchr(hp, ':', (size_t)(end - hp));
+            int skip = 0;
+            if (colon) {
+                const char * kb = hp;
+                const char * ke = colon;
+                while (kb < ke && isspace((unsigned char)(*kb))) kb++;
+                while (ke > kb && isspace((unsigned char)(*(ke - 1)))) ke--;
+                size_t k_len = (size_t)(ke - kb);
+                char key_lower[32];
+                if (k_len > 0 && k_len < sizeof(key_lower)) {
+                    for (size_t i = 0; i < k_len; i++) {
+                        key_lower[i] = (char)tolower((unsigned char)kb[i]);
+                    }
+                    key_lower[k_len] = 0;
+                    if (ve_tls_is_sdk_managed_header_lower(key_lower)) {
+                        skip = 1;
+                    }
+                }
             }
+            if (!skip) {
+                size_t line_len = (size_t)(end - hp);
+                while (line_len > 0 && (hp[line_len - 1] == '\r')) {
+                    line_len--;
+                }
+                if (line_len > 0) {
+                    /* 行长有限走栈缓冲；超长则堆分配，确保 ve_tls_buf_append 看到的是 NUL 结尾字符串。 */
+                    char line_buf[1024];
+                    if (line_len + 2 <= sizeof(line_buf)) {
+                        memcpy(line_buf, hp, line_len);
+                        line_buf[line_len] = '\n';
+                        line_buf[line_len + 1] = 0;
+                        if (ve_tls_buf_append(&out, &out_len, &out_cap, line_buf) != 0) {
+                            goto cleanup;
+                        }
+                    } else {
+                        char * heap = (char *)ve_tls_malloc(line_len + 2);
+                        if (!heap) {
+                            goto cleanup;
+                        }
+                        memcpy(heap, hp, line_len);
+                        heap[line_len] = '\n';
+                        heap[line_len + 1] = 0;
+                        int rc_append = ve_tls_buf_append(&out, &out_len, &out_cap, heap);
+                        ve_tls_free(heap);
+                        if (rc_append != 0) {
+                            goto cleanup;
+                        }
+                    }
+                }
+            }
+            hp = nl ? (nl + 1) : end;
         }
     }
     if (ve_tls_buf_append(&out, &out_len, &out_cap, "Host: ") != 0 ||

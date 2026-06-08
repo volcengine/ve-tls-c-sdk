@@ -5,6 +5,15 @@
 #include <stdint.h>
 #include <string.h>
 
+/* TLS 关键字 feature-detect：C11 _Thread_local > GNU __thread > 退化空（单线程或不支持平台）。 */
+#if defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 201112L) && !defined(__STDC_NO_THREADS__)
+#define VE_TLS_RETRY_TLS _Thread_local
+#elif defined(__GNUC__) || defined(__clang__)
+#define VE_TLS_RETRY_TLS __thread
+#else
+#define VE_TLS_RETRY_TLS
+#endif
+
 void ve_tls_retry_policy_init(ve_tls_retry_policy * policy) {
     if (!policy) {
         return;
@@ -29,7 +38,7 @@ static uint64_t ve_tls_mix64(uint64_t x) {
 }
 
 static double ve_tls_rand01_fallback(void) {
-    static uint64_t s = 0;
+    static VE_TLS_RETRY_TLS uint64_t s = 0;
     if (s == 0) {
         uintptr_t a = (uintptr_t)&s;
         uintptr_t b = (uintptr_t)&ve_tls_rand01_fallback;
