@@ -3459,6 +3459,21 @@ static int test_kv_add_log_budget_full_drops_before_builder_grow(void) {
     return ok ? 0 : -1;
 }
 
+static int test_estimate_kv_lens_size_overflow_returns_sentinel(void) {
+    /* 回归：当 kv 长度极端大导致 size_t 累加溢出时，
+     * estimate_kv_lens_size 必须返回 (size_t)-1 哨兵，
+     * 防止上层基于回绕值做预算/编码。 */
+    size_t key_lens[2];
+    size_t val_lens[2];
+    /* 两个 SIZE_MAX/2 量级的 length 累加必然回绕 */
+    key_lens[0] = (size_t)-1 / 4;
+    val_lens[0] = (size_t)-1 / 4;
+    key_lens[1] = (size_t)-1 / 4;
+    val_lens[1] = (size_t)-1 / 4;
+    size_t r = ve_tls_log_builder_estimate_kv_lens_size(1700000000000LL, 0, 0, key_lens, val_lens, 2);
+    return (r == (size_t)-1) ? 0 : -1;
+}
+
 static int test_scratch_swap_to_send_task_no_buffered_underreport(void) {
     /* 回归：scratch 与 send_queue 之间必须原子转换，
      * 任何中间观测点 buffered_bytes 都必须 >= 真实占用，绝不能"少计"。 */
@@ -12720,6 +12735,7 @@ int main(void) {
     RUN(162, test_kv_add_log_budget_full_drops_before_builder_grow());
     RUN(163, test_scratch_budget_is_counted_against_max_buffer_bytes());
     RUN(164, test_scratch_swap_to_send_task_no_buffered_underreport());
+    RUN(165, test_estimate_kv_lens_size_overflow_returns_sentinel());
     RUN(120, test_worker_pack_stage_unsupported_compress_drops_before_enqueue());
     RUN(8, test_manager_callback_no_raw_buffer_on_compress_error());
     RUN(9, test_time_parts_roundtrip_in_raw_buffer());

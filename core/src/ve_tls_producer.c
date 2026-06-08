@@ -1006,6 +1006,11 @@ static int ve_tls_try_add_log_tls_batching(
     }
 
     size_t estimated = ve_tls_log_builder_estimate_kv_lens_size(time_ms, time_ns, has_time_ns, key_lens, val_lens, kv_count);
+    if (estimated == (size_t)-1) {
+        /* size 估算溢出：直接拒绝该日志，避免下游基于回绕值做预算/编码 */
+        *out_rc = VE_TLS_INVALID;
+        return 1;
+    }
     producer->config.platform.mutex_lock(producer->mutex);
     if (producer->stop || !producer->accepting) {
         producer->config.platform.mutex_unlock(producer->mutex);
@@ -2245,6 +2250,10 @@ static ve_tls_result ve_tls_producer_add_log_kv_lens_time_parts_hashkey(
     }
 
     size_t estimated = ve_tls_log_builder_estimate_kv_lens_size(time_ms, time_ns, has_time_ns ? 1 : 0, key_lens, val_lens, kv_count);
+    if (estimated == (size_t)-1) {
+        /* size 估算溢出：直接拒绝该日志，避免下游基于回绕值做预算/编码 */
+        return VE_TLS_INVALID;
+    }
     producer->config.platform.mutex_lock(producer->mutex);
     if (producer->stop || !producer->accepting) {
         producer->config.platform.mutex_unlock(producer->mutex);

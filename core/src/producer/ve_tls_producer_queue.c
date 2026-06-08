@@ -143,13 +143,16 @@ void ve_tls_send_task_free(ve_tls_send_task * t) {
     if (!t) {
         return;
     }
-    /* 若 task 在 push 之前/失败时被销毁，必须把 prepare 阶段挂在这里的
-     * scratch 预算原子归还到 producer，否则 scratch_bytes 会永久泄漏。 */
-    if (t->scratch_held > 0 && t->scratch_owner) {
-        ve_tls_producer_release_scratch_bytes(t->scratch_owner, t->scratch_held);
-        t->scratch_held = 0;
-        t->scratch_owner = NULL;
-    }
+    /* 先缓存 scratch 归属，待真实内存释放完成后再回还预算：
+     * 否则在 release_scratch_bytes 内会持锁 cond_broadcast 唤醒等待者，
+     * 而此时 body/precompressed 仍未释放，可能让其他线程基于"少计"的
+     * buffered_bytes 通过 wait_buffer_space_locked，进而短暂突破 max_buffer_bytes。
+     * 延后归还可保证最坏情况下只会"多计"（更保守），而不会"少计"。 */
+    size_t held = t->scratch_held;
+    ve_tls_producer * owner = t->scratch_owner;
+    t->scratch_held = 0;
+    t->scratch_owner = NULL;
+
     ve_tls_free(t->hash_key);
     if (t->precompressed) {
         if (t->precompressed_pool) {
@@ -164,6 +167,10 @@ void ve_tls_send_task_free(ve_tls_send_task * t) {
         } else {
             ve_tls_free(t->body);
         }
+    }
+    /* 真实内存均已归还后，最后释放 scratch 预算并广播。 */
+    if (held > 0 && owner) {
+        ve_tls_producer_release_scratch_bytes(owner, held);
     }
     memset(t, 0, sizeof(*t));
 }

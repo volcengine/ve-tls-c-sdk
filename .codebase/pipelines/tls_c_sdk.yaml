@@ -6,7 +6,6 @@ jobs:
   unit_test_coverage:
     name: UT Coverage
     image: hub.byted.org/base/tls_build_cpp_ci_ci:tls_gcc11_with_ninja 
-    working-directory: tls-c-sdk
     runs-on:
       env: boe
       spec: c1.2xlarge

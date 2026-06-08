@@ -174,6 +174,14 @@ static size_t ve_tls_log_content_field_size(size_t klen, size_t vlen) {
     return ve_tls_key_u32_size(2, 2) + ve_tls_varint_u64_size((uint64_t)msg) + msg;
 }
 
+/* 防溢出加法：a + b 若回绕则返回 (size_t)-1（哨兵）。
+ * 上层拿到 -1 必须直接拒绝该 log，避免基于回绕值做预算/编码。 */
+static size_t ve_tls_size_add_safe(size_t a, size_t b) {
+    if (a == (size_t)-1 || b == (size_t)-1) return (size_t)-1;
+    if (a > (size_t)-1 - b) return (size_t)-1;
+    return a + b;
+}
+
 static size_t ve_tls_log_msg_size_lens(int64_t time_ms, uint32_t time_ns, int32_t has_time_ns, const size_t * key_lens, const size_t * val_lens, size_t kv_count) {
     if (time_ms <= 0) {
         time_ms = 0;
@@ -181,27 +189,32 @@ static size_t ve_tls_log_msg_size_lens(int64_t time_ms, uint32_t time_ns, int32_
         time_ns = 0;
     }
     uint64_t t = (uint64_t)time_ms;
-    size_t n = ve_tls_key_u32_size(1, 0) + ve_tls_varint_u64_size(t);
+    size_t n = ve_tls_size_add_safe(ve_tls_key_u32_size(1, 0), ve_tls_varint_u64_size(t));
     for (size_t i = 0; i < kv_count; i++) {
         size_t klen = key_lens ? key_lens[i] : 0;
         size_t vlen = val_lens ? val_lens[i] : 0;
-        n += ve_tls_log_content_field_size(klen, vlen);
+        size_t f = ve_tls_log_content_field_size(klen, vlen);
+        n = ve_tls_size_add_safe(n, f);
+        if (n == (size_t)-1) return (size_t)-1;
     }
     if (has_time_ns) {
-        n += ve_tls_key_u32_size(3, 5) + 4;
+        n = ve_tls_size_add_safe(n, ve_tls_size_add_safe(ve_tls_key_u32_size(3, 5), 4));
     }
     return n;
 }
 
 size_t ve_tls_log_builder_estimate_kv_lens_size(int64_t time_ms, uint32_t time_ns, int32_t has_time_ns, const size_t * key_lens, const size_t * val_lens, size_t kv_count) {
     size_t msg_size = ve_tls_log_msg_size_lens(time_ms, time_ns, has_time_ns, key_lens, val_lens, kv_count);
+    if (msg_size == (size_t)-1) {
+        return (size_t)-1;
+    }
     size_t entry_size = 1;
     if (msg_size <= UINT32_MAX) {
         entry_size += ve_tls_varint_u32_size((uint32_t)msg_size);
     } else {
         entry_size += ve_tls_varint_u64_size((uint64_t)msg_size);
     }
-    entry_size += msg_size;
+    entry_size = ve_tls_size_add_safe(entry_size, msg_size);
     return entry_size;
 }
 
