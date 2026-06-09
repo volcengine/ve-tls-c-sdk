@@ -12,12 +12,21 @@
 #include <limits.h>
 #include <stdio.h>
 
+#if defined(CLOCK_MONOTONIC) && defined(_POSIX_CLOCK_SELECTION) && (_POSIX_CLOCK_SELECTION > 0)
+#define VE_TLS_HAVE_PTHREAD_COND_CLOCK 1
+#else
+#define VE_TLS_HAVE_PTHREAD_COND_CLOCK 0
+#endif
+
 struct ve_tls_mutex {
     pthread_mutex_t mutex;
 };
 
 struct ve_tls_cond {
     pthread_cond_t cond;
+#if VE_TLS_HAVE_PTHREAD_COND_CLOCK
+    clockid_t clock_id;
+#endif
 };
 
 struct ve_tls_thread {
@@ -30,13 +39,17 @@ struct ve_tls_file {
 
 static int64_t ve_tls_posix_time_ms(void) {
     struct timeval tv;
-    gettimeofday(&tv, NULL);
+    if (gettimeofday(&tv, NULL) != 0) {
+        return 0;
+    }
     return (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
 }
 
 static int64_t ve_tls_posix_time_unix_ns(void) {
     struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
+    if (clock_gettime(CLOCK_REALTIME, &ts) != 0) {
+        return 0;
+    }
     return (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
 }
 
@@ -47,7 +60,8 @@ static void ve_tls_posix_sleep_ms(int64_t ms) {
     struct timespec ts;
     ts.tv_sec = (time_t)(ms / 1000);
     ts.tv_nsec = (long)((ms % 1000) * 1000000);
-    nanosleep(&ts, NULL);
+    while (nanosleep(&ts, &ts) != 0 && errno == EINTR) {
+    }
 }
 
 static ve_tls_mutex * ve_tls_pthread_mutex_create(void) {
@@ -55,7 +69,10 @@ static ve_tls_mutex * ve_tls_pthread_mutex_create(void) {
     if (!m) {
         return NULL;
     }
-    pthread_mutex_init(&m->mutex, NULL);
+    if (pthread_mutex_init(&m->mutex, NULL) != 0) {
+        free(m);
+        return NULL;
+    }
     return m;
 }
 
@@ -81,11 +98,21 @@ static ve_tls_cond * ve_tls_pthread_cond_create(void) {
         return NULL;
     }
     pthread_condattr_t attr;
-    pthread_condattr_init(&attr);
-#if defined(CLOCK_MONOTONIC) && defined(_POSIX_CLOCK_SELECTION) && (_POSIX_CLOCK_SELECTION > 0)
-    pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
+    if (pthread_condattr_init(&attr) != 0) {
+        free(c);
+        return NULL;
+    }
+#if VE_TLS_HAVE_PTHREAD_COND_CLOCK
+    c->clock_id = CLOCK_REALTIME;
+    if (pthread_condattr_setclock(&attr, CLOCK_MONOTONIC) == 0) {
+        c->clock_id = CLOCK_MONOTONIC;
+    }
 #endif
-    pthread_cond_init(&c->cond, &attr);
+    if (pthread_cond_init(&c->cond, &attr) != 0) {
+        pthread_condattr_destroy(&attr);
+        free(c);
+        return NULL;
+    }
     pthread_condattr_destroy(&attr);
     return c;
 }
@@ -105,11 +132,14 @@ static void ve_tls_pthread_cond_wait(ve_tls_cond * c, ve_tls_mutex * m) {
 static int ve_tls_pthread_cond_timedwait_ms(ve_tls_cond * c, ve_tls_mutex * m, int64_t timeout_ms) {
     struct timespec ts;
     struct timespec now;
-#if defined(CLOCK_MONOTONIC)
-    clock_gettime(CLOCK_MONOTONIC, &now);
+#if VE_TLS_HAVE_PTHREAD_COND_CLOCK
+    clockid_t clock_id = c->clock_id;
 #else
-    clock_gettime(CLOCK_REALTIME, &now);
+    clockid_t clock_id = CLOCK_REALTIME;
 #endif
+    if (clock_gettime(clock_id, &now) != 0) {
+        return -1;
+    }
     int64_t nanos = (int64_t)now.tv_nsec + (timeout_ms % 1000) * 1000000;
     ts.tv_sec = now.tv_sec + (timeout_ms / 1000) + nanos / 1000000000;
     ts.tv_nsec = nanos % 1000000000;

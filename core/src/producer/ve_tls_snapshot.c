@@ -18,8 +18,8 @@ static void ve_tls_runtime_snapshot_free(ve_tls_runtime_snapshot * snapshot) {
     ve_tls_free(snapshot->proxy);
     ve_tls_free(snapshot->user_agent);
     ve_tls_free(snapshot->access_key_id);
-    ve_tls_free(snapshot->access_key_secret);
-    ve_tls_free(snapshot->security_token);
+    ve_tls_secure_free_str(&snapshot->access_key_secret);
+    ve_tls_secure_free_str(&snapshot->security_token);
     memset(snapshot, 0, sizeof(*snapshot));
     ve_tls_free(snapshot);
 }

@@ -232,6 +232,7 @@ struct ve_tls_producer {
     uint64_t m_bytes_sent_total;
     uint64_t m_latency_buckets[8];
     int32_t use_global_env;
+    int32_t env_registered;
     int32_t env_in_queue;
     int32_t env_inflight;
     ve_tls_producer * env_next;
