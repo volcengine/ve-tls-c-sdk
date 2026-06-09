@@ -461,6 +461,9 @@ int ve_tls_builder_to_send_task(ve_tls_producer * producer, ve_tls_log_group_bui
     out->body = wb.data;
     out->body_size = wb.len;
     out->raw_body_size = wb.len;
+    wb.data = NULL;
+    wb.len = 0;
+    wb.cap = 0;
     out->log_count = b->log_count;
     out->earliest = b->earliest;
     out->latest = b->latest;

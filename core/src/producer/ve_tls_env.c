@@ -7,15 +7,17 @@
 
 #if defined(VE_TLS_ENABLE_PTHREAD)
 #include <pthread.h>
-/* g_env_init_mu 仅串行化 ve_tls_env_init/destroy 入口的 inited 检查与状态切换，
- * 不参与运行时热路径（队列/通知由 g_env.mutex 保护）。 */
+/* g_env_init_mu 保护全局 env 的生命周期；队列热路径仍由 g_env.mutex 保护。 */
 static pthread_mutex_t g_env_init_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_env_lifecycle_cv = PTHREAD_COND_INITIALIZER;
 #endif
 
 typedef struct {
     int inited;
     int stop;
     int destroying;
+    int tearing_down;
+    int active_ops;
     ve_tls_platform platform;
     ve_tls_mutex * mutex;
     ve_tls_cond * cond;
@@ -31,8 +33,142 @@ typedef struct {
 
 static ve_tls_env_state g_env;
 
+static int ve_tls_env_has_resources(void) {
+    return g_env.mutex || g_env.cond || g_env.q || g_env.senders;
+}
+
+static int ve_tls_env_resources_ready(void) {
+    return g_env.inited && g_env.mutex && g_env.cond && g_env.q;
+}
+
+#if defined(VE_TLS_ENABLE_PTHREAD)
+static int ve_tls_env_mark_destroying_locked(void) {
+    if (!g_env.inited && !ve_tls_env_has_resources()) {
+        return 0;
+    }
+    g_env.destroying = 1;
+    while (g_env.active_ops > 0) {
+        pthread_cond_wait(&g_env_lifecycle_cv, &g_env_init_mu);
+    }
+    g_env.tearing_down = 1;
+    return 1;
+}
+
+static int ve_tls_env_prepare_destroy(void) {
+    int ok;
+    pthread_mutex_lock(&g_env_init_mu);
+    while (g_env.tearing_down) {
+        pthread_cond_wait(&g_env_lifecycle_cv, &g_env_init_mu);
+    }
+    ok = ve_tls_env_mark_destroying_locked();
+    pthread_mutex_unlock(&g_env_init_mu);
+    return ok;
+}
+
+static int ve_tls_env_lifecycle_begin(int allow_destroying) {
+    int ok = 0;
+    pthread_mutex_lock(&g_env_init_mu);
+    if (ve_tls_env_resources_ready() && !g_env.tearing_down && (allow_destroying || !g_env.destroying)) {
+        g_env.active_ops++;
+        ok = 1;
+    }
+    pthread_mutex_unlock(&g_env_init_mu);
+    return ok;
+}
+
+static int ve_tls_env_lifecycle_begin_unregister(void) {
+    int ok = 0;
+    pthread_mutex_lock(&g_env_init_mu);
+    while (g_env.tearing_down) {
+        pthread_cond_wait(&g_env_lifecycle_cv, &g_env_init_mu);
+    }
+    if (ve_tls_env_resources_ready()) {
+        g_env.active_ops++;
+        ok = 1;
+    }
+    pthread_mutex_unlock(&g_env_init_mu);
+    return ok;
+}
+
+static void ve_tls_env_lifecycle_end(void) {
+    pthread_mutex_lock(&g_env_init_mu);
+    if (g_env.active_ops > 0) {
+        g_env.active_ops--;
+    }
+    if (g_env.active_ops == 0) {
+        pthread_cond_broadcast(&g_env_lifecycle_cv);
+    }
+    pthread_mutex_unlock(&g_env_init_mu);
+}
+
+static void ve_tls_env_destroy_abort_lifecycle(void) {
+    pthread_mutex_lock(&g_env_init_mu);
+    g_env.destroying = 0;
+    g_env.tearing_down = 0;
+    pthread_cond_broadcast(&g_env_lifecycle_cv);
+    pthread_mutex_unlock(&g_env_init_mu);
+}
+
+static void ve_tls_env_mark_unavailable(void) {
+    pthread_mutex_lock(&g_env_init_mu);
+    g_env.inited = 0;
+    pthread_mutex_unlock(&g_env_init_mu);
+}
+
+static void ve_tls_env_destroy_finish_lifecycle(void) {
+    pthread_mutex_lock(&g_env_init_mu);
+    g_env.destroying = 0;
+    g_env.tearing_down = 0;
+    g_env.active_ops = 0;
+    pthread_cond_broadcast(&g_env_lifecycle_cv);
+    pthread_mutex_unlock(&g_env_init_mu);
+}
+#else
+static int ve_tls_env_mark_destroying_locked(void) {
+    if (!g_env.inited && !ve_tls_env_has_resources()) {
+        return 0;
+    }
+    g_env.destroying = 1;
+    g_env.tearing_down = 1;
+    return 1;
+}
+
+static int ve_tls_env_prepare_destroy(void) {
+    return ve_tls_env_mark_destroying_locked();
+}
+
+static int ve_tls_env_lifecycle_begin(int allow_destroying) {
+    (void)allow_destroying;
+    return ve_tls_env_resources_ready();
+}
+
+static int ve_tls_env_lifecycle_begin_unregister(void) {
+    return ve_tls_env_resources_ready();
+}
+
+static void ve_tls_env_lifecycle_end(void) {
+}
+
+static void ve_tls_env_destroy_abort_lifecycle(void) {
+    g_env.destroying = 0;
+    g_env.tearing_down = 0;
+}
+
+static void ve_tls_env_mark_unavailable(void) {
+    g_env.inited = 0;
+}
+
+static void ve_tls_env_destroy_finish_lifecycle(void) {
+    g_env.destroying = 0;
+    g_env.tearing_down = 0;
+    g_env.active_ops = 0;
+}
+#endif
+
 static void ve_tls_env_queue_push_locked(ve_tls_producer * producer) {
-    if (!producer || g_env.q_count >= g_env.q_cap) {
+    if (!producer ||
+        __atomic_load_n(&producer->env_registered, __ATOMIC_ACQUIRE) == 0 ||
+        g_env.q_count >= g_env.q_cap) {
         return;
     }
     g_env.q[g_env.q_tail] = producer;
@@ -83,6 +219,9 @@ static int ve_tls_producer_has_pending(ve_tls_producer * producer, int64_t now_m
 static void ve_tls_env_tick_locked(void) {
     int64_t now = g_env.platform.time_ms ? g_env.platform.time_ms() : 0;
     for (ve_tls_producer * p = g_env.producers; p; p = p->env_next) {
+        if (__atomic_load_n(&p->env_registered, __ATOMIC_ACQUIRE) == 0) {
+            continue;
+        }
         if (__atomic_load_n(&p->env_in_queue, __ATOMIC_RELAXED) != 0) {
             continue;
         }
@@ -132,12 +271,17 @@ static void * ve_tls_env_sender_main(void * arg) {
     }
 }
 
+static ve_tls_result ve_tls_env_destroy_prepared(int32_t timeout_ms);
+
 ve_tls_result ve_tls_env_init(int32_t global_send_thread_count) {
     if (global_send_thread_count <= 0) {
         global_send_thread_count = 1;
     }
 #if defined(VE_TLS_ENABLE_PTHREAD)
     pthread_mutex_lock(&g_env_init_mu);
+    while (g_env.tearing_down) {
+        pthread_cond_wait(&g_env_lifecycle_cv, &g_env_init_mu);
+    }
 #endif
     if (g_env.inited) {
 #if defined(VE_TLS_ENABLE_PTHREAD)
@@ -154,23 +298,28 @@ ve_tls_result ve_tls_env_init(int32_t global_send_thread_count) {
     g_env.sender_count = global_send_thread_count;
     g_env.senders = (ve_tls_thread **)ve_tls_calloc((size_t)g_env.sender_count, sizeof(ve_tls_thread *));
     if (!g_env.mutex || !g_env.cond || !g_env.q || !g_env.senders) {
-        /* 失败路径：先把 inited 复位，再走 destroy 释放已分配资源；
-         * 否则下次 init 会被 inited==0 但部分字段为 NULL 的中间态欺骗。 */
+        /* 失败路径需要在释放生命周期锁后清理，避免 public destroy 重入自锁。 */
         g_env.inited = 0;
-        ve_tls_env_destroy(0);
 #if defined(VE_TLS_ENABLE_PTHREAD)
+        (void)ve_tls_env_mark_destroying_locked();
         pthread_mutex_unlock(&g_env_init_mu);
+#else
+        (void)ve_tls_env_mark_destroying_locked();
 #endif
+        (void)ve_tls_env_destroy_prepared(0);
         return VE_TLS_DROP_ERROR;
     }
     for (int32_t i = 0; i < g_env.sender_count; i++) {
         g_env.senders[i] = g_env.platform.thread_create(ve_tls_env_sender_main, NULL);
         if (!g_env.senders[i]) {
             g_env.inited = 0;
-            ve_tls_env_destroy(0);
 #if defined(VE_TLS_ENABLE_PTHREAD)
+            (void)ve_tls_env_mark_destroying_locked();
             pthread_mutex_unlock(&g_env_init_mu);
+#else
+            (void)ve_tls_env_mark_destroying_locked();
 #endif
+            (void)ve_tls_env_destroy_prepared(0);
             return VE_TLS_DROP_ERROR;
         }
     }
@@ -181,7 +330,7 @@ ve_tls_result ve_tls_env_init(int32_t global_send_thread_count) {
     return VE_TLS_OK;
 }
 
-ve_tls_result ve_tls_env_destroy(int32_t timeout_ms) {
+static ve_tls_result ve_tls_env_destroy_prepared(int32_t timeout_ms) {
     if (!g_env.inited && !g_env.mutex && !g_env.cond && !g_env.q && !g_env.senders) {
         return VE_TLS_OK;
     }
@@ -189,7 +338,6 @@ ve_tls_result ve_tls_env_destroy(int32_t timeout_ms) {
     if (g_env.mutex) {
         g_env.platform.mutex_lock(g_env.mutex);
     }
-    g_env.destroying = 1;
     for (;;) {
         int all_drained = 1;
         for (ve_tls_producer * p = g_env.producers; p; p = p->env_next) {
@@ -205,8 +353,10 @@ ve_tls_result ve_tls_env_destroy(int32_t timeout_ms) {
             break;
         }
         if (timeout_ms == 0) {
-            g_env.destroying = 0;
-            g_env.platform.mutex_unlock(g_env.mutex);
+            if (g_env.mutex) {
+                g_env.platform.mutex_unlock(g_env.mutex);
+            }
+            ve_tls_env_destroy_abort_lifecycle();
             return VE_TLS_TIMEOUT;
         }
         int wait_ms = 50;
@@ -215,8 +365,10 @@ ve_tls_result ve_tls_env_destroy(int32_t timeout_ms) {
             int64_t elapsed = now - start;
             int64_t remain = (int64_t)timeout_ms - elapsed;
             if (remain <= 0) {
-                g_env.destroying = 0;
-                g_env.platform.mutex_unlock(g_env.mutex);
+                if (g_env.mutex) {
+                    g_env.platform.mutex_unlock(g_env.mutex);
+                }
+                ve_tls_env_destroy_abort_lifecycle();
                 return VE_TLS_TIMEOUT;
             }
             if (remain < wait_ms) {
@@ -248,6 +400,12 @@ ve_tls_result ve_tls_env_destroy(int32_t timeout_ms) {
         g_env.senders = NULL;
     }
     g_env.sender_count = 0;
+    ve_tls_env_mark_unavailable();
+    if (g_env.mutex) {
+        g_env.platform.mutex_lock(g_env.mutex);
+        g_env.stop = 0;
+        g_env.platform.mutex_unlock(g_env.mutex);
+    }
     if (g_env.q) {
         ve_tls_free(g_env.q);
         g_env.q = NULL;
@@ -256,6 +414,10 @@ ve_tls_result ve_tls_env_destroy(int32_t timeout_ms) {
     g_env.q_head = 0;
     g_env.q_tail = 0;
     g_env.q_count = 0;
+    for (ve_tls_producer * p = g_env.producers; p; p = p->env_next) {
+        __atomic_store_n(&p->env_registered, 0, __ATOMIC_RELEASE);
+        __atomic_store_n(&p->env_in_queue, 0, __ATOMIC_RELAXED);
+    }
     g_env.producers = NULL;
     if (g_env.cond) {
         g_env.platform.cond_destroy(g_env.cond);
@@ -266,28 +428,48 @@ ve_tls_result ve_tls_env_destroy(int32_t timeout_ms) {
         g_env.mutex = NULL;
     }
     memset(&g_env.platform, 0, sizeof(g_env.platform));
-    g_env.inited = 0;
-    g_env.stop = 0;
-    g_env.destroying = 0;
+    ve_tls_env_destroy_finish_lifecycle();
     return VE_TLS_OK;
 }
 
+ve_tls_result ve_tls_env_destroy(int32_t timeout_ms) {
+    if (!ve_tls_env_prepare_destroy()) {
+        return VE_TLS_OK;
+    }
+    return ve_tls_env_destroy_prepared(timeout_ms);
+}
+
 int ve_tls_env_register_producer(ve_tls_producer * producer) {
-    if (!producer || !g_env.inited || g_env.destroying) {
+    if (!producer || !ve_tls_env_lifecycle_begin(0)) {
         return -1;
     }
     g_env.platform.mutex_lock(g_env.mutex);
-    producer->env_next = g_env.producers;
-    g_env.producers = producer;
+    if (!g_env.stop) {
+        __atomic_store_n(&producer->env_registered, 1, __ATOMIC_RELEASE);
+        producer->env_next = g_env.producers;
+        g_env.producers = producer;
+    } else {
+        g_env.platform.mutex_unlock(g_env.mutex);
+        ve_tls_env_lifecycle_end();
+        return -1;
+    }
     g_env.platform.mutex_unlock(g_env.mutex);
+    ve_tls_env_lifecycle_end();
     return 0;
 }
 
 void ve_tls_env_unregister_producer(ve_tls_producer * producer) {
-    if (!producer || !g_env.inited) {
+    if (!producer) {
+        return;
+    }
+    if (!ve_tls_env_lifecycle_begin_unregister()) {
+        __atomic_store_n(&producer->env_registered, 0, __ATOMIC_RELEASE);
+        __atomic_store_n(&producer->env_in_queue, 0, __ATOMIC_RELAXED);
+        producer->env_next = NULL;
         return;
     }
     g_env.platform.mutex_lock(g_env.mutex);
+    __atomic_store_n(&producer->env_registered, 0, __ATOMIC_RELEASE);
     ve_tls_producer * prev = NULL;
     for (ve_tls_producer * p = g_env.producers; p; p = p->env_next) {
         if (p == producer) {
@@ -300,6 +482,7 @@ void ve_tls_env_unregister_producer(ve_tls_producer * producer) {
         }
         prev = p;
     }
+    producer->env_next = NULL;
     for (size_t i = 0, idx = g_env.q_head; i < g_env.q_count; i++) {
         if (g_env.q[idx] == producer) {
             g_env.q[idx] = NULL;
@@ -308,20 +491,28 @@ void ve_tls_env_unregister_producer(ve_tls_producer * producer) {
     }
     __atomic_store_n(&producer->env_in_queue, 0, __ATOMIC_RELAXED);
     g_env.platform.mutex_unlock(g_env.mutex);
+    ve_tls_env_lifecycle_end();
 }
 
 void ve_tls_env_notify(ve_tls_producer * producer) {
-    if (!producer || !g_env.inited || g_env.stop || g_env.destroying) {
+    if (!producer || !ve_tls_env_lifecycle_begin(0)) {
+        return;
+    }
+    if (__atomic_load_n(&producer->env_registered, __ATOMIC_ACQUIRE) == 0) {
+        ve_tls_env_lifecycle_end();
         return;
     }
     if (__atomic_exchange_n(&producer->env_in_queue, 1, __ATOMIC_RELAXED) != 0) {
+        ve_tls_env_lifecycle_end();
         return;
     }
     g_env.platform.mutex_lock(g_env.mutex);
-    if (!g_env.stop && !g_env.destroying) {
+    if (!g_env.stop &&
+        __atomic_load_n(&producer->env_registered, __ATOMIC_ACQUIRE) != 0) {
         ve_tls_env_queue_push_locked(producer);
     } else {
         __atomic_store_n(&producer->env_in_queue, 0, __ATOMIC_RELAXED);
     }
     g_env.platform.mutex_unlock(g_env.mutex);
+    ve_tls_env_lifecycle_end();
 }
