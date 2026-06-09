@@ -31,6 +31,10 @@ void * ve_tls_realloc(void * p, size_t n);
 void ve_tls_free(void * p);
 char * ve_tls_strdup(const char * s);
 
+/* Best-effort sensitive data cleanup helpers shared by producer/signing code. */
+void ve_tls_secure_zero(void * p, size_t n);
+void ve_tls_secure_free_str(char ** ps);
+
 /* === Fault injection (test-only, no-op in production) ===
  * Default state: tag == NULL, costs at most one branch in alloc paths.
  * tag == NULL clears injection. fail_after >= 0; fail_count <= 0 treated as 1. */
@@ -71,4 +75,3 @@ static inline void ve_tls__site_cleanup(const char ** prev) {
 #endif
 
 #endif
-

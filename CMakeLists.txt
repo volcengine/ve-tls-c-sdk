@@ -77,6 +77,7 @@ if(VE_TLS_ENABLE_PTHREAD)
     set(THREADS_PREFER_PTHREAD_FLAG ON)
     find_package(Threads REQUIRED)
     target_link_libraries(ve_tls_core PRIVATE Threads::Threads)
+    target_compile_definitions(ve_tls_core PUBLIC VE_TLS_ENABLE_PTHREAD=1)
 endif()
 
 if(UNIX AND NOT APPLE)
@@ -221,7 +222,21 @@ if(VE_TLS_ENABLE_ASAN OR VE_TLS_ENABLE_UBSAN)
             set(_sanitize_flags "${_sanitize_flags},undefined")
         endif()
     endif()
-    foreach(tgt IN ITEMS ve_tls_core ve_tls_test_basic ve_tls_demo ve_tls_demo_real ve_tls_bench)
+    foreach(tgt IN ITEMS
+        ve_tls_core
+        ve_tls_test_basic
+        ve_tls_test_android_binding
+        ve_tls_demo
+        ve_tls_demo_putlogs
+        ve_tls_demo_putlogsv2
+        ve_tls_demo_real
+        ve_tls_bench
+        ve_tls_gen_raw_log
+        ve_tls_perf_tls
+        ve_tls_benchmark_tls
+        ve_tls_persistent_bench
+        ve_tls_persistent_real_bench
+    )
         if(TARGET ${tgt})
             target_compile_options(${tgt} PRIVATE -fsanitize=${_sanitize_flags} -fno-omit-frame-pointer)
             target_link_options(${tgt} PRIVATE -fsanitize=${_sanitize_flags})

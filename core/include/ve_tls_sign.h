@@ -63,4 +63,11 @@ int ve_tls_sign_v4_append_at(
     char ** headers_out
 );
 
+/**
+ * 清理当前线程的签名缓存，包括 SK inline/digest 与派生 signing key。
+ * SDK sender 线程退出时会自动调用；若调用方直接使用签名 API，并使用短期凭证或 AK/SK
+ * 轮转，建议在凭证失效后于同一线程主动调用，以缩短线程本地派生 key 的驻留时间。
+ */
+void ve_tls_sign_thread_cache_clear(void);
+
 #endif

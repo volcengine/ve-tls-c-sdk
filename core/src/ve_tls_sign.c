@@ -28,6 +28,30 @@ typedef struct {
     unsigned char own_value;
 } ve_tls_kv_pair;
 
+#if VE_TLS_HAVE_THREAD_LOCAL
+#define VE_TLS_SK_INLINE_CACHE_MAX 96
+typedef struct {
+    int valid;
+    char date8[9];
+    uint64_t region_sig;
+    uint64_t service_sig;
+    size_t sk_len;
+    int sk_use_digest;
+    char sk_inline[VE_TLS_SK_INLINE_CACHE_MAX];
+    unsigned char sk_digest[32];
+    unsigned char key[32];
+} ve_tls_signing_key_cache;
+
+static VE_TLS_THREAD_LOCAL ve_tls_signing_key_cache g_signing_key_cache;
+#endif
+
+void ve_tls_sign_thread_cache_clear(void) {
+#if VE_TLS_HAVE_THREAD_LOCAL
+    /* Clears this thread's cached SK material and derived signing key. */
+    ve_tls_secure_zero(&g_signing_key_cache, sizeof(g_signing_key_cache));
+#endif
+}
+
 static void ve_tls_pair_free(ve_tls_kv_pair * p) {
     if (!p) {
         return;
@@ -109,9 +133,21 @@ static int ve_tls_should_escape(unsigned char c) {
     return 1;
 }
 
+static int ve_tls_is_hex(unsigned char c) {
+    return (c >= '0' && c <= '9') ||
+           (c >= 'A' && c <= 'F') ||
+           (c >= 'a' && c <= 'f');
+}
+
 static char * ve_tls_url_encode_span(const char * s, size_t slen) {
     size_t hex_count = 0;
     for (size_t i = 0; i < slen; i++) {
+        if (s[i] == '%' && i + 2 < slen &&
+            ve_tls_is_hex((unsigned char)s[i + 1]) &&
+            ve_tls_is_hex((unsigned char)s[i + 2])) {
+            i += 2;
+            continue;
+        }
         if (ve_tls_should_escape((unsigned char)s[i])) {
             hex_count++;
         }
@@ -127,6 +163,15 @@ static char * ve_tls_url_encode_span(const char * s, size_t slen) {
     size_t j = 0;
     for (size_t i = 0; i < slen; i++) {
         unsigned char c = (unsigned char)s[i];
+        if (c == '%' && i + 2 < slen &&
+            ve_tls_is_hex((unsigned char)s[i + 1]) &&
+            ve_tls_is_hex((unsigned char)s[i + 2])) {
+            out[j++] = (char)c;
+            out[j++] = (char)toupper((unsigned char)s[i + 1]);
+            out[j++] = (char)toupper((unsigned char)s[i + 2]);
+            i += 2;
+            continue;
+        }
         if (ve_tls_should_escape(c)) {
             out[j++] = '%';
             out[j++] = "0123456789ABCDEF"[c >> 4];
@@ -653,6 +698,9 @@ static int ve_tls_signing_key(const char * sk, const char * date8, const char * 
     ve_tls_hmac_sha256(k_date, 32, (const unsigned char *)region, strlen(region), k_region);
     ve_tls_hmac_sha256(k_region, 32, (const unsigned char *)service, strlen(service), k_service);
     ve_tls_hmac_sha256(k_service, 32, (const unsigned char *)"request", 7, out32);
+    ve_tls_secure_zero(k_date, sizeof(k_date));
+    ve_tls_secure_zero(k_region, sizeof(k_region));
+    ve_tls_secure_zero(k_service, sizeof(k_service));
     return 0;
 }
 
@@ -670,68 +718,64 @@ static uint64_t ve_tls_fnv1a64(const char * s) {
 
 static void ve_tls_signing_key_cached(const char * sk, const char * date8, const char * region, const char * service, unsigned char out32[32]) {
 #if VE_TLS_HAVE_THREAD_LOCAL
-#define VE_TLS_SK_INLINE_CACHE_MAX 96
-    typedef struct {
-        int valid;
-        char date8[9];
-        uint64_t region_sig;
-        uint64_t service_sig;
-        size_t sk_len;
-        int sk_use_digest;
-        char sk_inline[VE_TLS_SK_INLINE_CACHE_MAX];
-        unsigned char sk_digest[32];
-        unsigned char key[32];
-    } ve_tls_signing_key_cache;
-    static VE_TLS_THREAD_LOCAL ve_tls_signing_key_cache cache;
+    ve_tls_signing_key_cache * cache = &g_signing_key_cache;
 
     size_t sk_len = strlen(sk);
     unsigned char sk_digest[32];
     int sk_digest_ready = 0;
     uint64_t region_sig = ve_tls_fnv1a64(region);
     uint64_t service_sig = ve_tls_fnv1a64(service);
-    if (cache.valid &&
-        memcmp(cache.date8, date8, 9) == 0 &&
-        cache.region_sig == region_sig &&
-        cache.service_sig == service_sig &&
-        cache.sk_len == sk_len) {
+    if (cache->valid &&
+        memcmp(cache->date8, date8, 9) == 0 &&
+        cache->region_sig == region_sig &&
+        cache->service_sig == service_sig &&
+        cache->sk_len == sk_len) {
         int sk_match = 0;
-        if (!cache.sk_use_digest) {
+        if (!cache->sk_use_digest) {
             if (sk_len <= VE_TLS_SK_INLINE_CACHE_MAX &&
-                memcmp(cache.sk_inline, sk, sk_len) == 0) {
+                memcmp(cache->sk_inline, sk, sk_len) == 0) {
                 sk_match = 1;
             }
         } else {
             ve_tls_sha256((const unsigned char *)sk, sk_len, sk_digest);
             sk_digest_ready = 1;
-            if (memcmp(cache.sk_digest, sk_digest, 32) == 0) {
+            if (memcmp(cache->sk_digest, sk_digest, 32) == 0) {
                 sk_match = 1;
             }
         }
         if (sk_match) {
-            memcpy(out32, cache.key, 32);
+            memcpy(out32, cache->key, 32);
+            if (sk_digest_ready) {
+                ve_tls_secure_zero(sk_digest, sizeof(sk_digest));
+            }
             return;
         }
     }
     ve_tls_signing_key(sk, date8, region, service, out32);
-    cache.valid = 1;
-    memcpy(cache.date8, date8, 9);
-    cache.region_sig = region_sig;
-    cache.service_sig = service_sig;
-    cache.sk_len = sk_len;
+    if (cache->valid) {
+        ve_tls_secure_zero(cache, sizeof(*cache));
+    }
+    cache->valid = 1;
+    memcpy(cache->date8, date8, 9);
+    cache->region_sig = region_sig;
+    cache->service_sig = service_sig;
+    cache->sk_len = sk_len;
     if (sk_len <= VE_TLS_SK_INLINE_CACHE_MAX) {
-        cache.sk_use_digest = 0;
+        cache->sk_use_digest = 0;
         if (sk_len > 0) {
-            memcpy(cache.sk_inline, sk, sk_len);
+            memcpy(cache->sk_inline, sk, sk_len);
         }
     } else {
         if (!sk_digest_ready) {
             ve_tls_sha256((const unsigned char *)sk, sk_len, sk_digest);
         }
-        cache.sk_use_digest = 1;
-        memcpy(cache.sk_digest, sk_digest, 32);
+        cache->sk_use_digest = 1;
+        memcpy(cache->sk_digest, sk_digest, 32);
     }
-    memcpy(cache.key, out32, 32);
-#undef VE_TLS_SK_INLINE_CACHE_MAX
+    memcpy(cache->key, out32, 32);
+    if (sk_digest_ready || sk_len > VE_TLS_SK_INLINE_CACHE_MAX) {
+        ve_tls_secure_zero(sk_digest, sizeof(sk_digest));
+    }
 #else
     ve_tls_signing_key(sk, date8, region, service, out32);
 #endif
@@ -1059,6 +1103,7 @@ int ve_tls_sign_v4_append_at(
     out = NULL;
     rc = 0;
 cleanup:
+    ve_tls_secure_zero(signing_key, sizeof(signing_key));
     ve_tls_free(out);
     ve_tls_free(canon_headers);
     ve_tls_free(signed_headers);

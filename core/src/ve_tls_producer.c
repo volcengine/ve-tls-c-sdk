@@ -40,24 +40,8 @@ static char * ve_tls_dup_cstr(const char * s) {
     return s ? ve_tls_strdup(s) : NULL;
 }
 
-static void ve_tls_secure_zero(void * p, size_t n) {
-    if (!p || n == 0) {
-        return;
-    }
-    volatile unsigned char * vp = (volatile unsigned char *)p;
-    while (n--) {
-        *vp++ = 0;
-    }
-}
-
-static void ve_tls_secure_free_str(char ** ps) {
-    if (!ps || !*ps) {
-        return;
-    }
-    size_t n = strlen(*ps);
-    ve_tls_secure_zero(*ps, n);
-    ve_tls_free(*ps);
-    *ps = NULL;
+static int ve_tls_count_fits_array(size_t count, size_t elem_size) {
+    return elem_size == 0 || count <= ((size_t)-1 / elem_size);
 }
 
 static int ve_tls_wait_buffer_space_locked(ve_tls_producer * producer, size_t need_bytes, int reserve_for_send);
@@ -68,6 +52,9 @@ static int ve_tls_copy_log_tags(const ve_tls_kv * tags, size_t count, ve_tls_kv 
     *out_count = 0;
     if (!tags || count == 0) {
         return 0;
+    }
+    if (!ve_tls_count_fits_array(count, sizeof(ve_tls_kv))) {
+        return -1;
     }
     ve_tls_kv * copy = (ve_tls_kv *)ve_tls_calloc(count, sizeof(ve_tls_kv));
     if (!copy) {
@@ -454,7 +441,7 @@ static ve_tls_result ve_tls_enqueue_ingress_raw_owned_locked(
             wait_ms = -1;
         }
     }
-    qrc = ve_tls_ingress_queue_push_locked(producer, norm_key, batch, flush, wait_ms);
+    qrc = ve_tls_ingress_queue_push_locked(producer, batch->norm_key, batch, flush, wait_ms);
     if (qrc != 0) {
         ve_tls_log_builder_free(batch);
         if (qrc == -2) {
@@ -934,7 +921,7 @@ static int ve_tls_tls_batch_flush_locked(ve_tls_producer * producer, const char 
             wait_ms = -1;
         }
     }
-    int qrc = ve_tls_ingress_queue_push_locked(producer, norm_key, ingress_batch, force_flush, wait_ms);
+    int qrc = ve_tls_ingress_queue_push_locked(producer, ingress_batch->norm_key, ingress_batch, force_flush, wait_ms);
     if (qrc != 0) {
         tb->logs = ingress_batch->logs;
         tb->logs_len = ingress_batch->logs_len;
@@ -2440,6 +2427,9 @@ ve_tls_result ve_tls_producer_add_log_kv_hashkey_with_id(ve_tls_producer * produ
     size_t * key_lens = key_lens_stack;
     size_t * val_lens = val_lens_stack;
     if (kv_count > 16) {
+        if (!ve_tls_count_fits_array(kv_count, sizeof(size_t))) {
+            return VE_TLS_DROP_ERROR;
+        }
         key_lens = (size_t *)ve_tls_malloc(kv_count * sizeof(size_t));
         val_lens = (size_t *)ve_tls_malloc(kv_count * sizeof(size_t));
         if (!key_lens || !val_lens) {
@@ -2503,6 +2493,9 @@ ve_tls_result ve_tls_producer_add_log_kv_time_parts_hashkey_with_id(ve_tls_produ
     size_t * key_lens = key_lens_stack;
     size_t * val_lens = val_lens_stack;
     if (kv_count > 16) {
+        if (!ve_tls_count_fits_array(kv_count, sizeof(size_t))) {
+            return VE_TLS_DROP_ERROR;
+        }
         key_lens = (size_t *)ve_tls_malloc(kv_count * sizeof(size_t));
         val_lens = (size_t *)ve_tls_malloc(kv_count * sizeof(size_t));
         if (!key_lens || !val_lens) {
@@ -2526,6 +2519,9 @@ ve_tls_result ve_tls_producer_add_log_kv_time_parts_hashkey_with_id(ve_tls_produ
 }
 
 static char * ve_tls_memdup0(const char * s, size_t n) {
+    if (n == (size_t)-1) {
+        return NULL;
+    }
     char * p = (char *)ve_tls_calloc(1, n + 1);
     if (!p) {
         return NULL;
@@ -2539,6 +2535,9 @@ static char * ve_tls_memdup0(const char * s, size_t n) {
 
 ve_tls_log_template * ve_tls_template_create(ve_tls_producer * producer, const char * const * keys, const size_t * key_lens, size_t key_count, const char * hash_key) {
     if (!producer || !keys || !key_lens || key_count == 0) {
+        return NULL;
+    }
+    if (!ve_tls_count_fits_array(key_count, sizeof(char *)) || !ve_tls_count_fits_array(key_count, sizeof(size_t))) {
         return NULL;
     }
     VE_TLS_ALLOC_SITE("template_create");
@@ -2623,6 +2622,9 @@ ve_tls_result ve_tls_template_add_values(ve_tls_log_template * tpl, int64_t time
     ve_tls_kv kvs_stack[16];
     ve_tls_kv * kvs = kvs_stack;
     if (tpl->key_count > 16) {
+        if (!ve_tls_count_fits_array(tpl->key_count, sizeof(ve_tls_kv))) {
+            return VE_TLS_DROP_ERROR;
+        }
         kvs = (ve_tls_kv *)ve_tls_calloc(tpl->key_count, sizeof(ve_tls_kv));
         if (!kvs) {
             return VE_TLS_DROP_ERROR;
@@ -2733,6 +2735,9 @@ ve_tls_result ve_tls_producer_add_log_with_len_time_parts_hashkey(ve_tls_produce
     ve_tls_kv kvs_stack[16];
     ve_tls_kv * kvs = kvs_stack;
     if (pair_count > 16) {
+        if (!ve_tls_count_fits_array(pair_count, sizeof(ve_tls_kv))) {
+            return VE_TLS_DROP_ERROR;
+        }
         kvs = (ve_tls_kv *)ve_tls_calloc(pair_count, sizeof(ve_tls_kv));
         if (!kvs) {
             return VE_TLS_DROP_ERROR;
