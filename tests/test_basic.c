@@ -52,6 +52,60 @@ typedef struct {
     int calls;
 } alloc_fail_state;
 
+static void alloc_fail_free(void * p, void * user_data);
+
+typedef struct {
+    int malloc_calls;
+    int calloc_calls;
+    int realloc_calls;
+    int strdup_calls;
+} alloc_fail_all_state;
+
+static void * alloc_fail_all_malloc(size_t n, void * user_data) {
+    alloc_fail_all_state * st = (alloc_fail_all_state *)user_data;
+    if (st) st->malloc_calls++;
+    (void)n;
+    return NULL;
+}
+
+static void * alloc_fail_all_calloc(size_t n, size_t size, void * user_data) {
+    alloc_fail_all_state * st = (alloc_fail_all_state *)user_data;
+    if (st) st->calloc_calls++;
+    (void)n;
+    (void)size;
+    return NULL;
+}
+
+static void * alloc_fail_all_realloc(void * p, size_t n, void * user_data) {
+    alloc_fail_all_state * st = (alloc_fail_all_state *)user_data;
+    if (st) st->realloc_calls++;
+    (void)p;
+    (void)n;
+    return NULL;
+}
+
+static char * alloc_fail_all_strdup(const char * s, void * user_data) {
+    alloc_fail_all_state * st = (alloc_fail_all_state *)user_data;
+    if (st) st->strdup_calls++;
+    (void)s;
+    return NULL;
+}
+
+static void set_alloc_fail_all(alloc_fail_all_state * st) {
+    ve_tls_alloc_hooks hooks;
+    memset(&hooks, 0, sizeof(hooks));
+    if (st) {
+        memset(st, 0, sizeof(*st));
+    }
+    hooks.malloc_fn = alloc_fail_all_malloc;
+    hooks.calloc_fn = alloc_fail_all_calloc;
+    hooks.realloc_fn = alloc_fail_all_realloc;
+    hooks.free_fn = alloc_fail_free;
+    hooks.strdup_fn = alloc_fail_all_strdup;
+    hooks.user_data = st;
+    ve_tls_alloc_set_hooks(&hooks);
+}
+
 static void * alloc_fail_malloc(size_t n, void * user_data) {
     alloc_fail_state * st = (alloc_fail_state *)user_data;
     if (!st) return malloc(n);
@@ -191,6 +245,77 @@ static void set_alloc_select_fail(alloc_select_fail_state * st, int fail_malloc_
     hooks.realloc_fn = alloc_select_realloc;
     hooks.free_fn = alloc_select_free;
     hooks.strdup_fn = alloc_select_strdup;
+    hooks.user_data = st;
+    ve_tls_alloc_set_hooks(&hooks);
+}
+
+typedef struct {
+    int fail_strdup_call;
+    int strdup_calls;
+    void * freed[32];
+    int freed_count;
+    int double_free;
+} alloc_double_free_state;
+
+static void * alloc_double_free_malloc(size_t n, void * user_data) {
+    (void)user_data;
+    return malloc(n);
+}
+
+static void * alloc_double_free_calloc(size_t n, size_t size, void * user_data) {
+    (void)user_data;
+    return calloc(n, size);
+}
+
+static void * alloc_double_free_realloc(void * p, size_t n, void * user_data) {
+    (void)user_data;
+    return realloc(p, n);
+}
+
+static void alloc_double_free_free(void * p, void * user_data) {
+    alloc_double_free_state * st = (alloc_double_free_state *)user_data;
+    if (!p) return;
+    if (st) {
+        for (int i = 0; i < st->freed_count; i++) {
+            if (st->freed[i] == p) {
+                st->double_free = 1;
+                return;
+            }
+        }
+        if (st->freed_count < (int)(sizeof(st->freed) / sizeof(st->freed[0]))) {
+            st->freed[st->freed_count++] = p;
+        }
+    }
+    free(p);
+}
+
+static char * alloc_double_free_strdup(const char * s, void * user_data) {
+    alloc_double_free_state * st = (alloc_double_free_state *)user_data;
+    if (st) {
+        st->strdup_calls++;
+        if (st->fail_strdup_call > 0 && st->strdup_calls == st->fail_strdup_call) {
+            return NULL;
+        }
+    }
+    if (!s) return NULL;
+    size_t n = strlen(s);
+    char * p = (char *)malloc(n + 1);
+    if (!p) return NULL;
+    memcpy(p, s, n);
+    p[n] = 0;
+    return p;
+}
+
+static void set_alloc_double_free_detector(alloc_double_free_state * st, int fail_strdup_call) {
+    ve_tls_alloc_hooks hooks;
+    memset(&hooks, 0, sizeof(hooks));
+    memset(st, 0, sizeof(*st));
+    st->fail_strdup_call = fail_strdup_call;
+    hooks.malloc_fn = alloc_double_free_malloc;
+    hooks.calloc_fn = alloc_double_free_calloc;
+    hooks.realloc_fn = alloc_double_free_realloc;
+    hooks.free_fn = alloc_double_free_free;
+    hooks.strdup_fn = alloc_double_free_strdup;
     hooks.user_data = st;
     ve_tls_alloc_set_hooks(&hooks);
 }
@@ -1710,6 +1835,39 @@ static int test_producer_update_endpoint_affects_url(void) {
     return 0;
 }
 
+static int test_producer_topic_id_percent_encoded_in_url(void) {
+    memset(g_sender_seen_url, 0, sizeof(g_sender_seen_url));
+    g_sender_hdr_ok = 0;
+    ve_tls_config cfg;
+    ve_tls_config_init(&cfg);
+    cfg.endpoint = "https://example.com";
+    cfg.region = "cn-beijing";
+    cfg.topic_id = "topic a&b=%/";
+    cfg.access_key_id = "ak2";
+    cfg.access_key_secret = "sk";
+    cfg.compress_type = "none";
+    cfg.send_thread_count = 1;
+    cfg.log_count_per_package = 1;
+    cfg.flush_interval_ms = 10;
+    cfg.retry_policy.max_attempts = 1;
+    cfg.http_client.do_request = test_http_sender_capture_url_and_auth_do;
+    cfg.http_client.free_response = test_http_ok_free;
+    ve_tls_producer * p = ve_tls_producer_create(&cfg);
+    if (!p) return -1;
+    ve_tls_kv kvs[1];
+    kvs[0].key = "k";
+    kvs[0].value = "v";
+    if (ve_tls_producer_add_log_kv(p, 1, kvs, 1, 1) != VE_TLS_OK) {
+        ve_tls_producer_destroy(p);
+        return -1;
+    }
+    for (int i = 0; i < 2000 && g_sender_seen_url[0] == 0; i++) cfg.platform.sleep_ms(1);
+    ve_tls_producer_destroy(p);
+    if (strstr(g_sender_seen_url, "https://example.com/PutLogs?TopicId=topic%20a%26b%3D%25%2F") == NULL) return -1;
+    if (strstr(g_sender_seen_url, "&b=") != NULL) return -1;
+    return 0;
+}
+
 static int test_producer_update_static_credentials_affects_auth_header(void) {
     g_sender_hdr_ok = 0;
     memset(g_sender_seen_url, 0, sizeof(g_sender_seen_url));
@@ -2903,6 +3061,37 @@ static int test_queue_delayed_promote_due_moves_to_ready(void) {
     return ok ? 0 : -1;
 }
 
+static int test_builder_to_send_task_strdupfail_does_not_double_free_body(void) {
+    ve_tls_log_group_builder * b = ve_tls_log_builder_create("hk");
+    if (!b) return -1;
+    ve_tls_kv kv;
+    kv.key = "k";
+    kv.value = "v";
+    size_t key_len = 1;
+    size_t val_len = 1;
+    if (ve_tls_log_builder_add_kv_lens(b, 1, 1, 0, 0, &kv, &key_len, &val_len, 1) != 0) {
+        ve_tls_log_builder_free(b);
+        return -1;
+    }
+
+    ve_tls_alloc_hooks saved;
+    memset(&saved, 0, sizeof(saved));
+    ve_tls_alloc_get_hooks(&saved);
+    alloc_double_free_state st;
+    set_alloc_double_free_detector(&st, 1);
+
+    ve_tls_producer p;
+    memset(&p, 0, sizeof(p));
+    ve_tls_send_task out;
+    memset(&out, 0, sizeof(out));
+    int rc = ve_tls_builder_to_send_task(&p, b, &out);
+
+    ve_tls_alloc_set_hooks(&saved);
+    ve_tls_log_builder_free(b);
+
+    return (rc != 0 && st.double_free == 0) ? 0 : -1;
+}
+
 static int test_ingress_queue_push_pop_order_and_drain_state(void) {
     ve_tls_config cfg;
     ve_tls_config_init(&cfg);
@@ -3586,29 +3775,29 @@ static void on_send_done_mgr_p2l_v2(
     (void)user_param;
     (void)start_id;
     (void)end_id;
-    g_mgr_p2l_done = 1;
+    __atomic_store_n(&g_mgr_p2l_done, 1, __ATOMIC_RELEASE);
     if (result != VE_TLS_DROP_ERROR || !error || !error->error_code || !error->error_message) {
-        g_mgr_p2l_ok = 0;
+        __atomic_store_n(&g_mgr_p2l_ok, 0, __ATOMIC_RELEASE);
         return;
     }
     snprintf(g_mgr_p2l_code, sizeof(g_mgr_p2l_code), "%s", error->error_code);
     snprintf(g_mgr_p2l_msg, sizeof(g_mgr_p2l_msg), "%s", error->error_message);
-    g_mgr_p2l_ok = 1;
+    __atomic_store_n(&g_mgr_p2l_ok, 1, __ATOMIC_RELEASE);
 }
 
 static int test_http_mgr_count_ok_do(ve_tls_http_client * client, const ve_tls_http_request * req, ve_tls_http_response * resp) {
     (void)client;
     (void)req;
     if (!resp) return -1;
-    g_mgr_p2l_http_calls++;
+    (void)__atomic_fetch_add(&g_mgr_p2l_http_calls, 1, __ATOMIC_RELEASE);
     resp->status_code = 200;
     resp->request_id = strdup("rid-ok");
     return 0;
 }
 
 static int test_manager_payload_too_large_after_comp_single(void) {
-    g_mgr_p2l_done = 0;
-    g_mgr_p2l_ok = 0;
+    __atomic_store_n(&g_mgr_p2l_done, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_mgr_p2l_ok, 0, __ATOMIC_RELEASE);
     g_http_called_unexpected = 0;
     memset(g_mgr_p2l_code, 0, sizeof(g_mgr_p2l_code));
     memset(g_mgr_p2l_msg, 0, sizeof(g_mgr_p2l_msg));
@@ -3640,17 +3829,17 @@ static int test_manager_payload_too_large_after_comp_single(void) {
         ve_tls_producer_destroy(p);
         return -1;
     }
-    for (int i = 0; i < 200 && !g_mgr_p2l_done; i++) cfg.platform.sleep_ms(10);
+    for (int i = 0; i < 200 && !__atomic_load_n(&g_mgr_p2l_done, __ATOMIC_ACQUIRE); i++) cfg.platform.sleep_ms(10);
     ve_tls_producer_destroy(p);
     if (g_http_called_unexpected) return -1;
-    if (!g_mgr_p2l_ok) return -1;
+    if (!__atomic_load_n(&g_mgr_p2l_ok, __ATOMIC_ACQUIRE)) return -1;
     if (strcmp(g_mgr_p2l_code, "PayloadTooLarge") != 0) return -1;
     if (strcmp(g_mgr_p2l_msg, "payload too large after compression") != 0) return -1;
     return 0;
 }
 
 static int test_manager_payload_too_large_split_into_two_requests(void) {
-    g_mgr_p2l_http_calls = 0;
+    __atomic_store_n(&g_mgr_p2l_http_calls, 0, __ATOMIC_RELEASE);
 
     ve_tls_kv kvs[1];
     kvs[0].key = "k1";
@@ -3727,18 +3916,18 @@ static int test_manager_payload_too_large_split_into_two_requests(void) {
         ve_tls_producer_destroy(p);
         return -1;
     }
-    for (int i = 0; i < 4000 && g_mgr_p2l_http_calls < 2; i++) cfg.platform.sleep_ms(1);
+    for (int i = 0; i < 4000 && __atomic_load_n(&g_mgr_p2l_http_calls, __ATOMIC_ACQUIRE) < 2; i++) cfg.platform.sleep_ms(1);
     ve_tls_producer_destroy(p);
-    if (g_mgr_p2l_http_calls >= 2) {
+    if (__atomic_load_n(&g_mgr_p2l_http_calls, __ATOMIC_ACQUIRE) >= 2) {
         return 0;
     }
     return -1;
 }
 
 static int test_manager_key_queue_limit_exceeded_drops(void) {
-    g_mgr_p2l_done = 0;
-    g_mgr_p2l_ok = 0;
-    g_mgr_p2l_http_calls = 0;
+    __atomic_store_n(&g_mgr_p2l_done, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_mgr_p2l_ok, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_mgr_p2l_http_calls, 0, __ATOMIC_RELEASE);
     g_http_called_unexpected = 0;
     memset(g_mgr_p2l_code, 0, sizeof(g_mgr_p2l_code));
     memset(g_mgr_p2l_msg, 0, sizeof(g_mgr_p2l_msg));
@@ -3770,22 +3959,22 @@ static int test_manager_key_queue_limit_exceeded_drops(void) {
         ve_tls_producer_destroy(p);
         return -1;
     }
-    for (int i = 0; i < 2000 && g_mgr_p2l_http_calls < 1; i++) cfg.platform.sleep_ms(1);
-    if (g_mgr_p2l_http_calls < 1) {
+    for (int i = 0; i < 2000 && __atomic_load_n(&g_mgr_p2l_http_calls, __ATOMIC_ACQUIRE) < 1; i++) cfg.platform.sleep_ms(1);
+    if (__atomic_load_n(&g_mgr_p2l_http_calls, __ATOMIC_ACQUIRE) < 1) {
         ve_tls_producer_destroy(p);
         return -1;
     }
 
-    g_mgr_p2l_done = 0;
-    g_mgr_p2l_ok = 0;
+    __atomic_store_n(&g_mgr_p2l_done, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_mgr_p2l_ok, 0, __ATOMIC_RELEASE);
     ve_tls_producer_set_send_done_v2(p, on_send_done_mgr_p2l_v2, NULL);
     if (ve_tls_producer_add_log_kv_hashkey(p, 0, "hk2", kvs, 1, 1) != VE_TLS_OK) {
         ve_tls_producer_destroy(p);
         return -1;
     }
-    for (int i = 0; i < 200 && !g_mgr_p2l_done; i++) cfg.platform.sleep_ms(10);
+    for (int i = 0; i < 200 && !__atomic_load_n(&g_mgr_p2l_done, __ATOMIC_ACQUIRE); i++) cfg.platform.sleep_ms(10);
     ve_tls_producer_destroy(p);
-    if (!g_mgr_p2l_ok) return -1;
+    if (!__atomic_load_n(&g_mgr_p2l_ok, __ATOMIC_ACQUIRE)) return -1;
     if (strcmp(g_mgr_p2l_code, "KeyQueueLimitExceeded") != 0) return -1;
     if (strcmp(g_mgr_p2l_msg, "key queue limit exceeded") != 0) return -1;
     return 0;
@@ -4615,6 +4804,48 @@ static int test_alloc_fail_add_log_kv_drops(void) {
     ve_tls_alloc_set_hooks(&saved);
     ve_tls_producer_destroy(p);
     return rc == VE_TLS_DROP_ERROR ? 0 : -1;
+}
+
+static int test_public_count_overflow_rejected_before_alloc(void) {
+    ve_tls_alloc_hooks saved;
+    memset(&saved, 0, sizeof(saved));
+    ve_tls_alloc_get_hooks(&saved);
+
+    ve_tls_producer p;
+    memset(&p, 0, sizeof(p));
+    ve_tls_kv kv;
+    kv.key = "k";
+    kv.value = "v";
+
+    alloc_fail_all_state st;
+    set_alloc_fail_all(&st);
+    size_t huge_kv_count = ((size_t)-1 / sizeof(size_t)) + 1;
+    ve_tls_result rc = ve_tls_producer_add_log_kv(&p, 1, &kv, huge_kv_count, 0);
+    int alloc_calls = st.malloc_calls + st.calloc_calls + st.realloc_calls + st.strdup_calls;
+    ve_tls_alloc_set_hooks(&saved);
+    if (rc != VE_TLS_DROP_ERROR || alloc_calls != 0) return -1;
+
+    const char * keys[1];
+    size_t key_lens[1];
+    keys[0] = "k";
+    key_lens[0] = 1;
+    set_alloc_fail_all(&st);
+    size_t huge_key_count = ((size_t)-1 / sizeof(char *)) + 1;
+    ve_tls_log_template * tpl = ve_tls_template_create(&p, keys, key_lens, huge_key_count, NULL);
+    alloc_calls = st.malloc_calls + st.calloc_calls + st.realloc_calls + st.strdup_calls;
+    ve_tls_alloc_set_hooks(&saved);
+    if (tpl != NULL || alloc_calls != 0) return -1;
+
+    const char * values[1];
+    size_t value_lens[1];
+    values[0] = "v";
+    value_lens[0] = 1;
+    set_alloc_fail_all(&st);
+    size_t huge_pair_count = ((size_t)-1 / sizeof(ve_tls_kv)) + 1;
+    rc = ve_tls_producer_add_log_with_len_time_parts_hashkey(&p, 1, 0, 0, NULL, keys, key_lens, values, value_lens, huge_pair_count, 0);
+    alloc_calls = st.malloc_calls + st.calloc_calls + st.realloc_calls + st.strdup_calls;
+    ve_tls_alloc_set_hooks(&saved);
+    return (rc == VE_TLS_DROP_ERROR && alloc_calls == 0) ? 0 : -1;
 }
 
 static int test_alloc_fail_env_init_fails(void) {
@@ -8036,6 +8267,7 @@ int main(void) {
     RUN(79, test_sender_default_hash_key_header_set());
     RUN(80, test_sender_transport_curl_retryable_flag());
     RUN(81, test_producer_update_endpoint_affects_url());
+    RUN(144, test_producer_topic_id_percent_encoded_in_url());
     RUN(82, test_producer_update_static_credentials_affects_auth_header());
     RUN(83, test_producer_common_rate_limit_and_breaker_paths());
     RUN(84, test_manager_payload_too_large_after_comp_single());
@@ -8062,6 +8294,7 @@ int main(void) {
     RUN(104, test_queue_push_front_pop_order());
     RUN(105, test_queue_idle_cleanup_removes_expired());
     RUN(106, test_queue_delayed_promote_due_moves_to_ready());
+    RUN(145, test_builder_to_send_task_strdupfail_does_not_double_free_body());
     RUN(119, test_ingress_queue_push_pop_order_and_drain_state());
     RUN(107, test_worker_send_queue_full_drop_sampled_paths());
     RUN(108, test_worker_send_queue_block_timeout_path());
@@ -8128,6 +8361,7 @@ int main(void) {
     RUN(33, test_env_init_idempotent());
     RUN(34, test_alloc_fail_add_log_raw_drops());
     RUN(35, test_alloc_fail_add_log_kv_drops());
+    RUN(146, test_public_count_overflow_rejected_before_alloc());
     RUN(36, test_alloc_fail_env_init_fails());
     RUN(74, test_alloc_failtrack_producer_create_no_leak());
     RUN(63, test_alloc_tracking_env_lifecycle_no_leak());
