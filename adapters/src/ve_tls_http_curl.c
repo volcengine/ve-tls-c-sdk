@@ -3,7 +3,6 @@
 #include <curl/curl.h>
 #include <stdlib.h>
 #include <string.h>
-#include <strings.h>
 #if !defined(_WIN32)
 #include <pthread.h>
 #endif
@@ -12,6 +11,26 @@ typedef struct {
     unsigned char * data;
     size_t size;
 } ve_tls_buf;
+
+static int ve_tls_ascii_tolower(int c) {
+    return (c >= 'A' && c <= 'Z') ? (c + ('a' - 'A')) : c;
+}
+
+static int ve_tls_ascii_strncasecmp(const char * a, const char * b, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        unsigned char ca = (unsigned char)a[i];
+        unsigned char cb = (unsigned char)b[i];
+        int da = ve_tls_ascii_tolower((int)ca);
+        int db = ve_tls_ascii_tolower((int)cb);
+        if (da != db) {
+            return da - db;
+        }
+        if (ca == 0) {
+            return 0;
+        }
+    }
+    return 0;
+}
 
 static size_t ve_tls_write_cb(char * ptr, size_t size, size_t nmemb, void * userdata) {
     if (nmemb != 0 && size > (size_t)-1 / nmemb) {
@@ -40,7 +59,7 @@ static size_t ve_tls_header_cb(char * ptr, size_t size, size_t nmemb, void * use
     size_t total = size * nmemb;
     ve_tls_http_response * resp = (ve_tls_http_response *)userdata;
     const char * key = "x-tls-requestid:";
-    if (total > strlen(key) && strncasecmp(ptr, key, strlen(key)) == 0) {
+    if (total > strlen(key) && ve_tls_ascii_strncasecmp(ptr, key, strlen(key)) == 0) {
         char * start = ptr + strlen(key);
         while (*start == ' ' || *start == '\t') {
             start++;
@@ -270,6 +289,8 @@ static int ve_tls_http_curl_do(ve_tls_http_client * client, const ve_tls_http_re
     resp->transport_kind = VE_TLS_TRANSPORT_NONE;
     resp->transport_code = 0;
     resp->transport_retryable = 0;
+    free(resp->error_code);
+    free(resp->error_message);
     resp->error_code = NULL;
     /* 成功路径必须同时清空 error_message：调用方常复用 ve_tls_http_response，
      * 残留旧错误信息会让上层误判本次成功请求"携带错误"。 */

@@ -209,11 +209,50 @@ static char * ve_tls_json_get_string(const unsigned char * json, size_t len, con
     return NULL;
 }
 
-static char * ve_tls_build_put_logs_url(const char * endpoint, const char * topic_id) {
+static int ve_tls_query_value_should_escape(unsigned char c) {
+    if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) {
+        return 0;
+    }
+    return !(c == '-' || c == '_' || c == '.' || c == '~');
+}
+
+static char * ve_tls_query_encode_value(const char * value) {
+    value = value ? value : "";
+    size_t len = strlen(value);
+    size_t escape_count = 0;
+    for (size_t i = 0; i < len; i++) {
+        if (ve_tls_query_value_should_escape((unsigned char)value[i])) {
+            escape_count++;
+        }
+    }
+    if (escape_count > (((size_t)-1 - len - 1) / 2)) {
+        return NULL;
+    }
+    size_t n = len + escape_count * 2 + 1;
+    char * out = (char *)ve_tls_malloc(n);
+    if (!out) {
+        return NULL;
+    }
+    size_t j = 0;
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)value[i];
+        if (ve_tls_query_value_should_escape(c)) {
+            out[j++] = '%';
+            out[j++] = "0123456789ABCDEF"[c >> 4];
+            out[j++] = "0123456789ABCDEF"[c & 0x0F];
+        } else {
+            out[j++] = (char)c;
+        }
+    }
+    out[j] = 0;
+    return out;
+}
+
+static char * ve_tls_build_put_logs_url(const char * endpoint, const char * encoded_topic_id) {
     endpoint = endpoint ? endpoint : "";
-    topic_id = topic_id ? topic_id : "";
+    encoded_topic_id = encoded_topic_id ? encoded_topic_id : "";
     size_t epn = strlen(endpoint);
-    size_t tpn = strlen(topic_id);
+    size_t tpn = strlen(encoded_topic_id);
     size_t mid = strlen("/PutLogs?TopicId=");
     size_t n = epn;
     if (n > (size_t)-1 - mid) return NULL;
@@ -226,7 +265,7 @@ static char * ve_tls_build_put_logs_url(const char * endpoint, const char * topi
     if (!url) {
         return NULL;
     }
-    snprintf(url, n, "%s/PutLogs?TopicId=%s", endpoint, topic_id);
+    snprintf(url, n, "%s/PutLogs?TopicId=%s", endpoint, encoded_topic_id);
     return url;
 }
 
@@ -445,8 +484,8 @@ static void ve_tls_owned_credentials_free(ve_tls_owned_credentials * owned) {
         return;
     }
     ve_tls_free(owned->access_key_id);
-    ve_tls_free(owned->access_key_secret);
-    ve_tls_free(owned->security_token);
+    ve_tls_secure_free_str(&owned->access_key_secret);
+    ve_tls_secure_free_str(&owned->security_token);
     memset(owned, 0, sizeof(*owned));
 }
 
@@ -455,8 +494,8 @@ static void ve_tls_static_cred_cache_free(ve_tls_static_cred_cache * cache) {
         return;
     }
     ve_tls_free(cache->access_key_id);
-    ve_tls_free(cache->access_key_secret);
-    ve_tls_free(cache->security_token);
+    ve_tls_secure_free_str(&cache->access_key_secret);
+    ve_tls_secure_free_str(&cache->security_token);
     memset(cache, 0, sizeof(*cache));
 }
 
@@ -497,8 +536,8 @@ static int ve_tls_static_cred_cache_refresh(ve_tls_producer * producer, ve_tls_s
     ve_tls_runtime_snapshot_release(snapshot);
     if (!ak || !sk) {
         ve_tls_free(ak);
-        ve_tls_free(sk);
-        ve_tls_free(tok);
+        ve_tls_secure_free_str(&sk);
+        ve_tls_secure_free_str(&tok);
         return -1;
     }
     ve_tls_static_cred_cache_free(cache);
@@ -770,14 +809,15 @@ static void ve_tls_send_cfg_cache_free(ve_tls_send_cfg_cache * s) {
 static void ve_tls_sender_thread_cache_clear(void) {
     ve_tls_send_cfg_cache_free(&g_send_cfg_cache);
     ve_tls_static_cred_cache_free(&g_static_cred_cache);
+    ve_tls_sign_thread_cache_clear();
 }
 
-static char * ve_tls_build_topic_query(const char * topic_id) {
-    if (!topic_id || topic_id[0] == 0) {
+static char * ve_tls_build_topic_query(const char * encoded_topic_id) {
+    if (!encoded_topic_id || encoded_topic_id[0] == 0) {
         return ve_tls_strdup("");
     }
     size_t qn = strlen("TopicId=");
-    size_t tpn = strlen(topic_id);
+    size_t tpn = strlen(encoded_topic_id);
     if (qn > (size_t)-1 - tpn) {
         return NULL;
     }
@@ -790,7 +830,7 @@ static char * ve_tls_build_topic_query(const char * topic_id) {
     if (!query) {
         return NULL;
     }
-    snprintf(query, qn, "TopicId=%s", topic_id);
+    snprintf(query, qn, "TopicId=%s", encoded_topic_id);
     return query;
 }
 
@@ -846,9 +886,15 @@ static int ve_tls_send_cfg_cache_refresh(ve_tls_producer * producer, ve_tls_send
         ve_tls_send_cfg_cache_free(&next);
         return -1;
     }
-    next.url = ve_tls_build_put_logs_url(next.endpoint, next.topic_id);
+    char * encoded_topic_id = ve_tls_query_encode_value(next.topic_id);
+    if (!encoded_topic_id) {
+        ve_tls_send_cfg_cache_free(&next);
+        return -2;
+    }
+    next.url = ve_tls_build_put_logs_url(next.endpoint, encoded_topic_id);
     next.host = ve_tls_extract_host(next.endpoint);
-    next.query = ve_tls_build_topic_query(next.topic_id);
+    next.query = ve_tls_build_topic_query(encoded_topic_id);
+    ve_tls_free(encoded_topic_id);
     if (!next.url || !next.host || !next.query) {
         ve_tls_send_cfg_cache_free(&next);
         return -2;

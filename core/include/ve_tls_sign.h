@@ -22,7 +22,8 @@
  *
  * 返回:   0 成功；非 0 失败（参数缺失/分配失败/签名内部错误）
  *
- * 线程安全:  无内部全局状态，多线程并发调用安全；调用方需保证入参缓冲不被并发修改。
+ * 线程安全:  内部仅使用当前线程的签名缓存，多线程并发调用安全；
+ *            调用方需保证入参缓冲不被并发修改。
  */
 int ve_tls_sign_v4_append(
     const char * access_key_id,
@@ -62,5 +63,13 @@ int ve_tls_sign_v4_append_at(
     const char * headers_in,
     char ** headers_out
 );
+
+/**
+ * 清理当前线程内的签名缓存。
+ *
+ * SDK sender 线程退出时会自动调用；直接使用签名 API 且希望主动缩短派生
+ * signing key 在当前线程内的驻留时间时，可在调用方线程中显式调用。
+ */
+void ve_tls_sign_thread_cache_clear(void);
 
 #endif
