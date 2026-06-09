@@ -4730,6 +4730,165 @@ static int test_env_destroy_timeout_then_recover(void) {
     return rc == VE_TLS_OK ? 0 : -1;
 }
 
+typedef struct {
+    ve_tls_result rc;
+    int32_t timeout_ms;
+} env_destroy_arg;
+
+static void * env_destroy_thread(void * arg) {
+    env_destroy_arg * a = (env_destroy_arg *)arg;
+    a->rc = ve_tls_env_destroy(a->timeout_ms);
+    return NULL;
+}
+
+typedef struct {
+    ve_tls_producer * producer;
+} env_producer_destroy_arg;
+
+static void * env_producer_destroy_thread(void * arg) {
+    env_producer_destroy_arg * a = (env_producer_destroy_arg *)arg;
+    ve_tls_producer_destroy(a->producer);
+    return NULL;
+}
+
+typedef struct {
+    ve_tls_producer * producer;
+    int stop;
+} env_notify_arg;
+
+static void * env_notify_thread(void * arg) {
+    env_notify_arg * a = (env_notify_arg *)arg;
+    while (!__atomic_load_n(&a->stop, __ATOMIC_ACQUIRE)) {
+        ve_tls_env_notify(a->producer);
+    }
+    return NULL;
+}
+
+static int test_env_destroy_concurrent_notify_no_uaf(void) {
+    ve_tls_platform platform;
+    ve_tls_platform_init_default(&platform);
+
+    for (int i = 0; i < 40; i++) {
+        if (ve_tls_env_init(1) != VE_TLS_OK) {
+            return -1;
+        }
+
+        ve_tls_config cfg;
+        ve_tls_config_init(&cfg);
+        cfg.endpoint = "https://example.com";
+        cfg.region = "cn-beijing";
+        cfg.topic_id = "t";
+        cfg.access_key_id = "ak";
+        cfg.access_key_secret = "sk";
+        cfg.retry_policy.max_attempts = 1;
+        cfg.flush_interval_ms = 0;
+        cfg.log_count_per_package = 1;
+        cfg.http_client.do_request = test_http_ok_do;
+        cfg.http_client.free_response = test_http_ok_free;
+        cfg.use_global_env = 1;
+
+        ve_tls_producer * p = ve_tls_producer_create(&cfg);
+        if (!p) {
+            (void)ve_tls_env_destroy(1000);
+            return -1;
+        }
+
+        env_notify_arg na;
+        memset(&na, 0, sizeof(na));
+        na.producer = p;
+        ve_tls_thread * notify_th = platform.thread_create(env_notify_thread, &na);
+        if (!notify_th) {
+            ve_tls_producer_destroy(p);
+            (void)ve_tls_env_destroy(1000);
+            return -1;
+        }
+
+        platform.sleep_ms(1);
+        ve_tls_result rc = ve_tls_env_destroy(5000);
+        platform.sleep_ms(1);
+        __atomic_store_n(&na.stop, 1, __ATOMIC_RELEASE);
+        platform.thread_join(notify_th);
+        ve_tls_producer_destroy(p);
+        if (rc != VE_TLS_OK) {
+            (void)ve_tls_env_destroy(1000);
+            return -1;
+        }
+    }
+
+    return ve_tls_env_destroy(1000) == VE_TLS_OK ? 0 : -1;
+}
+
+static int test_env_destroy_concurrent_producer_destroy_no_uaf(void) {
+    ve_tls_platform platform;
+    ve_tls_platform_init_default(&platform);
+
+    for (int i = 0; i < 30; i++) {
+        if (ve_tls_env_init(1) != VE_TLS_OK) {
+            return -1;
+        }
+
+        ve_tls_config cfg;
+        ve_tls_config_init(&cfg);
+        cfg.endpoint = "https://example.com";
+        cfg.region = "cn-beijing";
+        cfg.topic_id = "t";
+        cfg.access_key_id = "ak";
+        cfg.access_key_secret = "sk";
+        cfg.retry_policy.max_attempts = 1;
+        cfg.flush_interval_ms = 0;
+        cfg.log_count_per_package = 1;
+        cfg.http_client.do_request = test_http_ok_do;
+        cfg.http_client.free_response = test_http_ok_free;
+        cfg.use_global_env = 1;
+
+        ve_tls_producer * p = ve_tls_producer_create(&cfg);
+        if (!p) {
+            (void)ve_tls_env_destroy(1000);
+            return -1;
+        }
+
+        ve_tls_kv kvs[1];
+        kvs[0].key = "k1";
+        kvs[0].value = "v1";
+        if (ve_tls_producer_add_log_kv(p, 0, kvs, 1, 1) != VE_TLS_OK) {
+            ve_tls_producer_destroy(p);
+            (void)ve_tls_env_destroy(1000);
+            return -1;
+        }
+
+        env_destroy_arg da;
+        memset(&da, 0, sizeof(da));
+        da.timeout_ms = 5000;
+        ve_tls_thread * destroy_th = platform.thread_create(env_destroy_thread, &da);
+        if (!destroy_th) {
+            ve_tls_producer_destroy(p);
+            (void)ve_tls_env_destroy(1000);
+            return -1;
+        }
+
+        platform.sleep_ms(1);
+        env_producer_destroy_arg pa;
+        memset(&pa, 0, sizeof(pa));
+        pa.producer = p;
+        ve_tls_thread * producer_th = platform.thread_create(env_producer_destroy_thread, &pa);
+        if (!producer_th) {
+            platform.thread_join(destroy_th);
+            (void)ve_tls_env_destroy(1000);
+            ve_tls_producer_destroy(p);
+            return -1;
+        }
+
+        platform.thread_join(producer_th);
+        platform.thread_join(destroy_th);
+        if (da.rc != VE_TLS_OK) {
+            (void)ve_tls_env_destroy(1000);
+            return -1;
+        }
+    }
+
+    return ve_tls_env_destroy(1000) == VE_TLS_OK ? 0 : -1;
+}
+
 static int test_env_init_idempotent(void) {
     if (ve_tls_env_init(1) != VE_TLS_OK) {
         return -1;
@@ -8358,6 +8517,8 @@ int main(void) {
     RUN(30, test_env_shared_senders_multi_producer());
     RUN(31, test_env_create_without_init_fails());
     RUN(32, test_env_destroy_timeout_then_recover());
+    RUN(148, test_env_destroy_concurrent_notify_no_uaf());
+    RUN(147, test_env_destroy_concurrent_producer_destroy_no_uaf());
     RUN(33, test_env_init_idempotent());
     RUN(34, test_alloc_fail_add_log_raw_drops());
     RUN(35, test_alloc_fail_add_log_kv_drops());

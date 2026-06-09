@@ -70,6 +70,7 @@ if(VE_TLS_ENABLE_PTHREAD)
     set(THREADS_PREFER_PTHREAD_FLAG ON)
     find_package(Threads REQUIRED)
     target_link_libraries(ve_tls_core PRIVATE Threads::Threads)
+    target_compile_definitions(ve_tls_core PUBLIC VE_TLS_ENABLE_PTHREAD=1)
 endif()
 
 if(UNIX AND NOT APPLE)
