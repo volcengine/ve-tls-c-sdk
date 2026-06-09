@@ -52,7 +52,7 @@ for profile in $PROFILES; do
       --persistent-dir "$DIR" \
       2>&1) || true
 
-    produce_lps=$(echo "$output" | awk 'match($0, /produce_lps=[0-9.]+/) { print substr($0, RSTART+13, RLENGTH-13); exit }')
+    produce_lps=$(echo "$output" | awk 'match($0, /produce_lps=[0-9.]+/) { print substr($0, RSTART+12, RLENGTH-12); exit }')
     total_lps=$(echo "$output" | awk 'match($0, /total_lps=[0-9.]+/) { print substr($0, RSTART+10, RLENGTH-10); exit }')
     dropped=$(echo "$output" | awk 'match($0, /logs_dropped_total=[0-9]+/) { print substr($0, RSTART+19, RLENGTH-19); exit }')
 
@@ -86,7 +86,7 @@ for i in $(seq 1 $RUNS); do
     --duration-s 3 \
     2>&1) || true
 
-  produce_lps=$(echo "$output" | awk 'match($0, /produce_lps=[0-9.]+/) { print substr($0, RSTART+13, RLENGTH-13); exit }')
+  produce_lps=$(echo "$output" | awk 'match($0, /produce_lps=[0-9.]+/) { print substr($0, RSTART+12, RLENGTH-12); exit }')
   total_lps=$(echo "$output" | awk 'match($0, /total_lps=[0-9.]+/) { print substr($0, RSTART+10, RLENGTH-10); exit }')
 
   produce_arr+=("${produce_lps:-0}")

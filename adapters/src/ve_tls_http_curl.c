@@ -140,6 +140,23 @@ static int ve_tls_http_curl_do(ve_tls_http_client * client, const ve_tls_http_re
     if (!curl) {
         return -1;
     }
+    /* 入口统一清理上一次复用 resp 时残留的动态字段，避免成功/失败路径覆盖指针时泄漏旧的 strdup 内存。
+     * 调用方仍可在终止使用时显式调用 free_response 释放本次结果；free(NULL) 安全。 */
+    if (resp) {
+        free(resp->body);
+        free(resp->request_id);
+        free(resp->error_code);
+        free(resp->error_message);
+        resp->body = NULL;
+        resp->body_size = 0;
+        resp->request_id = NULL;
+        resp->error_code = NULL;
+        resp->error_message = NULL;
+        resp->status_code = 0;
+        resp->transport_kind = VE_TLS_TRANSPORT_NONE;
+        resp->transport_code = 0;
+        resp->transport_retryable = 0;
+    }
     curl_easy_reset(curl);
     ve_tls_buf body = {0};
     struct curl_slist * headers = NULL;
@@ -267,13 +284,8 @@ static int ve_tls_http_curl_do(ve_tls_http_client * client, const ve_tls_http_re
     resp->status_code = (int32_t)http_code;
     resp->body = body.data;
     resp->body_size = body.size;
-    resp->transport_kind = VE_TLS_TRANSPORT_NONE;
-    resp->transport_code = 0;
-    resp->transport_retryable = 0;
-    resp->error_code = NULL;
-    /* 成功路径必须同时清空 error_message：调用方常复用 ve_tls_http_response，
-     * 残留旧错误信息会让上层误判本次成功请求"携带错误"。 */
-    resp->error_message = NULL;
+    /* transport_kind / transport_code / transport_retryable / error_code / error_message
+     * 已在 do 入口统一清零；本路径仅写状态码与 body，避免重复赋值。 */
     curl_slist_free_all(headers);
     return 0;
 }
