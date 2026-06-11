@@ -92,6 +92,7 @@ static int test_android_binding_build_config_preserves_http_client_bridge(void) 
     bridge.free_response = test_http_bridge_free;
     bridge.user_data = &bridge_user_data;
     in.http_client = &bridge;
+    in.user_agent = "volc-tls-android/producer/v2.1.1";
 
     rc = ve_tls_android_binding_build_config(&in, &out, &runtime);
     if (rc != VE_TLS_OK) {
@@ -108,6 +109,10 @@ static int test_android_binding_build_config_preserves_http_client_bridge(void) 
     }
     if (out.http_client.user_data != bridge.user_data) {
         fprintf(stderr, "http_client.user_data was not preserved\n");
+        return 1;
+    }
+    if (out.user_agent != in.user_agent) {
+        fprintf(stderr, "user_agent was not preserved\n");
         return 1;
     }
 

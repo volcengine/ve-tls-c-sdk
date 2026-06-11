@@ -1100,9 +1100,12 @@ static int ve_tls_try_add_log_tls_batching(
     if (!should_merge && merge_bytes > 0 && g_tls_batch.builder->logs_len >= merge_bytes) {
         should_merge = 1;
     }
-    if (should_merge) {
+    int expose_for_timeout = !should_merge && producer->config.flush_interval_ms > 0;
+    if (should_merge || expose_for_timeout) {
         producer->config.platform.mutex_lock(producer->mutex);
-        int frc = ve_tls_tls_batch_flush_locked(producer, norm_key, g_tls_batch.builder, flush);
+        int frc = expose_for_timeout
+            ? ve_tls_tls_batch_merge_locked(producer, norm_key, g_tls_batch.builder)
+            : ve_tls_tls_batch_flush_locked(producer, norm_key, g_tls_batch.builder, flush);
         producer->config.platform.mutex_unlock(producer->mutex);
         if (frc != 0) {
             if (g_tls_batch.builder->logs_len > 0) {
