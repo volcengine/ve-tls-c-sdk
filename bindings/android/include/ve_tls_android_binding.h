@@ -32,6 +32,7 @@ typedef struct {
     const char * access_key_id;
     const char * access_key_secret;
     const char * security_token;
+    const char * user_agent;
     const char * source;
     const char * hash_key;
     const ve_tls_kv * log_tags;

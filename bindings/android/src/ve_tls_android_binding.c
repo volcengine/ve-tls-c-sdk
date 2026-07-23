@@ -12,6 +12,7 @@ static void ve_tls_android_config_view_copy_strings(const ve_tls_android_config_
     out->access_key_id = in->access_key_id;
     out->access_key_secret = in->access_key_secret;
     out->security_token = in->security_token;
+    out->user_agent = in->user_agent;
     out->hash_key = in->hash_key;
     out->persistent_file_path = in->persistent_file_path;
 }

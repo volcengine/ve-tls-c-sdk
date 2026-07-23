@@ -1526,6 +1526,63 @@ static int test_builder_flush_interval_respects_configured_deadline(void) {
     return 0;
 }
 
+static int test_tls_batch_flush_interval_visible_to_worker(void) {
+    memset(g_sender_time_t, 0, sizeof(g_sender_time_t));
+    g_sender_time_n = 0;
+
+    ve_tls_config cfg;
+    ve_tls_config_init(&cfg);
+    g_real_platform = cfg.platform;
+    g_fake_time = 6000;
+    cfg.platform.time_ms = test_fake_time_ms;
+    cfg.platform.sleep_ms = test_fake_sleep_ms;
+    cfg.platform.cond_timedwait_ms = test_fake_cond_timedwait_ms;
+
+    cfg.endpoint = "https://example.com";
+    cfg.region = "cn-beijing";
+    cfg.topic_id = "t";
+    cfg.access_key_id = "ak";
+    cfg.access_key_secret = "sk";
+    cfg.compress_type = "none";
+    cfg.flush_interval_ms = 10;
+    cfg.send_thread_count = 1;
+    cfg.ordered_send = 0;
+    cfg.log_count_per_package = 2;
+    cfg.retry_policy.max_attempts = 1;
+    cfg.http_client.do_request = test_http_sender_time_ok_do;
+    cfg.http_client.free_response = test_http_ok_free;
+
+    ve_tls_producer * p = ve_tls_producer_create(&cfg);
+    if (!p) return -1;
+
+    ve_tls_kv kvs[1];
+    kvs[0].key = "k";
+    kvs[0].value = "v";
+    if (ve_tls_producer_add_log_kv(p, 0, kvs, 1, 0) != VE_TLS_OK) {
+        ve_tls_producer_destroy(p);
+        return -1;
+    }
+    cfg.platform.mutex_lock(p->mutex);
+    cfg.platform.cond_signal(p->cond);
+    cfg.platform.mutex_unlock(p->mutex);
+    for (int i = 0; i < 2000; i++) {
+        g_real_platform.sleep_ms(1);
+        if (g_sender_time_n >= 1) break;
+    }
+    if (g_sender_time_n < 1) {
+        fprintf(stderr, "tls_batch_flush_deadline: no send fake_now=%lld\n", (long long)g_fake_time);
+        ve_tls_producer_destroy(p);
+        return -1;
+    }
+    ve_tls_producer_destroy(p);
+    if (g_sender_time_t[0] - 6000 < 10 || g_sender_time_t[0] - 6000 > 20) {
+        fprintf(stderr, "tls_batch_flush_deadline: send_at=%lld fake_now=%lld\n",
+            (long long)g_sender_time_t[0], (long long)g_fake_time);
+        return -1;
+    }
+    return 0;
+}
+
 static int test_sender_idle_wait_without_delayed_does_not_spin_timedwait(void) {
     ve_tls_config cfg;
     ve_tls_config_init(&cfg);
@@ -12983,7 +13040,8 @@ static int t_p9_global_env_create(void) {
 
 int main(void) {
     int rc = 0;
-#define RUN(code, fn) do { if ((fn) != 0) { rc = (code); goto end; } } while (0)
+    const char * filter = getenv("VE_TLS_TEST_FILTER");
+#define RUN(code, fn) do { if (!filter || strstr(#fn, filter)) { int _test_rc = (fn); if (_test_rc != 0) { fprintf(stderr, "test failed: %s rc=%d code=%d\n", #fn, _test_rc, (code)); rc = (code); goto end; } } } while (0)
 
     RUN(1, test_sha256());
     RUN(2, test_proto());
@@ -13076,6 +13134,7 @@ int main(void) {
     RUN(123, test_sign_matches_go_reference_with_fixed_xdate());
     RUN(171, test_sign_preserves_encoded_query_escapes());
     RUN(146, test_builder_flush_interval_respects_configured_deadline());
+    RUN(172, test_tls_batch_flush_interval_visible_to_worker());
     RUN(147, test_sender_idle_wait_without_delayed_does_not_spin_timedwait());
     RUN(118, test_sign_cache_secret_change_same_pointer_effective());
     RUN(17, test_send_queue_blocking_push());
