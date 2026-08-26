@@ -204,6 +204,77 @@ static void set_alloc_select_fail(alloc_select_fail_state * st, int fail_malloc_
 }
 
 typedef struct {
+    int fail_strdup_call;
+    int strdup_calls;
+    void * freed[32];
+    int freed_count;
+    int double_free;
+} alloc_double_free_state;
+
+static void * alloc_double_free_malloc(size_t n, void * user_data) {
+    (void)user_data;
+    return malloc(n);
+}
+
+static void * alloc_double_free_calloc(size_t n, size_t size, void * user_data) {
+    (void)user_data;
+    return calloc(n, size);
+}
+
+static void * alloc_double_free_realloc(void * p, size_t n, void * user_data) {
+    (void)user_data;
+    return realloc(p, n);
+}
+
+static void alloc_double_free_free(void * p, void * user_data) {
+    alloc_double_free_state * st = (alloc_double_free_state *)user_data;
+    if (!p) return;
+    if (st) {
+        for (int i = 0; i < st->freed_count; i++) {
+            if (st->freed[i] == p) {
+                st->double_free = 1;
+                return;
+            }
+        }
+        if (st->freed_count < (int)(sizeof(st->freed) / sizeof(st->freed[0]))) {
+            st->freed[st->freed_count++] = p;
+        }
+    }
+    free(p);
+}
+
+static char * alloc_double_free_strdup(const char * s, void * user_data) {
+    alloc_double_free_state * st = (alloc_double_free_state *)user_data;
+    if (st) {
+        st->strdup_calls++;
+        if (st->fail_strdup_call > 0 && st->strdup_calls == st->fail_strdup_call) {
+            return NULL;
+        }
+    }
+    if (!s) return NULL;
+    size_t n = strlen(s);
+    char * p = (char *)malloc(n + 1);
+    if (!p) return NULL;
+    memcpy(p, s, n);
+    p[n] = 0;
+    return p;
+}
+
+static void set_alloc_double_free_detector(alloc_double_free_state * st, int fail_strdup_call) {
+    ve_tls_alloc_hooks hooks;
+    memset(&hooks, 0, sizeof(hooks));
+    memset(st, 0, sizeof(*st));
+    st->fail_strdup_call = fail_strdup_call;
+    hooks.malloc_fn = alloc_double_free_malloc;
+    hooks.calloc_fn = alloc_double_free_calloc;
+    hooks.realloc_fn = alloc_double_free_realloc;
+    hooks.free_fn = alloc_double_free_free;
+    hooks.strdup_fn = alloc_double_free_strdup;
+    hooks.user_data = st;
+    ve_tls_alloc_set_hooks(&hooks);
+}
+
+typedef struct {
     int64_t live;
 } alloc_track_state;
 
@@ -1524,6 +1595,35 @@ static int test_builder_flush_interval_respects_configured_deadline(void) {
         return -1;
     }
     return 0;
+}
+
+static int test_builder_to_send_task_strdupfail_does_not_double_free_body(void) {
+    ve_tls_log_group_builder * b = ve_tls_log_builder_create("hk");
+    if (!b) return -1;
+    ve_tls_kv kv = {"k", "v"};
+    size_t key_len = 1;
+    size_t val_len = 1;
+    if (ve_tls_log_builder_add_kv_lens(b, 1, 1, 0, 0, &kv, &key_len, &val_len, 1) != 0) {
+        ve_tls_log_builder_free(b);
+        return -1;
+    }
+
+    ve_tls_alloc_hooks saved;
+    memset(&saved, 0, sizeof(saved));
+    ve_tls_alloc_get_hooks(&saved);
+    alloc_double_free_state st;
+    set_alloc_double_free_detector(&st, 1);
+
+    ve_tls_producer p;
+    memset(&p, 0, sizeof(p));
+    ve_tls_send_task out;
+    memset(&out, 0, sizeof(out));
+    int rc = ve_tls_builder_to_send_task(&p, b, &out);
+
+    ve_tls_alloc_set_hooks(&saved);
+    ve_tls_log_builder_free(b);
+
+    return (rc != 0 && st.strdup_calls == 1 && st.double_free == 0 && out.body == NULL) ? 0 : -1;
 }
 
 static int test_tls_batch_flush_interval_visible_to_worker(void) {
@@ -13134,6 +13234,7 @@ int main(void) {
     RUN(123, test_sign_matches_go_reference_with_fixed_xdate());
     RUN(171, test_sign_preserves_encoded_query_escapes());
     RUN(146, test_builder_flush_interval_respects_configured_deadline());
+    RUN(181, test_builder_to_send_task_strdupfail_does_not_double_free_body());
     RUN(172, test_tls_batch_flush_interval_visible_to_worker());
     RUN(147, test_sender_idle_wait_without_delayed_does_not_spin_timedwait());
     RUN(118, test_sign_cache_secret_change_same_pointer_effective());
