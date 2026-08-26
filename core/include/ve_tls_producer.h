@@ -198,7 +198,8 @@ ve_tls_producer * ve_tls_producer_create(const ve_tls_config * config);
 /*
  * Updates the active send target for subsequent requests. Requests that have already
  * entered the send path may still use the previously captured endpoint/region/topic,
- * but new requests are expected to converge quickly to the refreshed target.
+ * but new requests are expected to converge quickly to the refreshed target. Persistent
+ * backlog is not bound to its original target and will also use the refreshed target.
  */
 ve_tls_result ve_tls_producer_update_endpoint(ve_tls_producer * producer, const char * endpoint, const char * region, const char * topic_id);
 ve_tls_result ve_tls_producer_update_static_credentials(ve_tls_producer * producer, const char * access_key_id, const char * access_key_secret, const char * security_token);

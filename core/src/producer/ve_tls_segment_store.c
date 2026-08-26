@@ -35,6 +35,14 @@ static uint32_t crc32_update_local(uint32_t crc, unsigned char b) {
     return crc;
 }
 
+static uint32_t crc32_bytes_local(const unsigned char * buf, size_t size) {
+    uint32_t crc = 0xFFFFFFFFu;
+    for (size_t i = 0; i < size; i++) {
+        crc = crc32_update_local(crc, buf[i]);
+    }
+    return crc ^ 0xFFFFFFFFu;
+}
+
 static int read_payload_crc(ve_tls_platform * platform, ve_tls_file * file, uint64_t payload_size, uint32_t * out_crc) {
     unsigned char buf[4096];
     uint64_t remain = payload_size;
@@ -59,6 +67,7 @@ static int read_payload_crc(ve_tls_platform * platform, ve_tls_file * file, uint
 static int validate_ext_stream(const unsigned char * ext, uint32_t ext_len) {
     uint32_t pos = 0;
     int has_hash_key = 0;
+    int has_metadata = 0;
     while (pos < ext_len) {
         uint8_t type;
         uint16_t len;
@@ -76,6 +85,22 @@ static int validate_ext_stream(const unsigned char * ext, uint32_t ext_len) {
                 return -1;
             }
             has_hash_key = 1;
+        } else if (type == VE_TLS_PERSISTENT_EXT_TYPE_METADATA) {
+            uint32_t metadata_version;
+            uint32_t metadata_crc;
+            if (has_metadata || len != 16) {
+                return -1;
+            }
+            metadata_version = read_u32_le_local(ext + pos);
+            metadata_crc = read_u32_le_local(ext + pos + 12);
+            if (crc32_bytes_local(ext + pos, 12) != metadata_crc) {
+                return -1;
+            }
+            if (metadata_version != VE_TLS_PERSISTENT_RECORD_VERSION_LEGACY &&
+                metadata_version != VE_TLS_PERSISTENT_RECORD_VERSION_CURRENT) {
+                return VE_TLS_SEGMENT_STORE_UNSUPPORTED_VERSION;
+            }
+            has_metadata = 1;
         }
         pos += (uint32_t)len;
     }
@@ -264,7 +289,16 @@ static int scan_segment_file(ve_tls_platform * platform, const char * path, uint
         }
         payload_size = (uint64_t)total_len - (uint64_t)VE_TLS_PERSISTENT_RECORD_HEADER_SIZE - (uint64_t)ext_len;
         if (ext_len > 0) {
-            if (read_full(platform, file, ext_buf, ext_len) != 0 || validate_ext_stream(ext_buf, ext_len) != 0) {
+            int ext_rc;
+            if (read_full(platform, file, ext_buf, ext_len) != 0) {
+                break;
+            }
+            ext_rc = validate_ext_stream(ext_buf, ext_len);
+            if (ext_rc == VE_TLS_SEGMENT_STORE_UNSUPPORTED_VERSION) {
+                platform->file_close(file);
+                return ext_rc;
+            }
+            if (ext_rc != 0) {
                 break;
             }
         }
@@ -298,11 +332,13 @@ static int open_active_segment(ve_tls_segment_store * store, uint32_t segment_id
     ve_tls_path_info info;
     uint64_t valid_end = 0;
     uint64_t record_count = 0;
+    int scan_rc;
     if (ve_tls_segment_store_get_segment_path(store, segment_id, path, sizeof(path)) != 0) {
         return -1;
     }
-    if (scan_segment_file(store->platform, path, &valid_end, &record_count, NULL) != 0) {
-        return -1;
+    scan_rc = scan_segment_file(store->platform, path, &valid_end, &record_count, NULL);
+    if (scan_rc != 0) {
+        return scan_rc;
     }
     if (store->platform->path_stat(path, &info) != 0) {
         return -1;
@@ -508,14 +544,16 @@ int ve_tls_segment_store_repair_tail(ve_tls_segment_store * store, uint32_t segm
     ve_tls_file * file;
     uint64_t valid_end = 0;
     uint64_t record_count = 0;
+    int scan_rc;
     if (!store || !store->platform) {
         return -1;
     }
     if (ve_tls_segment_store_get_segment_path(store, segment_id, path, sizeof(path)) != 0) {
         return -1;
     }
-    if (scan_segment_file(store->platform, path, &valid_end, &record_count, NULL) != 0) {
-        return -1;
+    scan_rc = scan_segment_file(store->platform, path, &valid_end, &record_count, NULL);
+    if (scan_rc != 0) {
+        return scan_rc;
     }
     file = store->platform->file_open(path, VE_TLS_FILE_OPEN_RDWR, 0644);
     if (!file) {

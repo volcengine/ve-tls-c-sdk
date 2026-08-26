@@ -1579,6 +1579,8 @@ ve_tls_producer * ve_tls_producer_create(const ve_tls_config * config) {
 }
 
 ve_tls_result ve_tls_producer_update_endpoint(ve_tls_producer * producer, const char * endpoint, const char * region, const char * topic_id) {
+    uint64_t backlog_records = 0;
+    uint64_t backlog_bytes = 0;
     if (!producer) {
         return VE_TLS_INVALID;
     }
@@ -1631,6 +1633,23 @@ ve_tls_result ve_tls_producer_update_endpoint(ve_tls_producer * producer, const 
         return VE_TLS_DROP_ERROR;
     }
     producer->config.platform.mutex_unlock(producer->mutex);
+    if (changed && producer->persistent) {
+        if (producer->persistent_mutex) {
+            producer->config.platform.mutex_lock(producer->persistent_mutex);
+        }
+        backlog_records = producer->persistent->current_records;
+        backlog_bytes = producer->persistent->current_bytes;
+        if (producer->persistent_mutex) {
+            producer->config.platform.mutex_unlock(producer->persistent_mutex);
+        }
+    }
+    if (backlog_records > 0) {
+        ve_tls_metrics_emit(
+            producer,
+            "persistent_backlog_retarget",
+            backlog_records > (uint64_t)INT64_MAX ? INT64_MAX : (int64_t)backlog_records,
+            backlog_bytes > (uint64_t)INT64_MAX ? INT64_MAX : (int64_t)backlog_bytes);
+    }
     ve_tls_metrics_emit(producer, "config_update_endpoint", 1, 0);
     return VE_TLS_OK;
 }

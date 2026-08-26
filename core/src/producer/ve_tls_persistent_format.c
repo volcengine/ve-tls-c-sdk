@@ -57,6 +57,13 @@ static uint32_t crc32_bytes(const unsigned char * buf, size_t size) {
     return crc ^ 0xFFFFFFFFu;
 }
 
+static size_t ext_metadata_size(const ve_tls_persistent_record_view * view) {
+    if (!view || view->record_version != VE_TLS_PERSISTENT_RECORD_VERSION_CURRENT) {
+        return 0;
+    }
+    return (size_t)4 + 16;
+}
+
 static size_t ext_hash_key_size(const ve_tls_persistent_record_view * view) {
     size_t hk_len;
     if (!view || !view->hash_key || view->hash_key[0] == 0) {
@@ -74,10 +81,16 @@ size_t ve_tls_persistent_record_encoded_size(const ve_tls_persistent_record_view
     if (!view || !view->payload || view->payload_size == 0) {
         return 0;
     }
+    if (view->record_version != 0 &&
+        view->record_version != VE_TLS_PERSISTENT_RECORD_VERSION_LEGACY &&
+        view->record_version != VE_TLS_PERSISTENT_RECORD_VERSION_CURRENT) {
+        return 0;
+    }
     ext_len = ext_hash_key_size(view);
     if (view->hash_key && view->hash_key[0] != 0 && ext_len == 0) {
         return 0;
     }
+    ext_len += ext_metadata_size(view);
     if (ext_len > VE_TLS_PERSISTENT_RECORD_EXT_MAX) {
         return 0;
     }
@@ -87,6 +100,8 @@ size_t ve_tls_persistent_record_encoded_size(const ve_tls_persistent_record_view
 int ve_tls_persistent_record_encode(unsigned char * out, size_t out_cap, const ve_tls_persistent_record_view * view, size_t * out_size) {
     size_t total_len;
     size_t ext_len;
+    size_t hash_key_ext_len;
+    size_t metadata_ext_len;
     uint32_t flags;
     size_t pos;
     if (!out || !view || !out_size) {
@@ -96,7 +111,9 @@ int ve_tls_persistent_record_encode(unsigned char * out, size_t out_cap, const v
     if (total_len == 0 || out_cap < total_len) {
         return -1;
     }
-    ext_len = ext_hash_key_size(view);
+    hash_key_ext_len = ext_hash_key_size(view);
+    metadata_ext_len = ext_metadata_size(view);
+    ext_len = hash_key_ext_len + metadata_ext_len;
     flags = view->flags;
     if (ext_len > 0) {
         flags |= VE_TLS_PERSISTENT_RECORD_FLAG_HAS_EXT;
@@ -110,13 +127,22 @@ int ve_tls_persistent_record_encode(unsigned char * out, size_t out_cap, const v
     write_u32_le(out + 20, crc32_bytes(view->payload, view->payload_size));
     write_u32_le(out + 24, (uint32_t)ext_len);
     pos = VE_TLS_PERSISTENT_RECORD_HEADER_SIZE;
-    if (ext_len > 0) {
+    if (hash_key_ext_len > 0) {
         size_t hk_len = strlen(view->hash_key);
         out[pos] = VE_TLS_PERSISTENT_EXT_TYPE_HASH_KEY;
         out[pos + 1] = 0;
         write_u16_le(out + pos + 2, (uint16_t)hk_len);
         memcpy(out + pos + 4, view->hash_key, hk_len);
-        pos += ext_len;
+        pos += hash_key_ext_len;
+    }
+    if (metadata_ext_len > 0) {
+        out[pos] = VE_TLS_PERSISTENT_EXT_TYPE_METADATA;
+        out[pos + 1] = 0;
+        write_u16_le(out + pos + 2, 16);
+        write_u32_le(out + pos + 4, view->record_version);
+        write_u64_le(out + pos + 8, (uint64_t)view->enqueue_time_ms);
+        write_u32_le(out + pos + 16, crc32_bytes(out + pos + 4, 12));
+        pos += metadata_ext_len;
     }
     memcpy(out + pos, view->payload, view->payload_size);
     *out_size = total_len;
@@ -131,10 +157,12 @@ int ve_tls_persistent_record_decode(const unsigned char * buf, size_t size, ve_t
     uint32_t ext_len;
     size_t payload_size;
     size_t pos;
+    int has_metadata = 0;
     if (!buf || !out || size < VE_TLS_PERSISTENT_RECORD_HEADER_SIZE) {
         return -1;
     }
     memset(out, 0, sizeof(*out));
+    out->record_version = VE_TLS_PERSISTENT_RECORD_VERSION_LEGACY;
     magic = read_u32_le(buf);
     total_len = read_u32_le(buf + 4);
     flags = read_u32_le(buf + 16);
@@ -175,6 +203,27 @@ int ve_tls_persistent_record_decode(const unsigned char * buf, size_t size, ve_t
                 }
                 memcpy(out->hash_key, buf + pos, len);
                 out->hash_key[len] = 0;
+            } else if (type == VE_TLS_PERSISTENT_EXT_TYPE_METADATA) {
+                uint32_t metadata_version;
+                uint32_t metadata_crc;
+                if (has_metadata || len != 16) {
+                    ve_tls_persistent_record_free(out);
+                    return -1;
+                }
+                metadata_version = read_u32_le(buf + pos);
+                metadata_crc = read_u32_le(buf + pos + 12);
+                if (crc32_bytes(buf + pos, 12) != metadata_crc) {
+                    ve_tls_persistent_record_free(out);
+                    return -1;
+                }
+                if (metadata_version != VE_TLS_PERSISTENT_RECORD_VERSION_LEGACY &&
+                    metadata_version != VE_TLS_PERSISTENT_RECORD_VERSION_CURRENT) {
+                    ve_tls_persistent_record_free(out);
+                    return VE_TLS_PERSISTENT_RECORD_UNSUPPORTED_VERSION;
+                }
+                has_metadata = 1;
+                out->record_version = metadata_version;
+                out->enqueue_time_ms = (int64_t)read_u64_le(buf + pos + 4);
             }
             pos += len;
         }

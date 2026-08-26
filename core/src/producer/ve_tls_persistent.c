@@ -13,6 +13,8 @@
 #define VE_TLS_PERSISTENT_CHECKPOINT_ACK_DELTA_THRESHOLD 64
 #define VE_TLS_PERSISTENT_DEFAULT_HIGH_WATERMARK_PCT 85
 #define VE_TLS_PERSISTENT_DEFAULT_LOW_WATERMARK_PCT 70
+#define VE_TLS_PERSISTENT_MANIFEST_VERSION_CURRENT 2
+#define VE_TLS_PERSISTENT_MANIFEST_MAX_BYTES 4096
 
 static uint64_t add_u64_saturating(uint64_t left, uint64_t right) {
     return right > UINT64_MAX - left ? UINT64_MAX : left + right;
@@ -52,18 +54,35 @@ static int64_t persistent_now_ms(ve_tls_persistent * persistent) {
     return persistent->platform->time_ms();
 }
 
+static int write_manifest_full(ve_tls_platform * platform, ve_tls_file * file, const void * data, size_t size) {
+    size_t offset = 0;
+    while (offset < size) {
+        int64_t written = platform->file_write(file, (const unsigned char *)data + offset, size - offset);
+        if (written <= 0) {
+            return -1;
+        }
+        offset += (size_t)written;
+    }
+    return 0;
+}
+
 static int write_manifest(const ve_tls_persistent_options * options) {
     char path[640];
+    char tmp_path[640];
     char body[512];
     ve_tls_file * file;
     size_t body_len;
-    if (!options || !options->platform || path_join(path, sizeof(path), options->dir_path, "manifest") != 0) {
+    int rc = -1;
+    if (!options || !options->platform ||
+        path_join(path, sizeof(path), options->dir_path, "manifest") != 0 ||
+        path_join(tmp_path, sizeof(tmp_path), options->dir_path, "manifest.tmp") != 0) {
         return -1;
     }
     body_len = (size_t)snprintf(
         body,
         sizeof(body),
-        "format_version=1\ninstance_id=%s\nsegment_max_bytes=%llu\nsegment_max_records=%llu\nmax_bytes=%llu\nmax_records=%llu\nmax_segments=%u\n",
+        "format_version=%d\ninstance_id=%s\nsegment_max_bytes=%llu\nsegment_max_records=%llu\nmax_bytes=%llu\nmax_records=%llu\nmax_segments=%u\ntarget_policy=current_target\n",
+        VE_TLS_PERSISTENT_MANIFEST_VERSION_CURRENT,
         options->instance_id ? options->instance_id : "",
         (unsigned long long)options->segment_max_bytes,
         (unsigned long long)options->segment_max_records,
@@ -74,16 +93,164 @@ static int write_manifest(const ve_tls_persistent_options * options) {
     if (body_len >= sizeof(body)) {
         return -1;
     }
-    file = options->platform->file_open(path, VE_TLS_FILE_OPEN_WRONLY | VE_TLS_FILE_OPEN_CREATE | VE_TLS_FILE_OPEN_TRUNC, 0644);
+    file = options->platform->file_open(tmp_path, VE_TLS_FILE_OPEN_WRONLY | VE_TLS_FILE_OPEN_CREATE | VE_TLS_FILE_OPEN_TRUNC, 0644);
     if (!file) {
         return -1;
     }
-    if (options->platform->file_write(file, body, body_len) != (int64_t)body_len || options->platform->file_fsync(file) != 0) {
-        options->platform->file_close(file);
-        return -1;
+    if (write_manifest_full(options->platform, file, body, body_len) == 0 &&
+        options->platform->file_fsync(file) == 0) {
+        rc = 0;
     }
     options->platform->file_close(file);
+    if (rc != 0 || options->platform->path_rename(tmp_path, path) != 0) {
+        (void)options->platform->path_remove(tmp_path);
+        return -1;
+    }
     return 0;
+}
+
+static int consume_manifest_line(
+    const char * body,
+    size_t body_size,
+    size_t * offset,
+    const char * key,
+    const char ** value,
+    size_t * value_len
+) {
+    size_t key_len;
+    size_t line_end;
+    size_t value_start;
+    if (!body || !offset || !key || !value || !value_len || *offset >= body_size) {
+        return -1;
+    }
+    key_len = strlen(key);
+    line_end = *offset;
+    while (line_end < body_size && body[line_end] != '\n') {
+        line_end++;
+    }
+    if (line_end >= body_size || line_end - *offset < key_len + 1 ||
+        memcmp(body + *offset, key, key_len) != 0 || body[*offset + key_len] != '=') {
+        return -1;
+    }
+    value_start = *offset + key_len + 1;
+    *value = body + value_start;
+    *value_len = line_end - value_start;
+    *offset = line_end + 1;
+    return 0;
+}
+
+static int manifest_value_is_u64(const char * value, size_t value_len) {
+    uint64_t parsed = 0;
+    if (!value || value_len == 0) {
+        return 0;
+    }
+    for (size_t i = 0; i < value_len; i++) {
+        if (value[i] < '0' || value[i] > '9') {
+            return 0;
+        }
+        uint64_t digit = (uint64_t)(value[i] - '0');
+        if (parsed > (UINT64_MAX - digit) / 10) {
+            return 0;
+        }
+        parsed = parsed * 10 + digit;
+    }
+    return 1;
+}
+
+static int validate_manifest_body(const char * body, size_t body_size, int * out_version) {
+    static const char * numeric_keys[] = {
+        "segment_max_bytes",
+        "segment_max_records",
+        "max_bytes",
+        "max_records",
+        "max_segments"
+    };
+    const char * value;
+    size_t value_len;
+    size_t offset = 0;
+    int version;
+    if (!body || body_size == 0 || !out_version ||
+        consume_manifest_line(body, body_size, &offset, "format_version", &value, &value_len) != 0) {
+        return -1;
+    }
+    if (value_len == 1 && value[0] == '1') {
+        version = 1;
+    } else if (value_len == 1 && value[0] == '2') {
+        version = 2;
+    } else {
+        return -1;
+    }
+    if (consume_manifest_line(body, body_size, &offset, "instance_id", &value, &value_len) != 0) {
+        return -1;
+    }
+    if (memchr(value, 0, value_len) != NULL) {
+        return -1;
+    }
+    for (size_t i = 0; i < sizeof(numeric_keys) / sizeof(numeric_keys[0]); i++) {
+        if (consume_manifest_line(body, body_size, &offset, numeric_keys[i], &value, &value_len) != 0 ||
+            !manifest_value_is_u64(value, value_len)) {
+            return -1;
+        }
+    }
+    if (version == VE_TLS_PERSISTENT_MANIFEST_VERSION_CURRENT) {
+        if (consume_manifest_line(body, body_size, &offset, "target_policy", &value, &value_len) != 0 ||
+            value_len != strlen("current_target") ||
+            memcmp(value, "current_target", value_len) != 0) {
+            return -1;
+        }
+    }
+    if (offset != body_size) {
+        return -1;
+    }
+    *out_version = version;
+    return 0;
+}
+
+static int read_manifest_version(const ve_tls_persistent_options * options, int * out_version, int * out_exists) {
+    char path[640];
+    char body[VE_TLS_PERSISTENT_MANIFEST_MAX_BYTES];
+    ve_tls_path_info info;
+    ve_tls_file * file;
+    size_t offset = 0;
+    if (!options || !options->platform || !out_version || !out_exists ||
+        path_join(path, sizeof(path), options->dir_path, "manifest") != 0 ||
+        options->platform->path_stat(path, &info) != 0) {
+        return -1;
+    }
+    *out_exists = info.exists ? 1 : 0;
+    *out_version = 0;
+    if (!info.exists) {
+        return 0;
+    }
+    if (info.size == 0 || info.size >= sizeof(body)) {
+        return -1;
+    }
+    file = options->platform->file_open(path, VE_TLS_FILE_OPEN_RDONLY, 0);
+    if (!file) {
+        return -1;
+    }
+    while (offset < (size_t)info.size) {
+        int64_t n = options->platform->file_read(file, body + offset, (size_t)info.size - offset);
+        if (n <= 0) {
+            options->platform->file_close(file);
+            return -1;
+        }
+        offset += (size_t)n;
+    }
+    options->platform->file_close(file);
+    return validate_manifest_body(body, offset, out_version);
+}
+
+static int ensure_manifest(const ve_tls_persistent_options * options) {
+    int version = 0;
+    int exists = 0;
+    if (read_manifest_version(options, &version, &exists) != 0) {
+        return -1;
+    }
+    if (!exists || version == 1) {
+        return write_manifest(options);
+    }
+    return version == VE_TLS_PERSISTENT_MANIFEST_VERSION_CURRENT ? 0 : -1;
 }
 
 static void clear_segment_meta(ve_tls_persistent_segment_meta * meta) {
@@ -702,7 +869,7 @@ int ve_tls_persistent_open(ve_tls_persistent * persistent, const ve_tls_persiste
     if (persistent->platform->path_mkdirs(persistent->dir_path, 0700) != 0) {
         return -1;
     }
-    if (write_manifest(options) != 0) {
+    if (ensure_manifest(options) != 0) {
         ve_tls_persistent_close(persistent);
         return -1;
     }
@@ -836,6 +1003,8 @@ int ve_tls_persistent_append(ve_tls_persistent * persistent, int64_t log_id, con
     }
     memset(&view, 0, sizeof(view));
     view.log_id = log_id;
+    view.record_version = VE_TLS_PERSISTENT_RECORD_VERSION_CURRENT;
+    view.enqueue_time_ms = persistent_now_ms(persistent);
     view.hash_key = hash_key;
     view.payload = payload;
     view.payload_size = payload_size;
@@ -944,6 +1113,7 @@ int ve_tls_persistent_recover(ve_tls_persistent * persistent, int (*on_record)(i
             size_t record_size = 0;
             ve_tls_persistent_record record;
             int read_rc;
+            int decode_rc;
             memset(&record, 0, sizeof(record));
             read_rc = ve_tls_segment_store_reader_next(&persistent->store, &reader, &record_buf, &record_size);
             if (read_rc == 0) {
@@ -959,9 +1129,13 @@ int ve_tls_persistent_recover(ve_tls_persistent * persistent, int (*on_record)(i
                 }
                 break;
             }
-            if (ve_tls_persistent_record_decode(record_buf, record_size, &record) != 0) {
+            decode_rc = ve_tls_persistent_record_decode(record_buf, record_size, &record);
+            if (decode_rc != 0) {
                 ve_tls_segment_store_read_free(record_buf);
                 ve_tls_segment_store_reader_close(&persistent->store, &reader);
+                if (decode_rc == VE_TLS_PERSISTENT_RECORD_UNSUPPORTED_VERSION) {
+                    return -1;
+                }
                 if (ve_tls_segment_store_repair_tail(&persistent->store, segment_id, NULL) != 0) {
                     return -1;
                 }

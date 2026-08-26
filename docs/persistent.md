@@ -28,6 +28,8 @@ Persistent 目录包含这些文件：
 
 每个 Producer 或进程建议使用独立目录。多个活跃进程写同一个目录会破坏语义，`lease` 只能降低误用概率，不能把它变成多写者队列。
 
+`manifest` 当前格式版本为 V2。V1 会在打开时兼容升级；未知版本或损坏内容会使打开失败，SDK 不会先覆盖原文件。WAL record V2 在扩展字段中保存 `enqueue_time_ms`，没有该字段的旧记录按 V1 读取且时间为 `0`。该时间目前只用于保留格式能力，不会自动触发过期删除。
+
 ## 落盘模式
 
 | 模式 | `add_log` 成功边界 | 主动同步边界 |
@@ -56,6 +58,9 @@ active segment、未 durable ACK segment 和 replay cursor 对应 segment 不会
 - sync WAL 中，record `write` 成功但 `fsync` 失败时，`add_log` 返回 `VE_TLS_PERSISTENT_ERROR`，已写 record 仍保留并可在后续 flush/recover 中出现。调用方重试可能形成重复。
 - checkpoint 保存失败时保持 dirty，不回收对应记录，并发出 `persistent_checkpoint_save_failed` metric；metric 的两个值分别是本次完成范围的 `start_id` 和 `end_id`。
 - checkpoint 损坏时，SDK 会优先保证不漏发；代价是可能扩大重复范围。
+- WAL 中的 backlog 不绑定写入时的 endpoint、region 或 topic。调用 `ve_tls_producer_update_endpoint()` 后，尚未进入发送路径的旧 backlog 和后续 recover 记录都会使用当前 target；已经捕获发送快照的请求可能仍使用旧 target。
+- 如果业务不能接受旧 backlog 改投新 target，不要在同一个 persistent 目录上更新 target。当前 SDK 不提供 drain old target、target fingerprint 或自动拆分 store；调用更新接口表示接入方接受改投风险。
+- target 更新时若本地仍有 backlog，SDK 发出 `persistent_backlog_retarget(records, wal_bytes)` 事件用于告警，不阻止更新。
 
 如果业务不能接受重复，必须使用业务主键或消费侧去重。不要把 SDK 的 at-least-once 解释成 exactly-once。
 

@@ -43,6 +43,7 @@ Persistent 模式下，指标要和本地目录状态一起看：
 - `persistent_checkpoint_save_failed(start_id, end_id)`：checkpoint 未 durable；保持 dirty 且不回收对应范围。
 - `persistent_flush_failed(0, 0)`：flush 的非 sync、非 checkpoint 阶段失败。
 - `persistent_overflow_drop_oldest_unacked(records, wal_bytes)`：overflow policy 显式删除了旧未 ACK closed segment；两个值是本次损失的记录数和 WAL 字节数，同时累加 dropped totals。
+- `persistent_backlog_retarget(records, wal_bytes)`：更新 endpoint、region 或 topic 时本地仍有 persistent backlog；这些记录会使用更新后的 current target。该事件只告警，不阻止更新。
 - `log_dropped_persistent_overflow(1, bytes)`：`REJECT_NEW` 或 sample 策略拒绝当前新日志。
 - `log_dropped_persistent_overflow_timeout(1, bytes)`：`BLOCK` 或 sample 策略等待当前新日志超时。
 

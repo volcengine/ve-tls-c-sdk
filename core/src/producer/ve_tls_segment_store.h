@@ -18,7 +18,8 @@ typedef struct {
 typedef enum {
     VE_TLS_SEGMENT_STORE_OK = 0,
     VE_TLS_SEGMENT_STORE_ERROR = -1,
-    VE_TLS_SEGMENT_STORE_SYNC_FAILED = -2
+    VE_TLS_SEGMENT_STORE_SYNC_FAILED = -2,
+    VE_TLS_SEGMENT_STORE_UNSUPPORTED_VERSION = -3
 } ve_tls_segment_store_result;
 
 typedef struct {
