@@ -52,11 +52,15 @@ HTTP 状态码：
 
 发送失败但仍可重试时，批次会进入延迟队列。延迟队列按下一次重试时间排序，到期后重新交给 sender。
 
-达到最大重试次数、命中不可重试状态码或 Producer 关闭时，批次不会再入队。最终结果通过发送回调返回。
+达到最大重试次数、命中不可重试状态码或 Producer 关闭时，本轮批次不会再入队。最终结果通过发送回调返回。
+
+Memory 模式会在本轮结束后释放该批次。Persistent 模式不会 ACK 对应 WAL 记录，但当前也不会自动启动下一轮长期重试；需要进程重启或再次调用 `ve_tls_producer_recover()`。
 
 ## Persistent 下的处理边界
 
 - 批次最终成功后，SDK 会推进 checkpoint。
-- 不可重试终态失败也会作为已处理范围推进，避免 recover 后无限重放同一批毒丸日志。
+- 所有发送失败都不推进 checkpoint，包括 retryable exhausted、不可重试响应和内部 queue/budget 失败。
+- 当前没有发送失败后的公共永久 drop/quarantine 策略。无法发送的毒丸记录会在 recover 时继续出现，接入方应监控失败 callback 并隔离错误配置或 payload。
 - success callback 与 checkpoint 持久化之间存在窗口；进程在这个窗口崩溃时，recover 可能重放少量已经成功发送过的日志。
+- checkpoint 保存失败会保留 dirty 状态，并通过 `persistent_checkpoint_save_failed` metric 暴露对应 log id 范围。
 - 如果网络长期不可用，日志会继续占用 persistent 空间，直到触发 overflow policy。

@@ -300,6 +300,7 @@ void ve_tls_idle_cleanup(ve_tls_producer * producer);
 const char * ve_tls_normalize_hash_key(ve_tls_producer * producer, const char * hash_key);
 ve_tls_key_queue * ve_tls_ready_pop(ve_tls_producer * producer);
 void ve_tls_delayed_add_sorted(ve_tls_producer * producer, ve_tls_key_queue * q, int64_t next_ready_ms);
+#define VE_TLS_INGRESS_MERGE_KEY_QUEUE_LIMIT (-4)
 int ve_tls_ingress_task_merge_locked(ve_tls_producer * producer, const ve_tls_ingress_task * task);
 
 int ve_tls_producer_is_drained_locked(ve_tls_producer * producer);

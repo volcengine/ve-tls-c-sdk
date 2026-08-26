@@ -680,10 +680,12 @@ static int64_t ve_tls_persistent_record_completed_range_locked(ve_tls_producer *
 
 void ve_tls_persistent_on_final_result(ve_tls_producer * producer, ve_tls_result result, int64_t start_id, int64_t end_id) {
     int64_t ack_to = 0;
+    int checkpoint_save_failed = 0;
     if (!ve_tls_persistent_enabled(producer)) {
         return;
     }
-    if (result != VE_TLS_OK && result != VE_TLS_DROP_ERROR) {
+    /* Delivery failures describe the current attempt, not a durable drop policy. */
+    if (result != VE_TLS_OK) {
         return;
     }
     if (start_id <= 0 || end_id <= 0 || end_id < start_id) {
@@ -694,10 +696,17 @@ void ve_tls_persistent_on_final_result(ve_tls_producer * producer, ve_tls_result
     }
     ack_to = ve_tls_persistent_record_completed_range_locked(producer, start_id, end_id);
     if (ack_to > 0) {
-        (void)ve_tls_persistent_ack_range(producer->persistent, 1, ack_to);
+        if (ve_tls_persistent_ack_range(producer->persistent, 1, ack_to) != 0 &&
+            producer->persistent->checkpoint.acked_log_id >= ack_to &&
+            producer->persistent->durable_checkpoint_acked_log_id < ack_to) {
+            checkpoint_save_failed = 1;
+        }
     }
     if (producer->persistent_mutex) {
         producer->config.platform.mutex_unlock(producer->persistent_mutex);
+    }
+    if (checkpoint_save_failed) {
+        ve_tls_metrics_emit(producer, "persistent_checkpoint_save_failed", start_id, end_id);
     }
 }
 
@@ -779,6 +788,10 @@ int ve_tls_ingress_task_merge_locked(ve_tls_producer * producer, const ve_tls_in
     } else {
         q = ve_tls_key_queue_get_or_create(producer, norm_key);
         if (!q) {
+            if (producer->config.key_queue_max_active > 0 &&
+                producer->key_queue_count >= (size_t)producer->config.key_queue_max_active) {
+                return VE_TLS_INGRESS_MERGE_KEY_QUEUE_LIMIT;
+            }
             return -1;
         }
         if (!q->builder) {

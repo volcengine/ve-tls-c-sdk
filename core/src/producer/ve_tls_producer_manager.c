@@ -360,13 +360,14 @@ static void * ve_tls_worker_main_builder(void * arg) {
             if (ve_tls_ingress_queue_pop_locked(producer, &ingress_task) != 0) {
                 break;
             }
-            if (ve_tls_ingress_task_merge_locked(producer, &ingress_task) != 0) {
+            int merge_rc = ve_tls_ingress_task_merge_locked(producer, &ingress_task);
+            if (merge_rc != 0) {
                 ve_tls_manager_drop_range(producer,
                     ingress_task.batch ? ingress_task.batch->logs_len : 0,
                     ingress_task.batch ? ingress_task.batch->start_id : 0,
                     ingress_task.batch ? ingress_task.batch->end_id : 0,
-                    "MemoryAllocFailed",
-                    "ingress merge failed");
+                    merge_rc == VE_TLS_INGRESS_MERGE_KEY_QUEUE_LIMIT ? "KeyQueueLimitExceeded" : "MemoryAllocFailed",
+                    merge_rc == VE_TLS_INGRESS_MERGE_KEY_QUEUE_LIMIT ? "key queue limit exceeded" : "ingress merge failed");
             }
             if (ingress_task.batch) {
                 ve_tls_log_builder_free(ingress_task.batch);

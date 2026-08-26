@@ -459,6 +459,10 @@ static int g_track_segment_stats = 0;
 static ve_tls_mutex * g_track_producer_mutex = NULL;
 static _Thread_local int g_track_producer_mutex_depth = 0;
 static int g_track_file_write_saw_producer_mutex = 0;
+static int g_fail_next_file_fsync = 0;
+static int g_checkpoint_save_failed_events = 0;
+static int64_t g_checkpoint_save_failed_start_id = 0;
+static int64_t g_checkpoint_save_failed_end_id = 0;
 
 static int test_path_in_tracked_dir(const char * path) {
     size_t n;
@@ -552,6 +556,22 @@ static int64_t test_track_file_write(ve_tls_file * f, const void * buf, size_t s
         g_track_file_write_saw_producer_mutex = 1;
     }
     return g_real_platform.file_write(f, buf, size);
+}
+
+static int test_fail_next_file_fsync(ve_tls_file * f) {
+    if (__atomic_exchange_n(&g_fail_next_file_fsync, 0, __ATOMIC_ACQ_REL)) {
+        return -1;
+    }
+    return g_real_platform.file_fsync(f);
+}
+
+static void test_persistent_checkpoint_metrics_emit(const char * name, int64_t v1, int64_t v2, void * user_param) {
+    (void)user_param;
+    if (name && strcmp(name, "persistent_checkpoint_save_failed") == 0) {
+        g_checkpoint_save_failed_events++;
+        g_checkpoint_save_failed_start_id = v1;
+        g_checkpoint_save_failed_end_id = v2;
+    }
 }
 
 static int test_http_do(ve_tls_http_client * client, const ve_tls_http_request * req, ve_tls_http_response * resp) {
@@ -9565,20 +9585,16 @@ static int test_persistent_sender_ack_updates_checkpoint_and_reclaims_closed_seg
     return 0;
 }
 
-static int test_persistent_manager_drop_updates_checkpoint_and_reclaims_closed_segment(void) {
+static int test_persistent_retry_exhausted_retains_and_recovers(void) {
     char dir[PATH_MAX];
-    char seg1[PATH_MAX];
-    char seg2[PATH_MAX];
     ve_tls_config cfg;
-    ve_tls_producer * p = NULL;
-    ve_tls_path_info info1;
-    ve_tls_path_info info2;
-    int close_rc;
+    ve_tls_producer * p1 = NULL;
+    ve_tls_producer * p2 = NULL;
+    ve_tls_metrics metrics;
+    int close_rc = VE_TLS_DROP_ERROR;
     if (make_temp_dir(dir, sizeof(dir)) != 0) {
         return -1;
     }
-    join_path(seg1, sizeof(seg1), dir, "seg-000001.log");
-    join_path(seg2, sizeof(seg2), dir, "seg-000002.log");
     ve_tls_config_init(&cfg);
     cfg.endpoint = "https://example.com";
     cfg.region = "cn-beijing";
@@ -9588,41 +9604,185 @@ static int test_persistent_manager_drop_updates_checkpoint_and_reclaims_closed_s
     cfg.retry_policy.max_attempts = 1;
     cfg.flush_interval_ms = 0;
     cfg.agg_strategy = 0;
-    cfg.compress_type = "bad";
+    cfg.compress_type = "none";
+    cfg.http_client.do_request = test_http_step_always_transport_retry_do;
+    cfg.http_client.free_response = test_http_ok_free;
     cfg.use_persistent = 1;
     cfg.persistent_file_path = dir;
     cfg.max_persistent_log_count = 64;
-    cfg.max_persistent_file_size = 40;
+    cfg.max_persistent_file_size = 1024;
     cfg.max_persistent_file_count = 4;
-    p = ve_tls_producer_create(&cfg);
-    if (!p || !p->persistent) {
+    p1 = ve_tls_producer_create(&cfg);
+    if (!p1 || !p1->persistent) {
         cleanup_persistent_dir(dir);
         return -1;
     }
-    if (ve_tls_producer_add_log_raw(p, "{\"a\":1}", strlen("{\"a\":1}"), 1) != VE_TLS_OK ||
-        ve_tls_producer_add_log_raw(p, "{\"b\":2}", strlen("{\"b\":2}"), 1) != VE_TLS_OK) {
-        ve_tls_producer_destroy(p);
+    if (ve_tls_producer_add_log_raw(p1, "{\"a\":1}", strlen("{\"a\":1}"), 1) != VE_TLS_OK) {
+        ve_tls_producer_destroy(p1);
         cleanup_persistent_dir(dir);
         return -1;
     }
     for (int i = 0; i < 300; i++) {
-        if (p->persistent->checkpoint.acked_log_id >= 2) {
+        memset(&metrics, 0, sizeof(metrics));
+        ve_tls_producer_get_metrics(p1, &metrics);
+        if (metrics.requests_failed_total >= 1) {
             break;
         }
         cfg.platform.sleep_ms(10);
     }
-    close_rc = (int)ve_tls_producer_close(p, 10000);
-    if (p->persistent->checkpoint.acked_log_id < 2 ||
-        close_rc != VE_TLS_OK ||
-        cfg.platform.path_stat(seg1, &info1) != 0 ||
-        cfg.platform.path_stat(seg2, &info2) != 0 ||
-        info1.exists ||
-        !info2.exists) {
-        ve_tls_producer_destroy(p);
+    memset(&metrics, 0, sizeof(metrics));
+    ve_tls_producer_get_metrics(p1, &metrics);
+    close_rc = (int)ve_tls_producer_close(p1, 10000);
+    if (metrics.requests_failed_total < 1 ||
+        p1->persistent->checkpoint.acked_log_id != 0 ||
+        close_rc != VE_TLS_OK) {
+        ve_tls_producer_destroy(p1);
         cleanup_persistent_dir(dir);
         return -1;
     }
-    ve_tls_producer_destroy(p);
+    ve_tls_producer_destroy(p1);
+
+    cfg.http_client.do_request = test_http_ok_do;
+    cfg.http_client.free_response = test_http_ok_free;
+    p2 = ve_tls_producer_create(&cfg);
+    if (!p2 || !p2->persistent || ve_tls_producer_recover(p2) != VE_TLS_OK) {
+        ve_tls_producer_destroy(p2);
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    close_rc = (int)ve_tls_producer_close(p2, 10000);
+    memset(&metrics, 0, sizeof(metrics));
+    ve_tls_producer_get_metrics(p2, &metrics);
+    if (close_rc != VE_TLS_OK ||
+        metrics.logs_enqueued_total != 1 ||
+        metrics.requests_total != 1 ||
+        metrics.requests_failed_total != 0 ||
+        p2->persistent->checkpoint.acked_log_id < 1) {
+        ve_tls_producer_destroy(p2);
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    ve_tls_producer_destroy(p2);
+    cleanup_persistent_dir(dir);
+    return 0;
+}
+
+static int test_persistent_key_queue_failure_retains_and_recovers(void) {
+    char dir[PATH_MAX];
+    ve_tls_config cfg;
+    ve_tls_producer * p1 = NULL;
+    ve_tls_producer * p2 = NULL;
+    ve_tls_metrics metrics;
+    ve_tls_kv kv = {"k", "v"};
+    int close_rc = VE_TLS_DROP_ERROR;
+    if (make_temp_dir(dir, sizeof(dir)) != 0) {
+        return -1;
+    }
+    g_mgr_p2l_done = 0;
+    g_mgr_p2l_ok = 0;
+    g_mgr_p2l_http_calls = 0;
+    memset(g_mgr_p2l_code, 0, sizeof(g_mgr_p2l_code));
+    memset(g_mgr_p2l_msg, 0, sizeof(g_mgr_p2l_msg));
+
+    ve_tls_config_init(&cfg);
+    cfg.endpoint = "https://example.com";
+    cfg.region = "cn-beijing";
+    cfg.topic_id = "t";
+    cfg.access_key_id = "ak";
+    cfg.access_key_secret = "sk";
+    cfg.retry_policy.max_attempts = 1;
+    cfg.flush_interval_ms = 0;
+    cfg.log_count_per_package = 1;
+    cfg.key_queue_max_active = 1;
+    cfg.key_queue_idle_ttl_ms = 100000;
+    cfg.send_queue_size = 16;
+    cfg.compress_type = "none";
+    cfg.http_client.do_request = test_http_mgr_count_ok_do;
+    cfg.http_client.free_response = test_http_free;
+    cfg.use_persistent = 1;
+    cfg.persistent_file_path = dir;
+    cfg.max_persistent_log_count = 64;
+    cfg.max_persistent_file_size = 1024;
+    cfg.max_persistent_file_count = 4;
+
+    p1 = ve_tls_producer_create(&cfg);
+    if (!p1 || !p1->persistent) {
+        cleanup_persistent_dir(dir);
+        return -2;
+    }
+    if (ve_tls_producer_add_log_kv_hashkey(p1, 0, "hk1", &kv, 1, 1) != VE_TLS_OK) {
+        ve_tls_producer_destroy(p1);
+        cleanup_persistent_dir(dir);
+        return -3;
+    }
+    for (int i = 0; i < 2000; i++) {
+        if (p1->persistent->checkpoint.acked_log_id >= 1) {
+            break;
+        }
+        cfg.platform.sleep_ms(1);
+    }
+    if (p1->persistent->checkpoint.acked_log_id != 1) {
+        ve_tls_producer_destroy(p1);
+        cleanup_persistent_dir(dir);
+        return -4;
+    }
+
+    ve_tls_producer_set_send_done_v2(p1, on_send_done_mgr_p2l_v2, NULL);
+    if (ve_tls_producer_add_log_kv_hashkey(p1, 0, "hk2", &kv, 1, 1) != VE_TLS_OK) {
+        ve_tls_producer_destroy(p1);
+        cleanup_persistent_dir(dir);
+        return -5;
+    }
+    for (int i = 0; i < 300 && !g_mgr_p2l_done; i++) {
+        cfg.platform.sleep_ms(10);
+    }
+    close_rc = (int)ve_tls_producer_close(p1, 10000);
+    if (!g_mgr_p2l_ok ||
+        strcmp(g_mgr_p2l_code, "KeyQueueLimitExceeded") != 0 ||
+        p1->persistent->checkpoint.acked_log_id != 1 ||
+        close_rc != VE_TLS_OK) {
+        fprintf(stderr,
+            "persistent key queue retain debug done=%d ok=%d code=%s checkpoint=%lld close=%d\n",
+            g_mgr_p2l_done,
+            g_mgr_p2l_ok,
+            g_mgr_p2l_code,
+            (long long)p1->persistent->checkpoint.acked_log_id,
+            close_rc);
+        ve_tls_producer_destroy(p1);
+        cleanup_persistent_dir(dir);
+        return -6;
+    }
+    ve_tls_producer_destroy(p1);
+
+    cfg.key_queue_max_active = 0;
+    cfg.http_client.do_request = test_http_ok_do;
+    cfg.http_client.free_response = test_http_ok_free;
+    p2 = ve_tls_producer_create(&cfg);
+    if (!p2 || !p2->persistent || ve_tls_producer_recover(p2) != VE_TLS_OK) {
+        ve_tls_producer_destroy(p2);
+        cleanup_persistent_dir(dir);
+        return -7;
+    }
+    close_rc = (int)ve_tls_producer_close(p2, 10000);
+    memset(&metrics, 0, sizeof(metrics));
+    ve_tls_producer_get_metrics(p2, &metrics);
+    if (close_rc != VE_TLS_OK ||
+        metrics.logs_enqueued_total != 1 ||
+        metrics.requests_total != 1 ||
+        metrics.requests_failed_total != 0 ||
+        p2->persistent->checkpoint.acked_log_id < 2) {
+        fprintf(stderr,
+            "persistent key queue recover debug logs=%llu requests=%llu failed=%llu checkpoint=%lld close=%d\n",
+            (unsigned long long)metrics.logs_enqueued_total,
+            (unsigned long long)metrics.requests_total,
+            (unsigned long long)metrics.requests_failed_total,
+            (long long)p2->persistent->checkpoint.acked_log_id,
+            close_rc);
+        ve_tls_producer_destroy(p2);
+        cleanup_persistent_dir(dir);
+        return -8;
+    }
+    ve_tls_producer_destroy(p2);
     cleanup_persistent_dir(dir);
     return 0;
 }
@@ -10718,6 +10878,70 @@ static int test_persistent_out_of_order_ack_waits_for_contiguous_prefix(void) {
     }
     ve_tls_persistent_on_final_result(p, VE_TLS_OK, 1, 1);
     if (p->persistent->checkpoint.acked_log_id != 3) {
+        ve_tls_producer_destroy(p);
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    ve_tls_producer_destroy(p);
+    cleanup_persistent_dir(dir);
+    return 0;
+}
+
+static int test_persistent_checkpoint_fsync_failure_stays_dirty_and_emits_metric(void) {
+    char dir[PATH_MAX];
+    ve_tls_config cfg;
+    ve_tls_producer * p = NULL;
+    static const unsigned char payload[] = "checkpoint-fsync";
+    int64_t now_ms;
+    if (make_temp_dir(dir, sizeof(dir)) != 0) {
+        return -1;
+    }
+    ve_tls_config_init(&cfg);
+    g_real_platform = cfg.platform;
+    g_fail_next_file_fsync = 0;
+    g_checkpoint_save_failed_events = 0;
+    g_checkpoint_save_failed_start_id = 0;
+    g_checkpoint_save_failed_end_id = 0;
+    cfg.platform.file_fsync = test_fail_next_file_fsync;
+    cfg.endpoint = "https://example.com";
+    cfg.region = "cn-beijing";
+    cfg.topic_id = "t";
+    cfg.access_key_id = "ak";
+    cfg.access_key_secret = "sk";
+    cfg.flush_interval_ms = 100000;
+    cfg.use_persistent = 1;
+    cfg.persistent_file_path = dir;
+    cfg.max_persistent_log_count = 64;
+    cfg.max_persistent_file_size = 1024;
+    cfg.max_persistent_file_count = 4;
+    cfg.metrics_sink.emit = test_persistent_checkpoint_metrics_emit;
+
+    p = ve_tls_producer_create(&cfg);
+    if (!p || !p->persistent ||
+        ve_tls_persistent_append(p->persistent, 1, NULL, payload, sizeof(payload) - 1) != 0) {
+        ve_tls_producer_destroy(p);
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    now_ms = cfg.platform.time_ms ? cfg.platform.time_ms() : 0;
+    p->persistent->checkpoint_dirty = 1;
+    p->persistent->checkpoint_dirty_since_ms = now_ms > 1000 ? now_ms - 1000 : 1;
+    __atomic_store_n(&g_fail_next_file_fsync, 1, __ATOMIC_RELEASE);
+
+    ve_tls_persistent_on_final_result(p, VE_TLS_OK, 1, 1);
+    if (g_checkpoint_save_failed_events != 1 ||
+        g_checkpoint_save_failed_start_id != 1 ||
+        g_checkpoint_save_failed_end_id != 1 ||
+        p->persistent->checkpoint.acked_log_id != 1 ||
+        p->persistent->durable_checkpoint_acked_log_id != 0 ||
+        !p->persistent->checkpoint_dirty) {
+        ve_tls_producer_destroy(p);
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    if (ve_tls_persistent_flush(p->persistent) != 0 ||
+        p->persistent->durable_checkpoint_acked_log_id != 1 ||
+        p->persistent->checkpoint_dirty) {
         ve_tls_producer_destroy(p);
         cleanup_persistent_dir(dir);
         return -1;
@@ -13310,7 +13534,8 @@ int main(void) {
     RUN(145, test_persistent_recover_batches_multiple_logs_into_single_request());
     RUN(160, test_persistent_recover_streams_single_segment_with_one_open());
     RUN(132, test_persistent_sender_ack_updates_checkpoint_and_reclaims_closed_segment());
-    RUN(133, test_persistent_manager_drop_updates_checkpoint_and_reclaims_closed_segment());
+    RUN(182, test_persistent_retry_exhausted_retains_and_recovers());
+    RUN(183, test_persistent_key_queue_failure_retains_and_recovers());
     RUN(134, test_persistent_overflow_reject_new_returns_drop_error());
     RUN(135, test_persistent_overflow_block_times_out());
     RUN(136, test_persistent_heartbeat_updates_lease());
@@ -13331,6 +13556,7 @@ int main(void) {
     RUN(144, test_persistent_kv_path_batches_multiple_logs_into_single_request());
     RUN(150, test_persistent_append_releases_producer_mutex_for_disk_write());
     RUN(151, test_persistent_out_of_order_ack_waits_for_contiguous_prefix());
+    RUN(184, test_persistent_checkpoint_fsync_failure_stays_dirty_and_emits_metric());
     RUN(152, test_persistent_allows_multiple_sender_threads());
     RUN(153, test_persistent_append_reuses_large_record_scratch_buffer());
     RUN(154, test_segment_store_scan_large_records_without_heap_decode());

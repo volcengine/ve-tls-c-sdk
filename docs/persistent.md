@@ -32,8 +32,11 @@ Persistent 目录包含这些文件：
 
 - SDK 提供 at-least-once。崩溃、重试和 checkpoint 持久化边界可能带来少量重复。
 - `success callback` 表示请求已经进入发送成功路径，不表示 checkpoint 已经 durable 落盘。
-- `add_log` 返回失败的日志不在恢复范围内。常见原因包括参数错误、内存背压、persistent quota 或目录错误。
-- 不可重试的终态失败会推进已处理范围，避免 recover 后无限重放毒丸日志。
+- 只有服务端请求成功才推进 checkpoint。重试预算耗尽、不可重试响应、凭证刷新失败和内部 queue/budget 暂时失败都不会隐式 ACK 已 append 的记录。
+- 发送失败 callback 描述的是本轮发送结果，不代表 persistent 记录已经永久丢弃。当前没有“发送失败后显式永久丢弃”的公共策略。
+- 本轮发送结束后，未 ACK 记录保留在 WAL 中；当前实现不会自动开启下一轮长期重试，需要进程重启或再次调用 `ve_tls_producer_recover()` 才会重新入队。
+- `add_log` 在 persistent append 之前失败时不在恢复范围内；如果 append 已成功、后续内存入队失败，接口可能返回失败但记录仍会被 recover，调用方需要用 log id 或业务主键处理潜在重复。
+- checkpoint 保存失败时保持 dirty，不回收对应记录，并发出 `persistent_checkpoint_save_failed` metric；metric 的两个值分别是本次完成范围的 `start_id` 和 `end_id`。
 - checkpoint 损坏时，SDK 会优先保证不漏发；代价是可能扩大重复范围。
 - 当前 C core 不对每条日志 append 执行 `fsync`。如果业务需要进程外掉电级保证，需要在上层设计额外的持久化策略。
 
