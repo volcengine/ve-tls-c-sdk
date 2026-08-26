@@ -11,6 +11,12 @@
 #define VE_TLS_PERSISTENT_OVERFLOW_DROP_NEWEST_SAMPLE 3
 #define VE_TLS_PERSISTENT_CHECKPOINT_SAVE_WINDOW_MS 100
 #define VE_TLS_PERSISTENT_CHECKPOINT_ACK_DELTA_THRESHOLD 64
+#define VE_TLS_PERSISTENT_DEFAULT_HIGH_WATERMARK_PCT 85
+#define VE_TLS_PERSISTENT_DEFAULT_LOW_WATERMARK_PCT 70
+
+static uint64_t add_u64_saturating(uint64_t left, uint64_t right) {
+    return right > UINT64_MAX - left ? UINT64_MAX : left + right;
+}
 
 static int path_join(char * out, size_t out_size, const char * dir, const char * name) {
     if (!out || out_size == 0 || !dir || !name) {
@@ -200,6 +206,32 @@ static void advance_reclaim_cursor(ve_tls_persistent * persistent) {
     persistent->next_reclaim_segment_id = cursor;
 }
 
+static uint64_t percentage_floor(uint64_t max, int32_t pct) {
+    uint64_t quotient = max / 100;
+    uint64_t remainder = max % 100;
+    return quotient * (uint64_t)pct + (remainder * (uint64_t)pct) / 100;
+}
+
+static int is_soft_limit_exceeded(uint64_t current, uint64_t max, int32_t pct) {
+    uint64_t floor;
+    uint64_t remainder_product;
+    if (max == 0 || pct <= 0 || pct > 100) {
+        return 0;
+    }
+    floor = percentage_floor(max, pct);
+    remainder_product = (max % 100) * (uint64_t)pct;
+    return current >= floor + (remainder_product % 100 != 0 ? 1 : 0);
+}
+
+static int is_soft_limit_above(uint64_t current, uint64_t max, int32_t pct) {
+    uint64_t floor;
+    if (max == 0 || pct <= 0 || pct > 100) {
+        return 0;
+    }
+    floor = percentage_floor(max, pct);
+    return floor != UINT64_MAX && current > floor;
+}
+
 static int validate_current_lease(ve_tls_persistent * persistent) {
     ve_tls_lease_state current;
     if (!persistent || !persistent->platform) {
@@ -267,7 +299,53 @@ int ve_tls_persistent_heartbeat_if_due(ve_tls_persistent * persistent, int force
     return 0;
 }
 
+static int remove_segment(
+    ve_tls_persistent * persistent,
+    uint32_t segment_id,
+    ve_tls_persistent_segment_meta * meta,
+    uint64_t * removed_bytes,
+    uint64_t * removed_records
+) {
+    char path[640];
+    uint64_t segment_bytes;
+    uint64_t segment_records;
+    if (!persistent || !persistent->platform || !meta || !meta->exists) {
+        return -1;
+    }
+    if (ve_tls_segment_store_get_segment_path(&persistent->store, segment_id, path, sizeof(path)) != 0 ||
+        persistent->platform->path_remove(path) != 0) {
+        return -1;
+    }
+    segment_bytes = meta->size;
+    segment_records = meta->records;
+    if (persistent->current_bytes >= segment_bytes) {
+        persistent->current_bytes -= segment_bytes;
+    } else {
+        persistent->current_bytes = 0;
+    }
+    if (persistent->current_records >= segment_records) {
+        persistent->current_records -= segment_records;
+    } else {
+        persistent->current_records = 0;
+    }
+    if (persistent->current_segments > 0) {
+        persistent->current_segments--;
+    }
+    clear_segment_meta(meta);
+    if (segment_id >= persistent->next_reclaim_segment_id) {
+        persistent->next_reclaim_segment_id = segment_id < UINT32_MAX ? segment_id + 1 : UINT32_MAX;
+    }
+    if (removed_bytes) {
+        *removed_bytes = segment_bytes;
+    }
+    if (removed_records) {
+        *removed_records = segment_records;
+    }
+    return 0;
+}
+
 static int reclaim_acked_segments(ve_tls_persistent * persistent, int force) {
+    int stopped_at_replay_barrier = 0;
     if (!persistent || !persistent->platform) {
         return -1;
     }
@@ -283,46 +361,86 @@ static int reclaim_acked_segments(ve_tls_persistent * persistent, int force) {
     for (uint32_t segment_id = persistent->next_reclaim_segment_id;
          segment_id < persistent->store.active_segment_id;
          segment_id++) {
-        char path[640];
         ve_tls_persistent_segment_meta * meta;
         if (persistent->checkpoint.replay_begin_segment_id != 0 &&
             segment_id == persistent->checkpoint.replay_begin_segment_id) {
-            continue;
-        }
-        if (ve_tls_segment_store_get_segment_path(&persistent->store, segment_id, path, sizeof(path)) != 0) {
-            return -1;
+            stopped_at_replay_barrier = 1;
+            break;
         }
         meta = get_segment_meta_slot(persistent, segment_id);
         if (!meta || !meta->exists) {
-            persistent->next_reclaim_segment_id = segment_id + 1;
+            persistent->next_reclaim_segment_id = segment_id < UINT32_MAX ? segment_id + 1 : UINT32_MAX;
             continue;
         }
         if (meta->max_log_id > 0 && meta->max_log_id <= persistent->durable_checkpoint_acked_log_id) {
-            if (persistent->platform->path_remove(path) != 0) {
+            if (remove_segment(persistent, segment_id, meta, NULL, NULL) != 0) {
                 return -1;
             }
-            if (persistent->current_bytes >= meta->size) {
-                persistent->current_bytes -= meta->size;
-            } else {
-                persistent->current_bytes = 0;
-            }
-            if (persistent->current_records >= meta->records) {
-                persistent->current_records -= meta->records;
-            } else {
-                persistent->current_records = 0;
-            }
-            if (persistent->current_segments > 0) {
-                persistent->current_segments--;
-            }
-            clear_segment_meta(meta);
-            persistent->next_reclaim_segment_id = segment_id + 1;
             continue;
         }
         break;
     }
     advance_reclaim_cursor(persistent);
+    if (stopped_at_replay_barrier) {
+        /* The barrier may clear without another ACK; keep flush eligible to retry. */
+        persistent->reclaim_pending = 1;
+        return 0;
+    }
     persistent->reclaim_pending = 0;
     persistent->last_reclaim_acked_log_id = persistent->durable_checkpoint_acked_log_id;
+    return 0;
+}
+
+static int pressure_reclaim_needed(const ve_tls_persistent * persistent) {
+    if (!persistent) {
+        return 0;
+    }
+    return is_soft_limit_exceeded(persistent->current_bytes, persistent->max_bytes, persistent->high_watermark_pct) ||
+           is_soft_limit_exceeded(persistent->current_records, persistent->max_records, persistent->high_watermark_pct) ||
+           is_soft_limit_exceeded(persistent->current_segments, persistent->max_segments, persistent->high_watermark_pct);
+}
+
+static int pressure_above_low_watermark(const ve_tls_persistent * persistent) {
+    if (!persistent) {
+        return 0;
+    }
+    return is_soft_limit_above(persistent->current_bytes, persistent->max_bytes, persistent->low_watermark_pct) ||
+           is_soft_limit_above(persistent->current_records, persistent->max_records, persistent->low_watermark_pct) ||
+           is_soft_limit_above(persistent->current_segments, persistent->max_segments, persistent->low_watermark_pct);
+}
+
+static int reclaim_to_low_watermark(ve_tls_persistent * persistent) {
+    if (!persistent || !persistent->platform || !pressure_reclaim_needed(persistent) ||
+        persistent->durable_checkpoint_acked_log_id <= 0) {
+        return 0;
+    }
+    advance_reclaim_cursor(persistent);
+    while (pressure_above_low_watermark(persistent)) {
+        uint32_t segment_id = persistent->next_reclaim_segment_id;
+        ve_tls_persistent_segment_meta * meta;
+        if (segment_id >= persistent->store.active_segment_id) {
+            break;
+        }
+        if (persistent->checkpoint.replay_begin_segment_id != 0 &&
+            segment_id == persistent->checkpoint.replay_begin_segment_id) {
+            persistent->reclaim_pending = 1;
+            break;
+        }
+        meta = get_segment_meta_slot(persistent, segment_id);
+        if (!meta || !meta->exists) {
+            persistent->next_reclaim_segment_id = segment_id < UINT32_MAX ? segment_id + 1 : UINT32_MAX;
+            advance_reclaim_cursor(persistent);
+            continue;
+        }
+        if (meta->max_log_id <= 0 || meta->max_log_id > persistent->durable_checkpoint_acked_log_id) {
+            break;
+        }
+        if (remove_segment(persistent, segment_id, meta, NULL, NULL) != 0) {
+            return -1;
+        }
+        advance_reclaim_cursor(persistent);
+    }
+    advance_reclaim_cursor(persistent);
     return 0;
 }
 
@@ -398,14 +516,12 @@ static int persist_drop_oldest_unacked(ve_tls_persistent * persistent) {
         return -1;
     }
     for (uint32_t segment_id = 1; segment_id < persistent->store.active_segment_id; segment_id++) {
-        char path[640];
         ve_tls_persistent_segment_meta * meta;
+        uint64_t removed_bytes = 0;
+        uint64_t removed_records = 0;
         if (persistent->checkpoint.replay_begin_segment_id != 0 &&
             segment_id == persistent->checkpoint.replay_begin_segment_id) {
-            continue;
-        }
-        if (ve_tls_segment_store_get_segment_path(&persistent->store, segment_id, path, sizeof(path)) != 0) {
-            return -1;
+            break;
         }
         meta = get_segment_meta_slot(persistent, segment_id);
         if (!meta || !meta->exists || meta->max_log_id <= 0) {
@@ -418,27 +534,14 @@ static int persist_drop_oldest_unacked(ve_tls_persistent * persistent) {
                 return -1;
             }
         }
-        if (persistent->platform->path_remove(path) != 0) {
+        if (remove_segment(persistent, segment_id, meta, &removed_bytes, &removed_records) != 0) {
             return -1;
         }
-        if (persistent->current_bytes >= meta->size) {
-            persistent->current_bytes -= meta->size;
-        } else {
-            persistent->current_bytes = 0;
-        }
-        if (persistent->current_records >= meta->records) {
-            persistent->current_records -= meta->records;
-        } else {
-            persistent->current_records = 0;
-        }
-        if (persistent->current_segments > 0) {
-            persistent->current_segments--;
-        }
-        clear_segment_meta(meta);
-        if (segment_id >= persistent->next_reclaim_segment_id) {
-            persistent->next_reclaim_segment_id = segment_id + 1;
-            advance_reclaim_cursor(persistent);
-        }
+        persistent->append_dropped_records = add_u64_saturating(
+            persistent->append_dropped_records, removed_records);
+        persistent->append_dropped_bytes = add_u64_saturating(
+            persistent->append_dropped_bytes, removed_bytes);
+        advance_reclaim_cursor(persistent);
         return 1;
     }
     return 0;
@@ -448,15 +551,10 @@ static int would_need_new_segment(ve_tls_persistent * persistent, size_t append_
     if (!persistent) {
         return 0;
     }
-    return ((persistent->store.active_size > 0 && persistent->store.active_size + append_size > persistent->store.segment_max_bytes) ||
+    return ((persistent->store.active_size > 0 &&
+             (persistent->store.active_size > persistent->store.segment_max_bytes ||
+              (uint64_t)append_size > persistent->store.segment_max_bytes - persistent->store.active_size)) ||
             (persistent->store.active_records > 0 && persistent->store.active_records >= persistent->store.segment_max_records)) ? 1 : 0;
-}
-
-static int is_soft_limit_exceeded(uint64_t current, uint64_t max, int32_t pct) {
-    if (max == 0 || pct <= 0) {
-        return 0;
-    }
-    return current * 100 >= max * (uint64_t)pct;
 }
 
 static int is_hard_limit_exceeded(uint64_t current, uint64_t max) {
@@ -495,16 +593,16 @@ static unsigned char * persistent_get_append_buffer(ve_tls_persistent * persiste
 static int ensure_capacity_for_append(ve_tls_persistent * persistent, int64_t log_id, size_t record_size) {
     uint64_t next_bytes;
     uint64_t next_records;
-    uint32_t next_segments;
+    uint64_t next_segments;
     int need_new_segment;
     int saturated;
     if (!persistent) {
         return -1;
     }
     need_new_segment = would_need_new_segment(persistent, record_size);
-    next_bytes = persistent->current_bytes + (uint64_t)record_size;
-    next_records = persistent->current_records + 1;
-    next_segments = persistent->current_segments + (uint32_t)(need_new_segment ? 1 : 0);
+    next_bytes = add_u64_saturating(persistent->current_bytes, (uint64_t)record_size);
+    next_records = add_u64_saturating(persistent->current_records, 1);
+    next_segments = add_u64_saturating(persistent->current_segments, need_new_segment ? 1 : 0);
     saturated = is_hard_limit_exceeded(next_bytes, persistent->max_bytes) ||
                 is_hard_limit_exceeded(next_records, persistent->max_records) ||
                 (persistent->max_segments > 0 && next_segments > persistent->max_segments);
@@ -513,30 +611,29 @@ static int ensure_capacity_for_append(ve_tls_persistent * persistent, int64_t lo
             return -1;
         }
         need_new_segment = would_need_new_segment(persistent, record_size);
-        next_bytes = persistent->current_bytes + (uint64_t)record_size;
-        next_records = persistent->current_records + 1;
-        next_segments = persistent->current_segments + (uint32_t)(need_new_segment ? 1 : 0);
+        next_bytes = add_u64_saturating(persistent->current_bytes, (uint64_t)record_size);
+        next_records = add_u64_saturating(persistent->current_records, 1);
+        next_segments = add_u64_saturating(persistent->current_segments, need_new_segment ? 1 : 0);
         saturated = is_hard_limit_exceeded(next_bytes, persistent->max_bytes) ||
                     is_hard_limit_exceeded(next_records, persistent->max_records) ||
-                    (persistent->max_segments > 0 && next_segments > persistent->max_segments);
+                    (persistent->max_segments > 0 && next_segments > (uint64_t)persistent->max_segments);
     }
     if (!saturated) {
         return 0;
     }
-    if (persistent->overflow_policy == VE_TLS_PERSISTENT_OVERFLOW_DROP_OLDEST_UNACKED ||
-        (persistent->overflow_policy == VE_TLS_PERSISTENT_OVERFLOW_DROP_NEWEST_SAMPLE && should_treat_as_sampled(persistent, log_id))) {
+    if (persistent->overflow_policy == VE_TLS_PERSISTENT_OVERFLOW_DROP_OLDEST_UNACKED) {
         while (saturated) {
             int drop_rc = persist_drop_oldest_unacked(persistent);
             if (drop_rc <= 0) {
                 break;
             }
             need_new_segment = would_need_new_segment(persistent, record_size);
-            next_bytes = persistent->current_bytes + (uint64_t)record_size;
-            next_records = persistent->current_records + 1;
-            next_segments = persistent->current_segments + (uint32_t)(need_new_segment ? 1 : 0);
+            next_bytes = add_u64_saturating(persistent->current_bytes, (uint64_t)record_size);
+            next_records = add_u64_saturating(persistent->current_records, 1);
+            next_segments = add_u64_saturating(persistent->current_segments, need_new_segment ? 1 : 0);
             saturated = is_hard_limit_exceeded(next_bytes, persistent->max_bytes) ||
                         is_hard_limit_exceeded(next_records, persistent->max_records) ||
-                        (persistent->max_segments > 0 && next_segments > persistent->max_segments);
+                        (persistent->max_segments > 0 && next_segments > (uint64_t)persistent->max_segments);
         }
         if (!saturated) {
             return 0;
@@ -557,7 +654,21 @@ int ve_tls_persistent_open(ve_tls_persistent * persistent, const ve_tls_persiste
     ve_tls_path_info info;
     ve_tls_lease_options lease_options;
     ve_tls_segment_store_options store_options;
+    int32_t high_watermark_pct;
+    int32_t low_watermark_pct;
     if (!persistent || !options || !options->platform || !options->dir_path || options->dir_path[0] == 0) {
+        return -1;
+    }
+    high_watermark_pct = options->high_watermark_pct;
+    low_watermark_pct = options->low_watermark_pct;
+    if (high_watermark_pct == 0) {
+        high_watermark_pct = VE_TLS_PERSISTENT_DEFAULT_HIGH_WATERMARK_PCT;
+    }
+    if (low_watermark_pct == 0) {
+        low_watermark_pct = VE_TLS_PERSISTENT_DEFAULT_LOW_WATERMARK_PCT;
+    }
+    if (low_watermark_pct <= 0 || high_watermark_pct <= 0 ||
+        high_watermark_pct > 100 || low_watermark_pct >= high_watermark_pct) {
         return -1;
     }
     VE_TLS_ALLOC_SITE("persistent_open");
@@ -573,8 +684,8 @@ int ve_tls_persistent_open(ve_tls_persistent * persistent, const ve_tls_persiste
     persistent->max_bytes = options->max_bytes;
     persistent->max_records = options->max_records;
     persistent->max_segments = options->max_segments;
-    persistent->high_watermark_pct = options->high_watermark_pct > 0 ? options->high_watermark_pct : 85;
-    persistent->low_watermark_pct = options->low_watermark_pct > 0 ? options->low_watermark_pct : 70;
+    persistent->high_watermark_pct = high_watermark_pct;
+    persistent->low_watermark_pct = low_watermark_pct;
     persistent->overflow_policy = options->overflow_policy;
     persistent->sample_every_n = options->sample_every_n > 0 ? options->sample_every_n : 10;
     persistent->block_timeout_ms = options->block_timeout_ms;
@@ -709,7 +820,12 @@ int ve_tls_persistent_append(ve_tls_persistent * persistent, int64_t log_id, con
     unsigned char * record_buf = stack_buf;
     size_t record_size = 0;
     int rc;
-    if (!persistent || !persistent->platform || !payload || payload_size == 0) {
+    if (!persistent) {
+        return -1;
+    }
+    persistent->append_dropped_records = 0;
+    persistent->append_dropped_bytes = 0;
+    if (!persistent->platform || !payload || payload_size == 0) {
         return -1;
     }
     if (ve_tls_persistent_heartbeat_if_due(persistent, 0) != 0) {
@@ -768,17 +884,17 @@ int ve_tls_persistent_append(ve_tls_persistent * persistent, int64_t log_id, con
             }
         }
         if (ref.size == record_size && ref.segment_id != 0) {
-            persistent->current_bytes += (uint64_t)record_size;
-            persistent->current_records += 1;
+            persistent->current_bytes = add_u64_saturating(persistent->current_bytes, (uint64_t)record_size);
+            persistent->current_records = add_u64_saturating(persistent->current_records, 1);
             if (persistent->current_segments == 0) {
                 persistent->current_segments = 1;
             } else if (persistent->store.active_segment_id != prev_segment) {
-                persistent->current_segments += 1;
+                if (persistent->current_segments < UINT32_MAX) {
+                    persistent->current_segments++;
+                }
             }
-            if (is_soft_limit_exceeded(persistent->current_bytes, persistent->max_bytes, persistent->high_watermark_pct) ||
-                is_soft_limit_exceeded(persistent->current_records, persistent->max_records, persistent->high_watermark_pct) ||
-                is_soft_limit_exceeded(persistent->current_segments, persistent->max_segments, persistent->high_watermark_pct)) {
-                (void)reclaim_acked_segments(persistent, 1);
+            if (pressure_reclaim_needed(persistent)) {
+                (void)reclaim_to_low_watermark(persistent);
             }
         }
         if (rc == VE_TLS_SEGMENT_STORE_SYNC_FAILED) {
@@ -871,7 +987,11 @@ int ve_tls_persistent_recover(ve_tls_persistent * persistent, int (*on_record)(i
 }
 
 int ve_tls_persistent_ack_range(ve_tls_persistent * persistent, int64_t start_id, int64_t end_id) {
-    if (!persistent || !persistent->platform || end_id <= 0 || end_id < start_id) {
+    if (!persistent || !persistent->platform || start_id <= 0 || end_id <= 0 || end_id < start_id) {
+        return -1;
+    }
+    if (persistent->checkpoint.acked_log_id < INT64_MAX &&
+        start_id > persistent->checkpoint.acked_log_id + 1) {
         return -1;
     }
     if (ve_tls_persistent_heartbeat_if_due(persistent, 0) != 0) {

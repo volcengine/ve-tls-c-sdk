@@ -193,6 +193,9 @@ static int ve_tls_config_is_valid_for_create(const ve_tls_config * cfg) {
         ve_tls_persistent_durability durability;
         if (ve_tls_str_empty(cfg->persistent_file_path)) return 0;
         if (cfg->max_persistent_log_count <= 0 || cfg->max_persistent_file_size <= 0 || cfg->max_persistent_file_count <= 0) return 0;
+        if (cfg->persistent_low_watermark_pct <= 0 || cfg->persistent_high_watermark_pct <= 0 ||
+            cfg->persistent_high_watermark_pct > 100 ||
+            cfg->persistent_low_watermark_pct >= cfg->persistent_high_watermark_pct) return 0;
         if (ve_tls_resolve_persistent_durability(cfg, &durability) != 0) return 0;
     }
     if (cfg->buffer_full_policy == VE_TLS_BUFFER_FULL_BLOCK) {
@@ -289,6 +292,23 @@ static ve_tls_result ve_tls_map_persistent_flush_error(ve_tls_producer * produce
     return VE_TLS_PERSISTENT_ERROR;
 }
 
+static void ve_tls_record_persistent_append_drops(
+    ve_tls_producer * producer,
+    uint64_t dropped_records,
+    uint64_t dropped_bytes
+) {
+    if (!producer || (dropped_records == 0 && dropped_bytes == 0)) {
+        return;
+    }
+    ve_tls_metric_inc_u64(&producer->m_logs_dropped_total, dropped_records);
+    ve_tls_metric_inc_u64(&producer->m_bytes_dropped_total, dropped_bytes);
+    ve_tls_metrics_emit(
+        producer,
+        "persistent_overflow_drop_oldest_unacked",
+        dropped_records > (uint64_t)INT64_MAX ? INT64_MAX : (int64_t)dropped_records,
+        dropped_bytes > (uint64_t)INT64_MAX ? INT64_MAX : (int64_t)dropped_bytes);
+}
+
 static ve_tls_result ve_tls_persistent_append_with_retry_locked(
     ve_tls_producer * producer,
     int64_t id,
@@ -306,15 +326,20 @@ static ve_tls_result ve_tls_persistent_append_with_retry_locked(
         start_ms = producer->config.platform.time_ms();
     }
     for (;;) {
+        uint64_t dropped_records = 0;
+        uint64_t dropped_bytes = 0;
         producer->active_persistent_appends++;
         producer->config.platform.mutex_unlock(producer->mutex);
         if (producer->persistent_mutex) {
             producer->config.platform.mutex_lock(producer->persistent_mutex);
         }
         int prc = ve_tls_persistent_append(producer->persistent, id, hash_key, data, size);
+        dropped_records = producer->persistent->append_dropped_records;
+        dropped_bytes = producer->persistent->append_dropped_bytes;
         if (producer->persistent_mutex) {
             producer->config.platform.mutex_unlock(producer->persistent_mutex);
         }
+        ve_tls_record_persistent_append_drops(producer, dropped_records, dropped_bytes);
         if (prc == -3) {
             producer->config.platform.sleep_ms(5);
         }

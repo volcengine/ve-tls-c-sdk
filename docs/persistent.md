@@ -37,6 +37,14 @@ Persistent 目录包含这些文件：
 
 `VE_TLS_PDURABILITY_DEFAULT` 当前解析为 buffered WAL。旧字段 `force_flush_disk=1` 在 durability 未显式设置时兼容映射为 sync WAL。
 
+## 容量与水位
+
+`persistent_max_bytes`、`persistent_max_records` 和 `persistent_max_segments` 是独立硬上限。预测 append 后任一维度超过硬上限时，SDK 先回收可安全删除的 durable ACK closed segment；仍无空间时才执行 overflow policy。
+
+软水位采用 hysteresis：bytes、records、segments 任一已配置维度达到 high 即触发压力回收；回收按 segment 从旧到新进行，直到所有已配置维度都不高于 low，或遇到最旧的不可回收 segment。配置必须满足 `0 < low < high <= 100`。
+
+active segment、未 durable ACK segment 和 replay cursor 对应 segment 不会被水位回收。replay cursor 形成顺序屏障，清除后后续压力回收会从该 segment 继续。
+
 ## 语义边界
 
 - SDK 提供 at-least-once。崩溃、重试和 checkpoint 持久化边界可能带来少量重复。
@@ -55,10 +63,10 @@ Persistent 目录包含这些文件：
 
 | 策略 | 行为 | 适用场景 |
 | --- | --- | --- |
-| `VE_TLS_POVERFLOW_REJECT_NEW` | 空间不足时拒绝新日志，`add_log` 返回失败。 | 默认策略，适合不想静默丢弃的业务。 |
-| `VE_TLS_POVERFLOW_BLOCK` | 等待回收空间，超过 `persistent_block_timeout_ms` 后返回超时。 | 可以接受业务线程短暂等待的业务。 |
-| `VE_TLS_POVERFLOW_DROP_OLDEST_UNACKED` | 删除最老未 ack segment 换空间。 | 明确“保新不保旧”的场景。会牺牲 at-least-once 完整性。 |
-| `VE_TLS_POVERFLOW_DROP_NEWEST_SAMPLE` | 按 `persistent_sample_every_n` 采样丢弃新日志。 | 高峰期降采样。 |
+| `VE_TLS_POVERFLOW_REJECT_NEW` | 空间不足时拒绝新日志，旧 WAL 不变，`add_log` 返回失败。 | 默认策略，适合不想静默删除已接受日志的业务。 |
+| `VE_TLS_POVERFLOW_BLOCK` | 旧 WAL 不变；等待回收空间，超过 `persistent_block_timeout_ms` 后返回超时。 | 可以接受业务线程短暂等待的业务。 |
+| `VE_TLS_POVERFLOW_DROP_OLDEST_UNACKED` | 删除最老未 ack closed segment 换空间，并发出 `persistent_overflow_drop_oldest_unacked`。 | 明确“保新不保旧”的场景。会牺牲已接受日志的 at-least-once 完整性。 |
+| `VE_TLS_POVERFLOW_DROP_NEWEST_SAMPLE` | 按 `persistent_sample_every_n` 对新日志选择等待或拒绝；不会删除旧 WAL。 | 高峰期优先保留既有 backlog。 |
 
 ## lease 与 stale takeover
 

@@ -78,6 +78,8 @@ struct ve_tls_persistent {
     int64_t checkpoint_dirty_since_ms;
     uint32_t next_reclaim_segment_id;
     int64_t last_reclaim_acked_log_id;
+    uint64_t append_dropped_records;
+    uint64_t append_dropped_bytes;
     uint8_t checkpoint_dirty;
     uint8_t reclaim_pending;
     ve_tls_persistent_segment_meta * segment_meta;

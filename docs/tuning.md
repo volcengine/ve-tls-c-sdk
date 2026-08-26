@@ -16,7 +16,9 @@ Persistent 模式还需要单独控制磁盘：
 - `persistent_max_bytes` 控制总字节上限。
 - `persistent_max_records` 控制总记录数上限。
 - `persistent_max_segments` 控制 segment 数量。
-- `persistent_high_watermark_pct` 和 `persistent_low_watermark_pct` 控制水位回收。
+- `persistent_high_watermark_pct` 和 `persistent_low_watermark_pct` 形成回收迟滞区间，必须满足 `0 < low < high <= 100`。
+
+bytes、records、segments 任一已配置维度达到 high 就触发回收；只有所有维度都回到 low 以下才停止。不能只放大其中一个上限来规避压力，最紧的维度仍会成为实际容量边界。
 
 不要只调大磁盘上限。网络长期不可用时，越大的 backlog 代表越长的恢复时间，也代表越大的重复窗口。
 
@@ -35,7 +37,7 @@ Persistent 模式还需要单独控制磁盘：
 - `send_queue_full_policy=DROP`：manager 无法入 send queue 时丢批。
 - `send_queue_full_policy=DROP_SAMPLED`：按采样间隔丢弃，用于写入高峰下的折中策略。
 
-Persistent 的 overflow policy 决定磁盘满后的行为。默认 `REJECT_NEW` 比静默丢弃更容易排查。
+Persistent 的 overflow policy 决定硬上限仍无法释放时的行为。默认 `REJECT_NEW` 保留旧 WAL；`BLOCK` 保留旧 WAL 但阻塞调用方；`DROP_NEWEST_SAMPLE` 只作用于新日志；只有 `DROP_OLDEST_UNACKED` 会显式删除已接受记录，必须监控 `persistent_overflow_drop_oldest_unacked`。
 
 ## 默认派生档位
 

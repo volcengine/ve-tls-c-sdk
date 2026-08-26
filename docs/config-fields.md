@@ -109,8 +109,8 @@
 | `persistent_max_bytes` | 文件大小乘文件数 | 本地持久化总字节上限。 |
 | `persistent_max_records` | `max_persistent_log_count` | 本地持久化总记录上限。 |
 | `persistent_max_segments` | `max_persistent_file_count` | segment 总数上限。 |
-| `persistent_high_watermark_pct` | `85` | 超过软水位后优先尝试回收已 ack segment。 |
-| `persistent_low_watermark_pct` | `70` | 回收后的目标低水位。 |
+| `persistent_high_watermark_pct` | `85` | bytes、records、segments 任一已配置维度达到该比例时，触发已 ack closed segment 回收。 |
+| `persistent_low_watermark_pct` | `70` | 压力回收持续到所有已配置维度都不高于该比例，或没有可回收 segment。必须满足 `0 < low < high <= 100`。 |
 | `persistent_overflow_policy` | `VE_TLS_POVERFLOW_REJECT_NEW` | 空间不足时拒绝新日志、阻塞、丢最老未 ack segment 或采样丢弃新日志。 |
 | `persistent_sample_every_n` | `10` | `DROP_NEWEST_SAMPLE` 策略下的采样间隔。 |
 | `persistent_block_timeout_ms` | `1000` | `BLOCK` 策略下等待可用空间的最长时间。 |
