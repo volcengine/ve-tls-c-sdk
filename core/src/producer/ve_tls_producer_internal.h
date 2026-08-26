@@ -161,7 +161,7 @@ struct ve_tls_producer {
     int32_t worker_flushing_count;
     int32_t active_persistent_appends;
     ve_tls_completed_ack_range * persistent_ack_head;
-    int64_t next_id;
+    _Alignas(8) int64_t next_id;
     ve_tls_log_item * queue;
     size_t queue_cap;
     size_t queue_head;
@@ -215,28 +215,45 @@ struct ve_tls_producer {
     char * cfg_user_agent;
     char * cfg_persistent_file_path;
     ve_tls_persistent * persistent;
-    int64_t send_cfg_version;
-    int64_t static_cred_version;
+    _Alignas(8) int64_t send_cfg_version;
+    _Alignas(8) int64_t static_cred_version;
     _Atomic(ve_tls_runtime_snapshot *) runtime_snapshot;
     ve_tls_obj_pool send_task_pool;
     ve_tls_obj_pool header_buf_pool;
     ve_tls_obj_pool compress_buf_pool;
-    uint64_t m_logs_enqueued_total;
-    uint64_t m_logs_dropped_total;
-    uint64_t m_bytes_enqueued_total;
-    uint64_t m_bytes_dropped_total;
-    uint64_t m_batches_built_total;
-    uint64_t m_requests_total;
-    uint64_t m_requests_failed_total;
-    uint64_t m_retries_total;
-    uint64_t m_bytes_sent_total;
-    uint64_t m_latency_buckets[8];
+    _Alignas(8) _Atomic(uint64_t) m_logs_enqueued_total;
+    _Alignas(8) _Atomic(uint64_t) m_logs_dropped_total;
+    _Alignas(8) _Atomic(uint64_t) m_bytes_enqueued_total;
+    _Alignas(8) _Atomic(uint64_t) m_bytes_dropped_total;
+    _Alignas(8) _Atomic(uint64_t) m_batches_built_total;
+    _Alignas(8) _Atomic(uint64_t) m_requests_total;
+    _Alignas(8) _Atomic(uint64_t) m_requests_failed_total;
+    _Alignas(8) _Atomic(uint64_t) m_retries_total;
+    _Alignas(8) _Atomic(uint64_t) m_bytes_sent_total;
+    _Alignas(8) _Atomic(uint64_t) m_latency_buckets[8];
     int32_t use_global_env;
     int32_t env_registered;
     int32_t env_in_queue;
     int32_t env_inflight;
     ve_tls_producer * env_next;
 };
+
+#define VE_TLS_ASSERT_ATOMIC64_ALIGNED(field) \
+    _Static_assert(offsetof(struct ve_tls_producer, field) % 8 == 0, #field " must be 8-byte aligned")
+VE_TLS_ASSERT_ATOMIC64_ALIGNED(next_id);
+VE_TLS_ASSERT_ATOMIC64_ALIGNED(send_cfg_version);
+VE_TLS_ASSERT_ATOMIC64_ALIGNED(static_cred_version);
+VE_TLS_ASSERT_ATOMIC64_ALIGNED(m_logs_enqueued_total);
+VE_TLS_ASSERT_ATOMIC64_ALIGNED(m_logs_dropped_total);
+VE_TLS_ASSERT_ATOMIC64_ALIGNED(m_bytes_enqueued_total);
+VE_TLS_ASSERT_ATOMIC64_ALIGNED(m_bytes_dropped_total);
+VE_TLS_ASSERT_ATOMIC64_ALIGNED(m_batches_built_total);
+VE_TLS_ASSERT_ATOMIC64_ALIGNED(m_requests_total);
+VE_TLS_ASSERT_ATOMIC64_ALIGNED(m_requests_failed_total);
+VE_TLS_ASSERT_ATOMIC64_ALIGNED(m_retries_total);
+VE_TLS_ASSERT_ATOMIC64_ALIGNED(m_bytes_sent_total);
+VE_TLS_ASSERT_ATOMIC64_ALIGNED(m_latency_buckets);
+#undef VE_TLS_ASSERT_ATOMIC64_ALIGNED
 
 void ve_tls_producer_config_init(ve_tls_config * config);
 void ve_tls_producer_config_apply_runtime_defaults(ve_tls_config * config);
@@ -255,8 +272,8 @@ void ve_tls_breaker_wait_open(ve_tls_producer * producer);
 int ve_tls_breaker_try_enter_half_open(ve_tls_producer * producer);
 void ve_tls_breaker_leave_half_open(ve_tls_producer * producer, int ok);
 void ve_tls_breaker_on_final_result(ve_tls_producer * producer, int ok);
-void ve_tls_metric_inc_u64(uint64_t * p, uint64_t v);
-uint64_t ve_tls_metric_load_u64(uint64_t * p);
+void ve_tls_metric_inc_u64(_Atomic(uint64_t) * p, uint64_t v);
+uint64_t ve_tls_metric_load_u64(_Atomic(uint64_t) * p);
 void ve_tls_persistent_on_final_result(ve_tls_producer * producer, ve_tls_result result, int64_t start_id, int64_t end_id);
 int ve_tls_persistent_heartbeat_if_due(ve_tls_persistent * persistent, int force);
 
