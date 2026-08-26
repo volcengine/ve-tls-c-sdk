@@ -28,6 +28,15 @@ Persistent 目录包含这些文件：
 
 每个 Producer 或进程建议使用独立目录。多个活跃进程写同一个目录会破坏语义，`lease` 只能降低误用概率，不能把它变成多写者队列。
 
+## 落盘模式
+
+| 模式 | `add_log` 成功边界 | 主动同步边界 |
+| --- | --- | --- |
+| `VE_TLS_PDURABILITY_BUFFERED_WAL` | segment `write` 成功，数据可能仍在 OS page cache | segment rotation、`ve_tls_producer_flush()` 和正常 close |
+| `VE_TLS_PDURABILITY_SYNC_WAL` | segment `write` 及该文件的 `fsync` 成功 | 每条 append；无 dirty 数据时 flush 不重复 `fsync` |
+
+`VE_TLS_PDURABILITY_DEFAULT` 当前解析为 buffered WAL。旧字段 `force_flush_disk=1` 在 durability 未显式设置时兼容映射为 sync WAL。
+
 ## 语义边界
 
 - SDK 提供 at-least-once。崩溃、重试和 checkpoint 持久化边界可能带来少量重复。
@@ -36,9 +45,9 @@ Persistent 目录包含这些文件：
 - 发送失败 callback 描述的是本轮发送结果，不代表 persistent 记录已经永久丢弃。当前没有“发送失败后显式永久丢弃”的公共策略。
 - 本轮发送结束后，未 ACK 记录保留在 WAL 中；当前实现不会自动开启下一轮长期重试，需要进程重启或再次调用 `ve_tls_producer_recover()` 才会重新入队。
 - `add_log` 在 persistent append 之前失败时不在恢复范围内；如果 append 已成功、后续内存入队失败，接口可能返回失败但记录仍会被 recover，调用方需要用 log id 或业务主键处理潜在重复。
+- sync WAL 中，record `write` 成功但 `fsync` 失败时，`add_log` 返回 `VE_TLS_PERSISTENT_ERROR`，已写 record 仍保留并可在后续 flush/recover 中出现。调用方重试可能形成重复。
 - checkpoint 保存失败时保持 dirty，不回收对应记录，并发出 `persistent_checkpoint_save_failed` metric；metric 的两个值分别是本次完成范围的 `start_id` 和 `end_id`。
 - checkpoint 损坏时，SDK 会优先保证不漏发；代价是可能扩大重复范围。
-- 当前 C core 不对每条日志 append 执行 `fsync`。如果业务需要进程外掉电级保证，需要在上层设计额外的持久化策略。
 
 如果业务不能接受重复，必须使用业务主键或消费侧去重。不要把 SDK 的 at-least-once 解释成 exactly-once。
 

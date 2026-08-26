@@ -152,6 +152,35 @@ static void ve_tls_warn_risky_block_config(const ve_tls_config * cfg) {
     }
 }
 
+static int ve_tls_resolve_persistent_durability(
+    const ve_tls_config * cfg,
+    ve_tls_persistent_durability * out
+) {
+    ve_tls_persistent_durability durability;
+    if (!cfg || !out) {
+        return -1;
+    }
+    durability = cfg->persistent_durability;
+    if (durability == VE_TLS_PDURABILITY_DEFAULT) {
+        *out = cfg->force_flush_disk
+            ? VE_TLS_PDURABILITY_SYNC_WAL
+            : VE_TLS_PDURABILITY_BUFFERED_WAL;
+        return 0;
+    }
+    if (durability == VE_TLS_PDURABILITY_BUFFERED_WAL) {
+        if (cfg->force_flush_disk) {
+            return -1;
+        }
+        *out = durability;
+        return 0;
+    }
+    if (durability == VE_TLS_PDURABILITY_SYNC_WAL) {
+        *out = durability;
+        return 0;
+    }
+    return -1;
+}
+
 static int ve_tls_config_is_valid_for_create(const ve_tls_config * cfg) {
     if (!cfg) return 0;
     if (!ve_tls_is_http_url(cfg->endpoint)) return 0;
@@ -161,8 +190,10 @@ static int ve_tls_config_is_valid_for_create(const ve_tls_config * cfg) {
         if (ve_tls_str_empty(cfg->access_key_id) || ve_tls_str_empty(cfg->access_key_secret)) return 0;
     }
     if (cfg->use_persistent) {
+        ve_tls_persistent_durability durability;
         if (ve_tls_str_empty(cfg->persistent_file_path)) return 0;
         if (cfg->max_persistent_log_count <= 0 || cfg->max_persistent_file_size <= 0 || cfg->max_persistent_file_count <= 0) return 0;
+        if (ve_tls_resolve_persistent_durability(cfg, &durability) != 0) return 0;
     }
     if (cfg->buffer_full_policy == VE_TLS_BUFFER_FULL_BLOCK) {
         if (cfg->max_buffer_bytes <= 0) return 0;
@@ -216,7 +247,12 @@ static void ve_tls_release_queue_reservation_locked(ve_tls_producer * producer, 
     producer->config.platform.cond_broadcast(producer->cond);
 }
 
-static ve_tls_result ve_tls_map_persistent_append_error(ve_tls_producer * producer, int prc, size_t dropped_bytes) {
+static ve_tls_result ve_tls_map_persistent_append_error(
+    ve_tls_producer * producer,
+    int prc,
+    int64_t log_id,
+    size_t dropped_bytes
+) {
     if (prc == -2) {
         ve_tls_metric_inc_u64(&producer->m_logs_dropped_total, 1);
         ve_tls_metric_inc_u64(&producer->m_bytes_dropped_total, dropped_bytes);
@@ -230,6 +266,25 @@ static ve_tls_result ve_tls_map_persistent_append_error(ve_tls_producer * produc
         ve_tls_metrics_emit(producer, "log_dropped_persistent_overflow_timeout", 1, (int64_t)dropped_bytes);
         ve_tls_metrics_emit(producer, "log_dropped", 1, (int64_t)dropped_bytes);
         return VE_TLS_TIMEOUT;
+    }
+    if (prc == VE_TLS_PERSISTENT_APPEND_SYNC_FAILED) {
+        ve_tls_metrics_emit(producer, "persistent_sync_failed", log_id, (int64_t)dropped_bytes);
+        return VE_TLS_PERSISTENT_ERROR;
+    }
+    ve_tls_metrics_emit(producer, "persistent_append_failed", log_id, (int64_t)dropped_bytes);
+    return VE_TLS_PERSISTENT_ERROR;
+}
+
+static ve_tls_result ve_tls_map_persistent_flush_error(ve_tls_producer * producer, int flush_rc) {
+    if (flush_rc == 0) {
+        return VE_TLS_OK;
+    }
+    if (flush_rc == VE_TLS_PERSISTENT_APPEND_SYNC_FAILED) {
+        ve_tls_metrics_emit(producer, "persistent_sync_failed", 0, 0);
+    } else if (flush_rc == VE_TLS_PERSISTENT_FLUSH_CHECKPOINT_FAILED) {
+        ve_tls_metrics_emit(producer, "persistent_checkpoint_save_failed", 0, 0);
+    } else {
+        ve_tls_metrics_emit(producer, "persistent_flush_failed", 0, 0);
     }
     return VE_TLS_PERSISTENT_ERROR;
 }
@@ -273,12 +328,12 @@ static ve_tls_result ve_tls_persistent_append_with_retry_locked(
             return VE_TLS_OK;
         }
         if (prc != -3) {
-            return ve_tls_map_persistent_append_error(producer, prc, size);
+            return ve_tls_map_persistent_append_error(producer, prc, id, size);
         }
         if (timeout_ms > 0 && producer->config.platform.time_ms) {
             int64_t now_ms = producer->config.platform.time_ms();
             if (start_ms > 0 && now_ms - start_ms >= timeout_ms) {
-                return ve_tls_map_persistent_append_error(producer, -3, size);
+                return ve_tls_map_persistent_append_error(producer, -3, id, size);
             }
         }
     }
@@ -1366,6 +1421,7 @@ ve_tls_producer * ve_tls_producer_create(const ve_tls_config * config) {
     producer->accepting = 1;
     if (producer->config.use_persistent) {
         ve_tls_persistent_options popt;
+        ve_tls_persistent_durability durability;
         producer->persistent_mutex = producer->config.platform.mutex_create();
         if (!producer->persistent_mutex) {
             ve_tls_producer_destroy(producer);
@@ -1405,6 +1461,11 @@ ve_tls_producer * ve_tls_producer_create(const ve_tls_config * config) {
         popt.open_mode = producer->config.persistent_open_mode == VE_TLS_POPEN_FAIL_IF_OWNED
             ? VE_TLS_LEASE_OPEN_FAIL_IF_OWNED
             : VE_TLS_LEASE_OPEN_TAKEOVER_IF_STALE;
+        if (ve_tls_resolve_persistent_durability(&producer->config, &durability) != 0) {
+            ve_tls_producer_destroy(producer);
+            return NULL;
+        }
+        popt.durability = durability;
         if (ve_tls_persistent_open(producer->persistent, &popt) != 0) {
             ve_tls_producer_destroy(producer);
             return NULL;
@@ -1655,7 +1716,7 @@ ve_tls_result ve_tls_producer_close(ve_tls_producer * producer, int32_t timeout_
             producer->config.platform.mutex_unlock(producer->persistent_mutex);
         }
         if (flush_rc != 0) {
-            rc = VE_TLS_DROP_ERROR;
+            rc = ve_tls_map_persistent_flush_error(producer, flush_rc);
         }
     }
     return rc;
@@ -1709,7 +1770,7 @@ ve_tls_result ve_tls_producer_close_split(ve_tls_producer * producer, int32_t fl
             producer->config.platform.mutex_unlock(producer->persistent_mutex);
         }
         if (flush_rc != 0) {
-            rc = VE_TLS_DROP_ERROR;
+            rc = ve_tls_map_persistent_flush_error(producer, flush_rc);
         }
     }
     return rc;
@@ -2782,6 +2843,7 @@ ve_tls_result ve_tls_producer_add_log_with_len_time_parts_hashkey(ve_tls_produce
 }
 
 ve_tls_result ve_tls_producer_flush(ve_tls_producer * producer) {
+    int flush_rc = 0;
     if (!producer) {
         return VE_TLS_INVALID;
     }
@@ -2789,7 +2851,16 @@ ve_tls_result ve_tls_producer_flush(ve_tls_producer * producer) {
     producer->flush_requested = 1;
     producer->config.platform.cond_broadcast(producer->cond);
     producer->config.platform.mutex_unlock(producer->mutex);
-    return VE_TLS_OK;
+    if (producer->persistent) {
+        if (producer->persistent_mutex) {
+            producer->config.platform.mutex_lock(producer->persistent_mutex);
+        }
+        flush_rc = ve_tls_persistent_flush(producer->persistent);
+        if (producer->persistent_mutex) {
+            producer->config.platform.mutex_unlock(producer->persistent_mutex);
+        }
+    }
+    return ve_tls_map_persistent_flush_error(producer, flush_rc);
 }
 
 ve_tls_result ve_tls_producer_recover(ve_tls_producer * producer) {

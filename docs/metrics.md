@@ -38,6 +38,10 @@ Persistent 模式下，指标要和本地目录状态一起看：
 - `requests_failed_total` 与 `retries_total` 增长：先看回调中的 `http_code`、`error_code` 和 `retryable`。
 - `ve_tls_producer_get_buffered_bytes()` 长时间接近 `max_buffer_bytes`：发送速度跟不上写入，或 close/drain 时间不足。
 - persistent 目录持续增长：说明 backlog 没有被 ack 到可回收位置，优先查发送回调和网络。
+- `persistent_append_failed(log_id, bytes)`：record 未完整 append，常见原因是目录权限、磁盘空间或短写。
+- `persistent_sync_failed(log_id, bytes)`：record 或 dirty segment 的 `fsync` 失败；flush/close 失败时两个值为 `0`。
+- `persistent_checkpoint_save_failed(start_id, end_id)`：checkpoint 未 durable；保持 dirty 且不回收对应范围。
+- `persistent_flush_failed(0, 0)`：flush 的非 sync、非 checkpoint 阶段失败。
 
 `tools/persistent_real_bench.c` 会输出 `current_records`、`current_bytes`、`acked_log_id` 等字段，适合压测和恢复验证。它不是稳定的公共 metrics API，线上接入不要依赖这些内部字段。
 

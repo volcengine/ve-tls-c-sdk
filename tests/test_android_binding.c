@@ -154,6 +154,7 @@ static int test_android_binding_build_persistent_path_and_clamps_sender(void) {
     in.max_persistent_file_size = 1048576;
     in.max_persistent_file_count = 10;
     in.force_flush_disk = 1;
+    in.persistent_durability = VE_TLS_PDURABILITY_SYNC_WAL;
 
     rc = ve_tls_android_binding_build_config(&in, &out, &runtime);
     if (rc != VE_TLS_OK) {
@@ -199,7 +200,8 @@ static int test_android_binding_build_persistent_path_and_clamps_sender(void) {
     if (out.max_persistent_log_count != 65536 ||
         out.max_persistent_file_size != 1048576 ||
         out.max_persistent_file_count != 10 ||
-        out.force_flush_disk != 1) {
+        out.force_flush_disk != 1 ||
+        out.persistent_durability != VE_TLS_PDURABILITY_SYNC_WAL) {
         fprintf(stderr, "persistent limit fields were not copied\n");
         return 1;
     }

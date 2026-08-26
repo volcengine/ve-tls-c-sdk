@@ -47,6 +47,7 @@ static void ve_tls_android_config_view_copy_runtime_fields(const ve_tls_android_
     out->max_persistent_file_size = in->max_persistent_file_size;
     out->max_persistent_file_count = in->max_persistent_file_count;
     out->force_flush_disk = in->force_flush_disk;
+    out->persistent_durability = (ve_tls_persistent_durability)in->persistent_durability;
 }
 
 static int ve_tls_android_binding_sanitize_process_name(const char * in, char * out, size_t out_cap) {

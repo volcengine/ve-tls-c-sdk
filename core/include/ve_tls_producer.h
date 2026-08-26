@@ -44,6 +44,12 @@ typedef enum {
     VE_TLS_POPEN_TAKEOVER_IF_STALE = 1
 } ve_tls_persistent_open_mode;
 
+typedef enum {
+    VE_TLS_PDURABILITY_DEFAULT = 0,
+    VE_TLS_PDURABILITY_BUFFERED_WAL = 1,
+    VE_TLS_PDURABILITY_SYNC_WAL = 2
+} ve_tls_persistent_durability;
+
 typedef struct {
     const char * key;
     const char * value;
@@ -134,6 +140,7 @@ typedef struct {
     int32_t max_persistent_file_size;
     int32_t max_persistent_file_count;
     int32_t force_flush_disk;
+    ve_tls_persistent_durability persistent_durability;
     int32_t persistent_max_bytes;
     int32_t persistent_max_records;
     int32_t persistent_max_segments;

@@ -37,6 +37,7 @@
 Persistent 模式下，失败可能发生在发送前：
 
 - append segment 失败：通常是目录不可写、磁盘不足或参数不合法。
+- sync segment 失败：`add_log` 或 flush/close 返回 `VE_TLS_PERSISTENT_ERROR`；write 已完成时记录仍可能被 recover。
 - recover 失败：通常是目录格式异常、lease 冲突或存储文件损坏超过可修复范围。
 - checkpoint 写入失败：可能导致下一次 recover 重放更多日志。
 - quota 命中：按 `persistent_overflow_policy` 返回失败、阻塞或丢弃。

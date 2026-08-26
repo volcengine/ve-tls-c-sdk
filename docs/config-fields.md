@@ -117,4 +117,5 @@
 | `persistent_lease_timeout_ms` | `60000` | owner stale 判定时间。 |
 | `persistent_heartbeat_interval_ms` | `10000` | owner lease 心跳间隔。 |
 | `persistent_open_mode` | `VE_TLS_POPEN_TAKEOVER_IF_STALE` | `FAIL_IF_OWNED` 会在目录被占用时失败；`TAKEOVER_IF_STALE` 允许 stale 后接管。 |
-| `force_flush_disk` | `0` | 字段已暴露，但 C core 当前不把它作为每条日志 append 后强制 `fsync` 的语义。 |
+| `persistent_durability` | `VE_TLS_PDURABILITY_DEFAULT` | 默认解析为 `BUFFERED_WAL`；也可显式选择 `BUFFERED_WAL` 或 `SYNC_WAL`。 |
+| `force_flush_disk` | `0` | 兼容字段。durability 为 `DEFAULT` 且该值非零时映射为 `SYNC_WAL`；与显式 `BUFFERED_WAL` 同时设置会拒绝创建。 |

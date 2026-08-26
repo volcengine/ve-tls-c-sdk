@@ -319,10 +319,28 @@ static int open_active_segment(ve_tls_segment_store * store, uint32_t segment_id
     store->active_segment_id = segment_id;
     store->active_size = valid_end;
     store->active_records = record_count;
+    store->active_dirty = 0;
     return 0;
 }
 
+int ve_tls_segment_store_flush(ve_tls_segment_store * store) {
+    if (!store || !store->platform || !store->active_file) {
+        return VE_TLS_SEGMENT_STORE_ERROR;
+    }
+    if (!store->active_dirty) {
+        return VE_TLS_SEGMENT_STORE_OK;
+    }
+    if (store->platform->file_fsync(store->active_file) != 0) {
+        return VE_TLS_SEGMENT_STORE_SYNC_FAILED;
+    }
+    store->active_dirty = 0;
+    return VE_TLS_SEGMENT_STORE_OK;
+}
+
 static int rotate_segment(ve_tls_segment_store * store) {
+    if (ve_tls_segment_store_flush(store) != VE_TLS_SEGMENT_STORE_OK) {
+        return VE_TLS_SEGMENT_STORE_SYNC_FAILED;
+    }
     if (store->active_file) {
         store->platform->file_close(store->active_file);
         store->active_file = NULL;
@@ -339,6 +357,7 @@ int ve_tls_segment_store_open(ve_tls_segment_store * store, const ve_tls_segment
     store->platform = options->platform;
     store->segment_max_bytes = options->segment_max_bytes > 0 ? options->segment_max_bytes : (64 * 1024);
     store->segment_max_records = options->segment_max_records > 0 ? options->segment_max_records : 1024;
+    store->sync_on_append = options->sync_on_append ? 1 : 0;
     if (strlen(options->dir_path) >= sizeof(store->dir_path)) {
         return -1;
     }
@@ -367,6 +386,7 @@ void ve_tls_segment_store_close(ve_tls_segment_store * store) {
         return;
     }
     if (store->active_file) {
+        (void)ve_tls_segment_store_flush(store);
         store->platform->file_close(store->active_file);
         store->active_file = NULL;
     }
@@ -380,22 +400,28 @@ int ve_tls_segment_store_append(ve_tls_segment_store * store, const unsigned cha
     }
     if ((store->active_size > 0 && store->active_size + size > store->segment_max_bytes) ||
         (store->active_records > 0 && store->active_records >= store->segment_max_records)) {
-        if (rotate_segment(store) != 0) {
-            return -1;
+        int rotate_rc = rotate_segment(store);
+        if (rotate_rc != VE_TLS_SEGMENT_STORE_OK) {
+            return rotate_rc;
         }
     }
     offset = store->active_size;
     if (write_full(store->platform, store->active_file, record, size) != 0) {
-        return -1;
+        (void)store->platform->file_truncate(store->active_file, (int64_t)offset);
+        return VE_TLS_SEGMENT_STORE_ERROR;
     }
     store->active_size += size;
     store->active_records++;
+    store->active_dirty = 1;
     if (out_ref) {
         out_ref->segment_id = store->active_segment_id;
         out_ref->offset = offset;
         out_ref->size = (uint32_t)size;
     }
-    return 0;
+    if (store->sync_on_append) {
+        return ve_tls_segment_store_flush(store);
+    }
+    return VE_TLS_SEGMENT_STORE_OK;
 }
 
 int ve_tls_segment_store_read(ve_tls_segment_store * store, uint32_t segment_id, uint64_t offset, unsigned char ** out_record, size_t * out_size, uint64_t * next_offset) {

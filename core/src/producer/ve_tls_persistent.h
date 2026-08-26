@@ -1,11 +1,19 @@
 #ifndef VE_TLS_PERSISTENT_H
 #define VE_TLS_PERSISTENT_H
 
+#include "ve_tls_producer.h"
 #include "ve_tls_checkpoint.h"
 #include "ve_tls_lease.h"
 #include "ve_tls_segment_store.h"
 
 #include <stdint.h>
+
+enum {
+    VE_TLS_PERSISTENT_APPEND_REJECT_NEW = -2,
+    VE_TLS_PERSISTENT_APPEND_BLOCKED = -3,
+    VE_TLS_PERSISTENT_APPEND_SYNC_FAILED = -4,
+    VE_TLS_PERSISTENT_FLUSH_CHECKPOINT_FAILED = -5
+};
 
 typedef struct {
     ve_tls_platform * platform;
@@ -28,6 +36,7 @@ typedef struct {
     int64_t lease_timeout_ms;
     int64_t heartbeat_interval_ms;
     int open_mode;
+    ve_tls_persistent_durability durability;
 } ve_tls_persistent_options;
 
 typedef struct {
@@ -59,6 +68,7 @@ struct ve_tls_persistent {
     int64_t lease_timeout_ms;
     int64_t heartbeat_interval_ms;
     int32_t open_mode;
+    ve_tls_persistent_durability durability;
     int64_t next_heartbeat_ms;
     uint64_t current_bytes;
     uint64_t current_records;

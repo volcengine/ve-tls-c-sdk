@@ -6,8 +6,6 @@
 #include <stdio.h>
 #include <string.h>
 
-#define VE_TLS_PERSISTENT_APPEND_REJECT_NEW (-2)
-#define VE_TLS_PERSISTENT_APPEND_BLOCKED    (-3)
 #define VE_TLS_PERSISTENT_OVERFLOW_BLOCK 1
 #define VE_TLS_PERSISTENT_OVERFLOW_DROP_OLDEST_UNACKED 2
 #define VE_TLS_PERSISTENT_OVERFLOW_DROP_NEWEST_SAMPLE 3
@@ -583,6 +581,13 @@ int ve_tls_persistent_open(ve_tls_persistent * persistent, const ve_tls_persiste
     persistent->lease_timeout_ms = options->lease_timeout_ms;
     persistent->heartbeat_interval_ms = options->heartbeat_interval_ms;
     persistent->open_mode = options->open_mode;
+    persistent->durability = options->durability == VE_TLS_PDURABILITY_DEFAULT
+        ? VE_TLS_PDURABILITY_BUFFERED_WAL
+        : options->durability;
+    if (persistent->durability != VE_TLS_PDURABILITY_BUFFERED_WAL &&
+        persistent->durability != VE_TLS_PDURABILITY_SYNC_WAL) {
+        return -1;
+    }
     if (persistent->platform->path_mkdirs(persistent->dir_path, 0700) != 0) {
         return -1;
     }
@@ -632,6 +637,7 @@ int ve_tls_persistent_open(ve_tls_persistent * persistent, const ve_tls_persiste
     store_options.resume_segment_id = persistent->checkpoint.last_segment_id > 0
         ? persistent->checkpoint.last_segment_id
         : 0;
+    store_options.sync_on_append = persistent->durability == VE_TLS_PDURABILITY_SYNC_WAL ? 1 : 0;
     if (ve_tls_segment_store_open(&persistent->store, &store_options) != 0) {
         ve_tls_persistent_close(persistent);
         return -1;
@@ -680,9 +686,12 @@ int ve_tls_persistent_flush(ve_tls_persistent * persistent) {
     if (!persistent || !persistent->platform) {
         return -1;
     }
+    if (ve_tls_segment_store_flush(&persistent->store) != VE_TLS_SEGMENT_STORE_OK) {
+        return VE_TLS_PERSISTENT_APPEND_SYNC_FAILED;
+    }
     if (persistent->checkpoint_dirty) {
         if (checkpoint_save_if_due(persistent, 1) != 0) {
-            return -1;
+            return VE_TLS_PERSISTENT_FLUSH_CHECKPOINT_FAILED;
         }
     }
     if (persistent->durable_checkpoint_acked_log_id > persistent->last_reclaim_acked_log_id) {
@@ -741,7 +750,7 @@ int ve_tls_persistent_append(ve_tls_persistent * persistent, int64_t log_id, con
         uint32_t prev_segment = persistent->store.active_segment_id;
         memset(&ref, 0, sizeof(ref));
         rc = ve_tls_segment_store_append(&persistent->store, record_buf, record_size, &ref);
-        if (rc == 0) {
+        if (ref.size == record_size && ref.segment_id != 0) {
             ve_tls_persistent_segment_meta * meta;
             meta = get_segment_meta_slot(persistent, ref.segment_id);
             if (!meta) {
@@ -758,7 +767,7 @@ int ve_tls_persistent_append(ve_tls_persistent * persistent, int64_t log_id, con
                 }
             }
         }
-        if (rc == 0) {
+        if (ref.size == record_size && ref.segment_id != 0) {
             persistent->current_bytes += (uint64_t)record_size;
             persistent->current_records += 1;
             if (persistent->current_segments == 0) {
@@ -771,6 +780,9 @@ int ve_tls_persistent_append(ve_tls_persistent * persistent, int64_t log_id, con
                 is_soft_limit_exceeded(persistent->current_segments, persistent->max_segments, persistent->high_watermark_pct)) {
                 (void)reclaim_acked_segments(persistent, 1);
             }
+        }
+        if (rc == VE_TLS_SEGMENT_STORE_SYNC_FAILED) {
+            rc = VE_TLS_PERSISTENT_APPEND_SYNC_FAILED;
         }
     }
     return rc;

@@ -460,9 +460,17 @@ static ve_tls_mutex * g_track_producer_mutex = NULL;
 static _Thread_local int g_track_producer_mutex_depth = 0;
 static int g_track_file_write_saw_producer_mutex = 0;
 static int g_fail_next_file_fsync = 0;
+static int g_file_fsync_calls = 0;
+static int g_fail_file_fsync_call = 0;
+static int g_fail_next_file_write = 0;
+static int g_fail_next_segment_open = 0;
+static int g_short_write_then_fail = 0;
 static int g_checkpoint_save_failed_events = 0;
 static int64_t g_checkpoint_save_failed_start_id = 0;
 static int64_t g_checkpoint_save_failed_end_id = 0;
+static int g_persistent_append_failed_events = 0;
+static int g_persistent_sync_failed_events = 0;
+static int64_t g_persistent_failure_log_id = 0;
 
 static int test_path_in_tracked_dir(const char * path) {
     size_t n;
@@ -565,12 +573,51 @@ static int test_fail_next_file_fsync(ve_tls_file * f) {
     return g_real_platform.file_fsync(f);
 }
 
+static int test_count_file_fsync(ve_tls_file * f) {
+    int call = __atomic_add_fetch(&g_file_fsync_calls, 1, __ATOMIC_ACQ_REL);
+    if (__atomic_load_n(&g_fail_file_fsync_call, __ATOMIC_ACQUIRE) == call) {
+        return -1;
+    }
+    return g_real_platform.file_fsync(f);
+}
+
+static int64_t test_short_write_then_fail_file_write(ve_tls_file * f, const void * buf, size_t size) {
+    if (__atomic_exchange_n(&g_fail_next_file_write, 0, __ATOMIC_ACQ_REL)) {
+        return -1;
+    }
+    int state = __atomic_load_n(&g_short_write_then_fail, __ATOMIC_ACQUIRE);
+    if (state == 1) {
+        size_t partial = size > 1 ? size / 2 : 1;
+        __atomic_store_n(&g_short_write_then_fail, 2, __ATOMIC_RELEASE);
+        return g_real_platform.file_write(f, buf, partial);
+    }
+    if (state == 2) {
+        __atomic_store_n(&g_short_write_then_fail, 0, __ATOMIC_RELEASE);
+        return -1;
+    }
+    return g_real_platform.file_write(f, buf, size);
+}
+
+static ve_tls_file * test_fail_next_segment_file_open(const char * path, int flags, int mode) {
+    if (path && strstr(path, "/seg-") != NULL &&
+        __atomic_exchange_n(&g_fail_next_segment_open, 0, __ATOMIC_ACQ_REL)) {
+        return NULL;
+    }
+    return g_real_platform.file_open(path, flags, mode);
+}
+
 static void test_persistent_checkpoint_metrics_emit(const char * name, int64_t v1, int64_t v2, void * user_param) {
     (void)user_param;
     if (name && strcmp(name, "persistent_checkpoint_save_failed") == 0) {
         g_checkpoint_save_failed_events++;
         g_checkpoint_save_failed_start_id = v1;
         g_checkpoint_save_failed_end_id = v2;
+    } else if (name && strcmp(name, "persistent_append_failed") == 0) {
+        g_persistent_append_failed_events++;
+        g_persistent_failure_log_id = v1;
+    } else if (name && strcmp(name, "persistent_sync_failed") == 0) {
+        g_persistent_sync_failed_events++;
+        g_persistent_failure_log_id = v1;
     }
 }
 
@@ -9064,6 +9111,455 @@ static int test_segment_store_append_read_rotate_and_repair(void) {
     return 0;
 }
 
+static int test_segment_store_buffered_and_sync_durability(void) {
+    char buffered_dir[PATH_MAX] = {0};
+    char sync_dir[PATH_MAX] = {0};
+    ve_tls_config cfg;
+    ve_tls_segment_store_options opt;
+    ve_tls_segment_store store;
+    ve_tls_segment_record_ref ref;
+    static const unsigned char record[] = "durability-record";
+    if (make_temp_dir(buffered_dir, sizeof(buffered_dir)) != 0 ||
+        make_temp_dir(sync_dir, sizeof(sync_dir)) != 0) {
+        cleanup_persistent_dir(buffered_dir);
+        cleanup_persistent_dir(sync_dir);
+        return -1;
+    }
+    ve_tls_config_init(&cfg);
+    g_real_platform = cfg.platform;
+    g_fake_time = 1000;
+    cfg.platform.time_ms = test_fake_time_ms;
+    cfg.platform.file_fsync = test_count_file_fsync;
+
+    memset(&opt, 0, sizeof(opt));
+    memset(&store, 0, sizeof(store));
+    opt.platform = &cfg.platform;
+    opt.dir_path = buffered_dir;
+    opt.segment_max_bytes = 4096;
+    opt.segment_max_records = 1;
+    opt.sync_on_append = 0;
+    if (ve_tls_segment_store_open(&store, &opt) != 0) {
+        cleanup_persistent_dir(buffered_dir);
+        cleanup_persistent_dir(sync_dir);
+        return -1;
+    }
+    g_file_fsync_calls = 0;
+    if (ve_tls_segment_store_append(&store, record, sizeof(record), &ref) != 0 ||
+        g_file_fsync_calls != 0 || !store.active_dirty ||
+        ve_tls_segment_store_append(&store, record, sizeof(record), &ref) != 0 ||
+        g_file_fsync_calls != 1 || !store.active_dirty ||
+        ve_tls_segment_store_flush(&store) != 0 ||
+        g_file_fsync_calls != 2 || store.active_dirty ||
+        ve_tls_segment_store_flush(&store) != 0 || g_file_fsync_calls != 2) {
+        ve_tls_segment_store_close(&store);
+        cleanup_persistent_dir(buffered_dir);
+        cleanup_persistent_dir(sync_dir);
+        return -1;
+    }
+    ve_tls_segment_store_close(&store);
+
+    memset(&opt, 0, sizeof(opt));
+    memset(&store, 0, sizeof(store));
+    opt.platform = &cfg.platform;
+    opt.dir_path = sync_dir;
+    opt.segment_max_bytes = 4096;
+    opt.segment_max_records = 1;
+    opt.sync_on_append = 1;
+    if (ve_tls_segment_store_open(&store, &opt) != 0) {
+        cleanup_persistent_dir(buffered_dir);
+        cleanup_persistent_dir(sync_dir);
+        return -1;
+    }
+    g_file_fsync_calls = 0;
+    if (ve_tls_segment_store_append(&store, record, sizeof(record), &ref) != 0 ||
+        g_file_fsync_calls != 1 || store.active_dirty ||
+        ve_tls_segment_store_append(&store, record, sizeof(record), &ref) != 0 ||
+        g_file_fsync_calls != 2 || store.active_dirty ||
+        ve_tls_segment_store_flush(&store) != 0 || g_file_fsync_calls != 2) {
+        ve_tls_segment_store_close(&store);
+        cleanup_persistent_dir(buffered_dir);
+        cleanup_persistent_dir(sync_dir);
+        return -1;
+    }
+    ve_tls_segment_store_close(&store);
+    cleanup_persistent_dir(buffered_dir);
+    cleanup_persistent_dir(sync_dir);
+    return 0;
+}
+
+static int test_segment_store_short_write_rolls_back_tail(void) {
+    char dir[PATH_MAX];
+    char segment_path[PATH_MAX];
+    ve_tls_config cfg;
+    ve_tls_segment_store_options opt;
+    ve_tls_segment_store store;
+    ve_tls_path_info info;
+    static const unsigned char record[] = "short-write-record";
+    if (make_temp_dir(dir, sizeof(dir)) != 0) {
+        return -1;
+    }
+    ve_tls_config_init(&cfg);
+    g_real_platform = cfg.platform;
+    cfg.platform.file_write = test_short_write_then_fail_file_write;
+    memset(&opt, 0, sizeof(opt));
+    memset(&store, 0, sizeof(store));
+    opt.platform = &cfg.platform;
+    opt.dir_path = dir;
+    opt.segment_max_bytes = 4096;
+    opt.segment_max_records = 16;
+    if (ve_tls_segment_store_open(&store, &opt) != 0) {
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    join_path(segment_path, sizeof(segment_path), dir, "seg-000001.log");
+    __atomic_store_n(&g_fail_next_file_write, 1, __ATOMIC_RELEASE);
+    if (ve_tls_segment_store_append(&store, record, sizeof(record), NULL) == 0 ||
+        store.active_size != 0 || store.active_records != 0 || store.active_dirty ||
+        cfg.platform.path_stat(segment_path, &info) != 0 || info.size != 0) {
+        ve_tls_segment_store_close(&store);
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    __atomic_store_n(&g_short_write_then_fail, 1, __ATOMIC_RELEASE);
+    if (ve_tls_segment_store_append(&store, record, sizeof(record), NULL) == 0 ||
+        store.active_size != 0 || store.active_records != 0 || store.active_dirty ||
+        cfg.platform.path_stat(segment_path, &info) != 0 || info.size != 0 ||
+        ve_tls_segment_store_append(&store, record, sizeof(record), NULL) != 0 ||
+        cfg.platform.path_stat(segment_path, &info) != 0 || info.size != sizeof(record)) {
+        ve_tls_segment_store_close(&store);
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    ve_tls_segment_store_close(&store);
+    cleanup_persistent_dir(dir);
+    return 0;
+}
+
+typedef struct {
+    int count;
+    int64_t log_id;
+} test_sync_failure_recover_state;
+
+static int test_sync_failure_recover_record(
+    int64_t log_id,
+    const char * hash_key,
+    const unsigned char * payload,
+    size_t payload_size,
+    void * user
+) {
+    static const unsigned char expected[] = "sync-failure-record";
+    test_sync_failure_recover_state * state = (test_sync_failure_recover_state *)user;
+    if (!state || log_id != 1 || (hash_key && hash_key[0] != 0) ||
+        payload_size != sizeof(expected) - 1 || memcmp(payload, expected, payload_size) != 0) {
+        return -1;
+    }
+    state->count++;
+    state->log_id = log_id;
+    return 0;
+}
+
+static int test_persistent_sync_failure_keeps_written_record_recoverable(void) {
+    char dir[PATH_MAX];
+    ve_tls_config cfg;
+    ve_tls_persistent_options opt;
+    ve_tls_persistent persistent;
+    test_sync_failure_recover_state recovered;
+    static const unsigned char payload[] = "sync-failure-record";
+    if (make_temp_dir(dir, sizeof(dir)) != 0) {
+        return -1;
+    }
+    ve_tls_config_init(&cfg);
+    g_real_platform = cfg.platform;
+    g_fake_time = 1000;
+    cfg.platform.time_ms = test_fake_time_ms;
+    cfg.platform.file_fsync = test_count_file_fsync;
+    memset(&opt, 0, sizeof(opt));
+    memset(&persistent, 0, sizeof(persistent));
+    memset(&recovered, 0, sizeof(recovered));
+    opt.platform = &cfg.platform;
+    opt.dir_path = dir;
+    opt.instance_id = "test-instance";
+    opt.owner_id = "owner-a";
+    opt.owner_process_name = "proc-a";
+    opt.owner_pid = 123;
+    opt.segment_max_bytes = 4096;
+    opt.segment_max_records = 128;
+    opt.max_bytes = 8192;
+    opt.max_records = 512;
+    opt.max_segments = 8;
+    opt.now_ms = 1000;
+    opt.lease_timeout_ms = 1000;
+    opt.heartbeat_interval_ms = 1000;
+    opt.open_mode = VE_TLS_LEASE_OPEN_TAKEOVER_IF_STALE;
+    opt.durability = VE_TLS_PDURABILITY_SYNC_WAL;
+    if (ve_tls_persistent_open(&persistent, &opt) != 0) {
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    g_file_fsync_calls = 0;
+    g_fail_file_fsync_call = 1;
+    if (ve_tls_persistent_append(&persistent, 1, NULL, payload, sizeof(payload) - 1) !=
+            VE_TLS_PERSISTENT_APPEND_SYNC_FAILED ||
+        persistent.current_records != 1 || persistent.store.active_records != 1 ||
+        !persistent.store.active_dirty) {
+        g_fail_file_fsync_call = 0;
+        ve_tls_persistent_close(&persistent);
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    g_fail_file_fsync_call = 0;
+    if (ve_tls_persistent_flush(&persistent) != 0 || persistent.store.active_dirty ||
+        ve_tls_persistent_recover(&persistent, test_sync_failure_recover_record, &recovered) != 0 ||
+        recovered.count != 1 || recovered.log_id != 1) {
+        ve_tls_persistent_close(&persistent);
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    ve_tls_persistent_close(&persistent);
+    cleanup_persistent_dir(dir);
+    return 0;
+}
+
+static int test_persistent_durability_config_mapping(void) {
+    char buffered_dir[PATH_MAX] = {0};
+    char legacy_sync_dir[PATH_MAX] = {0};
+    char explicit_sync_dir[PATH_MAX] = {0};
+    char conflict_dir[PATH_MAX] = {0};
+    char permission_dir[PATH_MAX] = {0};
+    ve_tls_config cfg;
+    ve_tls_producer * producer;
+    if (make_temp_dir(buffered_dir, sizeof(buffered_dir)) != 0 ||
+        make_temp_dir(legacy_sync_dir, sizeof(legacy_sync_dir)) != 0 ||
+        make_temp_dir(explicit_sync_dir, sizeof(explicit_sync_dir)) != 0 ||
+        make_temp_dir(conflict_dir, sizeof(conflict_dir)) != 0 ||
+        make_temp_dir(permission_dir, sizeof(permission_dir)) != 0) {
+        goto fail;
+    }
+    ve_tls_config_init(&cfg);
+    cfg.endpoint = "https://example.com";
+    cfg.region = "cn-beijing";
+    cfg.topic_id = "t";
+    cfg.access_key_id = "ak";
+    cfg.access_key_secret = "sk";
+    cfg.use_persistent = 1;
+    cfg.max_persistent_log_count = 64;
+    cfg.max_persistent_file_size = 4096;
+    cfg.max_persistent_file_count = 4;
+
+    cfg.persistent_file_path = buffered_dir;
+    producer = ve_tls_producer_create(&cfg);
+    if (!producer || !producer->persistent ||
+        producer->persistent->durability != VE_TLS_PDURABILITY_BUFFERED_WAL) {
+        ve_tls_producer_destroy(producer);
+        goto fail;
+    }
+    ve_tls_producer_destroy(producer);
+
+    cfg.persistent_file_path = legacy_sync_dir;
+    cfg.force_flush_disk = 1;
+    producer = ve_tls_producer_create(&cfg);
+    if (!producer || !producer->persistent ||
+        producer->persistent->durability != VE_TLS_PDURABILITY_SYNC_WAL) {
+        ve_tls_producer_destroy(producer);
+        goto fail;
+    }
+    ve_tls_producer_destroy(producer);
+
+    cfg.persistent_file_path = explicit_sync_dir;
+    cfg.force_flush_disk = 0;
+    cfg.persistent_durability = VE_TLS_PDURABILITY_SYNC_WAL;
+    producer = ve_tls_producer_create(&cfg);
+    if (!producer || !producer->persistent ||
+        producer->persistent->durability != VE_TLS_PDURABILITY_SYNC_WAL) {
+        ve_tls_producer_destroy(producer);
+        goto fail;
+    }
+    ve_tls_producer_destroy(producer);
+
+    cfg.persistent_file_path = conflict_dir;
+    cfg.force_flush_disk = 1;
+    cfg.persistent_durability = VE_TLS_PDURABILITY_BUFFERED_WAL;
+    producer = ve_tls_producer_create(&cfg);
+    if (producer) {
+        ve_tls_producer_destroy(producer);
+        goto fail;
+    }
+
+    ve_tls_config_init(&cfg);
+    g_real_platform = cfg.platform;
+    cfg.platform.file_open = test_fail_next_segment_file_open;
+    cfg.endpoint = "https://example.com";
+    cfg.region = "cn-beijing";
+    cfg.topic_id = "t";
+    cfg.access_key_id = "ak";
+    cfg.access_key_secret = "sk";
+    cfg.use_persistent = 1;
+    cfg.persistent_file_path = permission_dir;
+    cfg.max_persistent_log_count = 64;
+    cfg.max_persistent_file_size = 4096;
+    cfg.max_persistent_file_count = 4;
+    __atomic_store_n(&g_fail_next_segment_open, 1, __ATOMIC_RELEASE);
+    producer = ve_tls_producer_create(&cfg);
+    if (producer) {
+        ve_tls_producer_destroy(producer);
+        goto fail;
+    }
+    cleanup_persistent_dir(buffered_dir);
+    cleanup_persistent_dir(legacy_sync_dir);
+    cleanup_persistent_dir(explicit_sync_dir);
+    cleanup_persistent_dir(conflict_dir);
+    cleanup_persistent_dir(permission_dir);
+    return 0;
+
+fail:
+    cleanup_persistent_dir(buffered_dir);
+    cleanup_persistent_dir(legacy_sync_dir);
+    cleanup_persistent_dir(explicit_sync_dir);
+    cleanup_persistent_dir(conflict_dir);
+    cleanup_persistent_dir(permission_dir);
+    return -1;
+}
+
+static int test_persistent_append_and_sync_failures_emit_distinct_metrics(void) {
+    char sync_dir[PATH_MAX] = {0};
+    char flush_dir[PATH_MAX] = {0};
+    char append_dir[PATH_MAX] = {0};
+    ve_tls_config cfg;
+    ve_tls_producer * producer = NULL;
+    ve_tls_result rc;
+    static const char log[] = "{\"message\":\"durability-metric\"}";
+    if (make_temp_dir(sync_dir, sizeof(sync_dir)) != 0 ||
+        make_temp_dir(flush_dir, sizeof(flush_dir)) != 0 ||
+        make_temp_dir(append_dir, sizeof(append_dir)) != 0) {
+        goto fail;
+    }
+
+    ve_tls_config_init(&cfg);
+    g_real_platform = cfg.platform;
+    g_fake_time = 1000;
+    cfg.platform.time_ms = test_fake_time_ms;
+    cfg.platform.file_fsync = test_count_file_fsync;
+    cfg.endpoint = "https://example.com";
+    cfg.region = "cn-beijing";
+    cfg.topic_id = "t";
+    cfg.access_key_id = "ak";
+    cfg.access_key_secret = "sk";
+    cfg.flush_interval_ms = 100000;
+    cfg.use_persistent = 1;
+    cfg.persistent_file_path = sync_dir;
+    cfg.max_persistent_log_count = 64;
+    cfg.max_persistent_file_size = 4096;
+    cfg.max_persistent_file_count = 4;
+    cfg.persistent_durability = VE_TLS_PDURABILITY_SYNC_WAL;
+    cfg.metrics_sink.emit = test_persistent_checkpoint_metrics_emit;
+    producer = ve_tls_producer_create(&cfg);
+    if (!producer) {
+        goto fail;
+    }
+    g_file_fsync_calls = 0;
+    g_fail_file_fsync_call = 1;
+    g_persistent_append_failed_events = 0;
+    g_persistent_sync_failed_events = 0;
+    g_persistent_failure_log_id = 0;
+    rc = ve_tls_producer_add_log_raw(producer, log, sizeof(log) - 1, 0);
+    g_fail_file_fsync_call = 0;
+    if (rc != VE_TLS_PERSISTENT_ERROR ||
+        g_persistent_append_failed_events != 0 ||
+        g_persistent_sync_failed_events != 1 ||
+        g_persistent_failure_log_id != 1) {
+        goto fail;
+    }
+    ve_tls_producer_destroy(producer);
+    producer = NULL;
+
+    ve_tls_config_init(&cfg);
+    g_real_platform = cfg.platform;
+    g_fake_time = 1000;
+    cfg.platform.time_ms = test_fake_time_ms;
+    cfg.platform.file_fsync = test_count_file_fsync;
+    cfg.endpoint = "https://example.com";
+    cfg.region = "cn-beijing";
+    cfg.topic_id = "t";
+    cfg.access_key_id = "ak";
+    cfg.access_key_secret = "sk";
+    cfg.flush_interval_ms = 100000;
+    cfg.use_persistent = 1;
+    cfg.persistent_file_path = flush_dir;
+    cfg.max_persistent_log_count = 64;
+    cfg.max_persistent_file_size = 4096;
+    cfg.max_persistent_file_count = 4;
+    cfg.metrics_sink.emit = test_persistent_checkpoint_metrics_emit;
+    producer = ve_tls_producer_create(&cfg);
+    if (!producer) {
+        goto fail;
+    }
+    g_file_fsync_calls = 0;
+    g_fail_file_fsync_call = 0;
+    g_persistent_sync_failed_events = 0;
+    if (ve_tls_producer_add_log_raw(producer, log, sizeof(log) - 1, 0) != VE_TLS_OK ||
+        g_file_fsync_calls != 0 ||
+        ve_tls_producer_flush(producer) != VE_TLS_OK || g_file_fsync_calls != 1 ||
+        ve_tls_producer_flush(producer) != VE_TLS_OK || g_file_fsync_calls != 1 ||
+        ve_tls_producer_add_log_raw(producer, log, sizeof(log) - 1, 0) != VE_TLS_OK) {
+        goto fail;
+    }
+    g_fail_file_fsync_call = 2;
+    rc = ve_tls_producer_flush(producer);
+    g_fail_file_fsync_call = 0;
+    if (rc != VE_TLS_PERSISTENT_ERROR ||
+        g_persistent_sync_failed_events != 1 ||
+        g_file_fsync_calls != 2) {
+        goto fail;
+    }
+    ve_tls_producer_destroy(producer);
+    producer = NULL;
+
+    ve_tls_config_init(&cfg);
+    g_real_platform = cfg.platform;
+    cfg.platform.file_write = test_short_write_then_fail_file_write;
+    cfg.endpoint = "https://example.com";
+    cfg.region = "cn-beijing";
+    cfg.topic_id = "t";
+    cfg.access_key_id = "ak";
+    cfg.access_key_secret = "sk";
+    cfg.flush_interval_ms = 100000;
+    cfg.use_persistent = 1;
+    cfg.persistent_file_path = append_dir;
+    cfg.max_persistent_log_count = 64;
+    cfg.max_persistent_file_size = 4096;
+    cfg.max_persistent_file_count = 4;
+    cfg.metrics_sink.emit = test_persistent_checkpoint_metrics_emit;
+    producer = ve_tls_producer_create(&cfg);
+    if (!producer) {
+        goto fail;
+    }
+    g_persistent_append_failed_events = 0;
+    g_persistent_sync_failed_events = 0;
+    g_persistent_failure_log_id = 0;
+    __atomic_store_n(&g_short_write_then_fail, 1, __ATOMIC_RELEASE);
+    rc = ve_tls_producer_add_log_raw(producer, log, sizeof(log) - 1, 0);
+    if (rc != VE_TLS_PERSISTENT_ERROR ||
+        g_persistent_append_failed_events != 1 ||
+        g_persistent_sync_failed_events != 0 ||
+        g_persistent_failure_log_id != 1) {
+        goto fail;
+    }
+    ve_tls_producer_destroy(producer);
+    cleanup_persistent_dir(sync_dir);
+    cleanup_persistent_dir(flush_dir);
+    cleanup_persistent_dir(append_dir);
+    return 0;
+
+fail:
+    g_fail_file_fsync_call = 0;
+    __atomic_store_n(&g_short_write_then_fail, 0, __ATOMIC_RELEASE);
+    ve_tls_producer_destroy(producer);
+    cleanup_persistent_dir(sync_dir);
+    cleanup_persistent_dir(flush_dir);
+    cleanup_persistent_dir(append_dir);
+    return -1;
+}
+
 static int test_checkpoint_roundtrip_and_lease_takeover(void) {
     char dir[PATH_MAX];
     char checkpoint_path[PATH_MAX];
@@ -13527,6 +14023,11 @@ int main(void) {
     RUN(125, test_platform_default_has_file_hooks());
     RUN(126, test_persistent_record_roundtrip_hash_key());
     RUN(127, test_segment_store_append_read_rotate_and_repair());
+    RUN(185, test_segment_store_buffered_and_sync_durability());
+    RUN(186, test_segment_store_short_write_rolls_back_tail());
+    RUN(187, test_persistent_sync_failure_keeps_written_record_recoverable());
+    RUN(188, test_persistent_durability_config_mapping());
+    RUN(189, test_persistent_append_and_sync_failures_emit_distinct_metrics());
     RUN(128, test_checkpoint_roundtrip_and_lease_takeover());
     RUN(129, test_persistent_open_creates_metadata_files());
     RUN(130, test_producer_create_with_persistent_adds_disk_record());

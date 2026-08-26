@@ -12,7 +12,14 @@ typedef struct {
     uint64_t segment_max_bytes;
     uint64_t segment_max_records;
     uint32_t resume_segment_id;
+    int32_t sync_on_append;
 } ve_tls_segment_store_options;
+
+typedef enum {
+    VE_TLS_SEGMENT_STORE_OK = 0,
+    VE_TLS_SEGMENT_STORE_ERROR = -1,
+    VE_TLS_SEGMENT_STORE_SYNC_FAILED = -2
+} ve_tls_segment_store_result;
 
 typedef struct {
     uint32_t segment_id;
@@ -35,10 +42,13 @@ typedef struct {
     uint64_t active_size;
     uint64_t active_records;
     ve_tls_file * active_file;
+    int32_t sync_on_append;
+    uint8_t active_dirty;
 } ve_tls_segment_store;
 
 int ve_tls_segment_store_open(ve_tls_segment_store * store, const ve_tls_segment_store_options * options);
 void ve_tls_segment_store_close(ve_tls_segment_store * store);
+int ve_tls_segment_store_flush(ve_tls_segment_store * store);
 int ve_tls_segment_store_append(ve_tls_segment_store * store, const unsigned char * record, size_t size, ve_tls_segment_record_ref * out_ref);
 int ve_tls_segment_store_read(ve_tls_segment_store * store, uint32_t segment_id, uint64_t offset, unsigned char ** out_record, size_t * out_size, uint64_t * next_offset);
 void ve_tls_segment_store_read_free(unsigned char * record);
