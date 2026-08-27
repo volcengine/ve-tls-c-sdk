@@ -5812,6 +5812,37 @@ static int test_config_init_request_timeout_default_is_50s(void) {
             cfg.connect_timeout_ms == 10000) ? 0 : -1;
 }
 
+static int test_producer_create_versioned_validation(void) {
+    ve_tls_config cfg;
+    ve_tls_config_init(&cfg);
+    cfg.endpoint = "https://example.com";
+    cfg.region = "cn-beijing";
+    cfg.topic_id = "t";
+    cfg.access_key_id = "ak";
+    cfg.access_key_secret = "sk";
+
+    ve_tls_producer * p = ve_tls_producer_create_versioned(
+        &cfg, sizeof(cfg), VE_TLS_CONFIG_VERSION_1);
+    if (!p) {
+        return -1;
+    }
+    ve_tls_producer_destroy(p);
+
+    p = ve_tls_producer_create_versioned(
+        &cfg, sizeof(cfg), VE_TLS_CONFIG_VERSION_1 + 1u);
+    if (p) {
+        ve_tls_producer_destroy(p);
+        return -2;
+    }
+    p = ve_tls_producer_create_versioned(
+        &cfg, sizeof(cfg) - 1u, VE_TLS_CONFIG_VERSION_1);
+    if (p) {
+        ve_tls_producer_destroy(p);
+        return -3;
+    }
+    return 0;
+}
+
 static int test_producer_derived_defaults_follow_memory_budget(void) {
     ve_tls_config cfg;
     ve_tls_config_init(&cfg);
@@ -14969,6 +15000,7 @@ int main(void) {
     RUN(111, test_compress_apply_edge_cases());
     RUN(114, test_alloc_hooks_and_small_edge_cases());
     RUN(164, test_config_init_request_timeout_default_is_50s());
+    RUN(305, test_producer_create_versioned_validation());
     RUN(112, test_send_queue_push_timeout_returns_minus2());
     RUN(113, test_send_queue_stop_causes_push_pop_fail());
     RUN(115, test_add_log_with_len_exports_one_record());

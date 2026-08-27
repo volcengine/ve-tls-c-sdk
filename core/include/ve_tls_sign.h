@@ -3,6 +3,10 @@
 
 #include <stddef.h>
 
+#include "ve_tls_export.h"
+
+VE_TLS_BEGIN_DECLS
+
 /**
  * 计算 Volcengine V4 签名并把签名结果与 SDK 管理头（Host/X-Date/X-Content-Sha256/
  * X-Security-Token/Authorization）追加到 headers_in 之后。
@@ -69,5 +73,7 @@ int ve_tls_sign_v4_append_at(
  * 轮转，建议在凭证失效后于同一线程主动调用，以缩短线程本地派生 key 的驻留时间。
  */
 void ve_tls_sign_thread_cache_clear(void);
+
+VE_TLS_END_DECLS
 
 #endif

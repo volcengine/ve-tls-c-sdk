@@ -3,7 +3,10 @@
 
 #include <stdint.h>
 
+#include "ve_tls_export.h"
 #include "ve_tls_http.h"
+
+VE_TLS_BEGIN_DECLS
 
 typedef struct {
     int32_t http_code;
@@ -15,6 +18,8 @@ typedef struct {
     int32_t retryable;
 } ve_tls_error;
 
-void ve_tls_error_free_fields(ve_tls_error * err);
+VE_TLS_API void ve_tls_error_free_fields(ve_tls_error * err);
+
+VE_TLS_END_DECLS
 
 #endif

@@ -4,6 +4,10 @@
 #include <stdint.h>
 #include <stddef.h>
 
+#include "ve_tls_export.h"
+
+VE_TLS_BEGIN_DECLS
+
 typedef struct ve_tls_mutex ve_tls_mutex;
 typedef struct ve_tls_cond ve_tls_cond;
 typedef struct ve_tls_thread ve_tls_thread;
@@ -63,6 +67,8 @@ typedef struct {
     int (*path_rename)(const char * from, const char * to);
 } ve_tls_platform;
 
-void ve_tls_platform_init_default(ve_tls_platform * platform);
+VE_TLS_API void ve_tls_platform_init_default(ve_tls_platform * platform);
+
+VE_TLS_END_DECLS
 
 #endif

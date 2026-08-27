@@ -1578,6 +1578,17 @@ ve_tls_producer * ve_tls_producer_create(const ve_tls_config * config) {
     return producer;
 }
 
+ve_tls_producer * ve_tls_producer_create_versioned(
+    const ve_tls_config * config,
+    size_t config_size,
+    uint32_t config_version
+) {
+    if (config_version != VE_TLS_CONFIG_VERSION_1 || config_size != sizeof(ve_tls_config)) {
+        return NULL;
+    }
+    return ve_tls_producer_create(config);
+}
+
 ve_tls_result ve_tls_producer_update_endpoint(ve_tls_producer * producer, const char * endpoint, const char * region, const char * topic_id) {
     uint64_t backlog_records = 0;
     uint64_t backlog_bytes = 0;

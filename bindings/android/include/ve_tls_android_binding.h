@@ -4,7 +4,10 @@
 #include <stdint.h>
 #include <stddef.h>
 
+#include "ve_tls_export.h"
 #include "ve_tls_producer.h"
+
+VE_TLS_BEGIN_DECLS
 
 typedef ve_tls_result (*ve_tls_android_recover_fn)(ve_tls_producer * producer);
 typedef ve_tls_result (*ve_tls_android_close_fn)(ve_tls_producer * producer, int32_t timeout_ms);
@@ -84,27 +87,29 @@ typedef struct {
     ve_tls_android_destroy_fn destroy;
 } ve_tls_android_runtime_options;
 
-ve_tls_result ve_tls_android_binding_build_config(
+VE_TLS_API ve_tls_result ve_tls_android_binding_build_config(
     const ve_tls_android_config_view * in,
     ve_tls_config * out,
     ve_tls_android_runtime_options * runtime
 );
 
-ve_tls_result ve_tls_android_binding_build_persistent_path(
+VE_TLS_API ve_tls_result ve_tls_android_binding_build_persistent_path(
     const char * base_path,
     const char * process_name,
     char * rewritten_path,
     size_t rewritten_cap
 );
 
-ve_tls_result ve_tls_android_binding_after_create(
+VE_TLS_API ve_tls_result ve_tls_android_binding_after_create(
     ve_tls_producer * producer,
     const ve_tls_android_runtime_options * runtime
 );
 
-void ve_tls_android_binding_before_destroy(
+VE_TLS_API void ve_tls_android_binding_before_destroy(
     ve_tls_producer * producer,
     const ve_tls_android_runtime_options * runtime
 );
+
+VE_TLS_END_DECLS
 
 #endif
