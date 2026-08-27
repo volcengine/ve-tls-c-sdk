@@ -1134,7 +1134,9 @@ int ve_tls_persistent_append(ve_tls_persistent * persistent, int64_t log_id, con
                 (void)reclaim_to_low_watermark(persistent);
             }
         }
-        if (rc == VE_TLS_SEGMENT_STORE_SYNC_FAILED) {
+        if (rc == VE_TLS_SEGMENT_STORE_UNSUPPORTED_VERSION) {
+            rc = VE_TLS_PERSISTENT_APPEND_UNSUPPORTED_VERSION;
+        } else if (rc == VE_TLS_SEGMENT_STORE_SYNC_FAILED) {
             rc = VE_TLS_PERSISTENT_APPEND_SYNC_FAILED;
         }
     }

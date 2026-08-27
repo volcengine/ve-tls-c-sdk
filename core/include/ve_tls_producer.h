@@ -146,7 +146,6 @@ typedef struct {
     int32_t max_persistent_file_size;
     int32_t max_persistent_file_count;
     int32_t force_flush_disk;
-    ve_tls_persistent_durability persistent_durability;
     int32_t persistent_max_bytes;
     int32_t persistent_max_records;
     int32_t persistent_max_segments;
@@ -160,7 +159,11 @@ typedef struct {
     int32_t persistent_open_mode;
     ve_tls_platform platform;
     ve_tls_http_client http_client;
+    ve_tls_persistent_durability persistent_durability;
 } ve_tls_config;
+
+/* Size of the pre-versioned layout consumed by the legacy init/create APIs. */
+#define VE_TLS_CONFIG_LEGACY_SIZE offsetof(ve_tls_config, persistent_durability)
 
 typedef void (*ve_tls_send_done_fn)(
     ve_tls_result result,
@@ -199,6 +202,11 @@ typedef struct {
 } ve_tls_metrics;
 
 VE_TLS_API void ve_tls_config_init(ve_tls_config * config);
+VE_TLS_API ve_tls_result ve_tls_config_init_versioned(
+    ve_tls_config * config,
+    size_t config_size,
+    uint32_t config_version
+);
 
 VE_TLS_API ve_tls_producer * ve_tls_producer_create(const ve_tls_config * config);
 VE_TLS_API ve_tls_producer * ve_tls_producer_create_versioned(

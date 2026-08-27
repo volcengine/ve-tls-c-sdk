@@ -119,3 +119,8 @@
 | `persistent_open_mode` | `VE_TLS_POPEN_TAKEOVER_IF_STALE` | `FAIL_IF_OWNED` 会在目录被占用时失败；`TAKEOVER_IF_STALE` 允许 stale 后接管。 |
 | `persistent_durability` | `VE_TLS_PDURABILITY_DEFAULT` | 默认解析为 `BUFFERED_WAL`；也可显式选择 `BUFFERED_WAL` 或 `SYNC_WAL`。 |
 | `force_flush_disk` | `0` | 兼容字段。durability 为 `DEFAULT` 且该值非零时映射为 `SYNC_WAL`；与显式 `BUFFERED_WAL` 同时设置会拒绝创建。 |
+
+`persistent_durability` 位于 versioned config 尾部。设置该字段时必须使用
+`ve_tls_config_init_versioned` 和 `ve_tls_producer_create_versioned`；旧的
+init/create 入口只消费 `VE_TLS_CONFIG_LEGACY_SIZE`，继续通过
+`force_flush_disk` 保留原有 sync-WAL 映射。

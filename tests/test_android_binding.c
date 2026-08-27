@@ -94,7 +94,14 @@ static int test_android_binding_build_config_preserves_http_client_bridge(void) 
     in.http_client = &bridge;
     in.user_agent = "volc-tls-android/producer/v2.1.1";
 
-    rc = ve_tls_android_binding_build_config(&in, &out, &runtime);
+    rc = ve_tls_android_binding_build_config_versioned(
+        &in,
+        sizeof(in),
+        VE_TLS_ANDROID_CONFIG_VIEW_VERSION_CURRENT,
+        &out,
+        sizeof(out),
+        VE_TLS_CONFIG_VERSION_CURRENT,
+        &runtime);
     if (rc != VE_TLS_OK) {
         fprintf(stderr, "build_config failed for http client bridge: %d\n", rc);
         return 1;
@@ -172,7 +179,14 @@ static int test_android_binding_build_persistent_path_and_clamps_sender(void) {
     in.persistent_sample_every_n = 7;
     in.persistent_block_timeout_ms = 2500;
 
-    rc = ve_tls_android_binding_build_config(&in, &out, &runtime);
+    rc = ve_tls_android_binding_build_config_versioned(
+        &in,
+        sizeof(in),
+        VE_TLS_ANDROID_CONFIG_VIEW_VERSION_CURRENT,
+        &out,
+        sizeof(out),
+        VE_TLS_CONFIG_VERSION_CURRENT,
+        &runtime);
     if (rc != VE_TLS_OK) {
         fprintf(stderr, "build_config failed: %d\n", rc);
         return 1;
@@ -520,6 +534,109 @@ static int test_android_binding_before_destroy_prefers_split_close(void) {
     return 0;
 }
 
+static int test_android_binding_versioned_config_contract(void) {
+    ve_tls_android_config_view current;
+    ve_tls_android_runtime_options runtime;
+    ve_tls_config out;
+    unsigned char * legacy;
+    size_t i;
+    ve_tls_result rc;
+
+    memset(&current, 0, sizeof(current));
+    current.endpoint = "https://example.com";
+    current.use_persistent = 1;
+    current.destroy_wait_ms = 1234;
+    current.persistent_durability = VE_TLS_PDURABILITY_SYNC_WAL;
+    legacy = (unsigned char *)malloc(VE_TLS_ANDROID_CONFIG_VIEW_V1_SIZE);
+    if (!legacy) {
+        return 1;
+    }
+    memcpy(legacy, &current, VE_TLS_ANDROID_CONFIG_VIEW_V1_SIZE);
+
+    memset(&runtime, 0, sizeof(runtime));
+    memset(&out, 0xA5, sizeof(out));
+    rc = ve_tls_android_binding_build_config(
+        (const ve_tls_android_config_view *)legacy, &out, &runtime);
+    if (rc != VE_TLS_OK || runtime.destroy_wait_ms != 1234 || !runtime.persistent_enabled) {
+        fprintf(stderr, "legacy Android config view was not parsed correctly\n");
+        free(legacy);
+        return 1;
+    }
+    for (i = VE_TLS_CONFIG_LEGACY_SIZE; i < sizeof(out); i++) {
+        if (((const unsigned char *)&out)[i] != 0xA5) {
+            fprintf(stderr, "legacy config entry point wrote beyond the legacy output layout\n");
+            free(legacy);
+            return 1;
+        }
+    }
+
+    memset(&runtime, 0, sizeof(runtime));
+    rc = ve_tls_android_binding_build_config_versioned(
+        (const ve_tls_android_config_view *)legacy,
+        VE_TLS_ANDROID_CONFIG_VIEW_V1_SIZE,
+        VE_TLS_ANDROID_CONFIG_VIEW_VERSION_1,
+        &out,
+        sizeof(out),
+        VE_TLS_CONFIG_VERSION_CURRENT,
+        &runtime);
+    if (rc != VE_TLS_OK || out.persistent_durability != VE_TLS_PDURABILITY_DEFAULT ||
+        runtime.destroy_wait_ms != 1234) {
+        fprintf(stderr, "versioned Android v1 config compatibility failed\n");
+        free(legacy);
+        return 1;
+    }
+    free(legacy);
+
+    rc = ve_tls_android_binding_build_config_versioned(
+        &current,
+        sizeof(current),
+        VE_TLS_ANDROID_CONFIG_VIEW_VERSION_CURRENT,
+        &out,
+        sizeof(out),
+        VE_TLS_CONFIG_VERSION_CURRENT,
+        &runtime);
+    if (rc != VE_TLS_OK || out.persistent_durability != VE_TLS_PDURABILITY_SYNC_WAL) {
+        fprintf(stderr, "versioned Android v2 fields were not copied\n");
+        return 1;
+    }
+    if (ve_tls_android_binding_build_config_versioned(
+            &current,
+            sizeof(current) - 1u,
+            VE_TLS_ANDROID_CONFIG_VIEW_VERSION_CURRENT,
+            &out,
+            sizeof(out),
+            VE_TLS_CONFIG_VERSION_CURRENT,
+            &runtime) != VE_TLS_INVALID ||
+        ve_tls_android_binding_build_config_versioned(
+            &current,
+            sizeof(current),
+            VE_TLS_ANDROID_CONFIG_VIEW_VERSION_CURRENT + 1u,
+            &out,
+            sizeof(out),
+            VE_TLS_CONFIG_VERSION_CURRENT,
+            &runtime) != VE_TLS_INVALID ||
+        ve_tls_android_binding_build_config_versioned(
+            &current,
+            sizeof(current),
+            VE_TLS_ANDROID_CONFIG_VIEW_VERSION_CURRENT,
+            &out,
+            sizeof(out) - 1u,
+            VE_TLS_CONFIG_VERSION_CURRENT,
+            &runtime) != VE_TLS_INVALID ||
+        ve_tls_android_binding_build_config_versioned(
+            &current,
+            sizeof(current),
+            VE_TLS_ANDROID_CONFIG_VIEW_VERSION_CURRENT,
+            &out,
+            sizeof(out),
+            VE_TLS_CONFIG_VERSION_CURRENT + 1u,
+            &runtime) != VE_TLS_INVALID) {
+        fprintf(stderr, "invalid Android config size/version should be rejected\n");
+        return 1;
+    }
+    return 0;
+}
+
 static int test_android_binding_recover_and_destroy_sequence(void) {
     pid_t child = fork();
     if (child < 0) {
@@ -550,6 +667,9 @@ int main(void) {
         return 1;
     }
     if (test_android_binding_build_config_runtime_defaults_without_memset() != 0) {
+        return 1;
+    }
+    if (test_android_binding_versioned_config_contract() != 0) {
         return 1;
     }
     if (test_android_binding_before_destroy_prefers_split_close() != 0) {

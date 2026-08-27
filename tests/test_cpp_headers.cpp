@@ -27,12 +27,22 @@ int main() {
     ve_tls_producer *producer = nullptr;
 
     ve_tls_alloc_get_hooks(&hooks);
-    ve_tls_config_init(&config);
+    if (ve_tls_config_init_versioned(
+            &config, sizeof(config), VE_TLS_CONFIG_VERSION_CURRENT) != VE_TLS_OK) {
+        return 1;
+    }
     ve_tls_platform_init_default(&platform);
     ve_tls_retry_policy_init(&retry);
     ve_tls_http_response_init(&response);
     ve_tls_error_free_fields(&error);
-    if (ve_tls_android_binding_build_config(&android_view, &config, &runtime) != VE_TLS_OK) {
+    if (ve_tls_android_binding_build_config_versioned(
+            &android_view,
+            sizeof(android_view),
+            VE_TLS_ANDROID_CONFIG_VIEW_VERSION_CURRENT,
+            &config,
+            sizeof(config),
+            VE_TLS_CONFIG_VERSION_CURRENT,
+            &runtime) != VE_TLS_OK) {
         return 1;
     }
     if (ve_tls_android_binding_build_persistent_path("", "", path, sizeof(path)) != VE_TLS_OK) {
