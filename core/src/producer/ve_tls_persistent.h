@@ -7,6 +7,7 @@
 #include "ve_tls_segment_store.h"
 
 #include <stdint.h>
+#include <stdatomic.h>
 
 enum {
     VE_TLS_PERSISTENT_APPEND_REJECT_NEW = -2,
@@ -69,7 +70,8 @@ struct ve_tls_persistent {
     int64_t heartbeat_interval_ms;
     int32_t open_mode;
     ve_tls_persistent_durability durability;
-    int64_t next_heartbeat_ms;
+    ve_tls_mutex * heartbeat_mutex;
+    _Atomic(int64_t) next_heartbeat_ms;
     uint64_t current_bytes;
     uint64_t current_records;
     uint32_t current_segments;

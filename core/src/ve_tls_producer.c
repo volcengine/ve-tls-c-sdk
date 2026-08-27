@@ -1529,10 +1529,6 @@ ve_tls_producer * ve_tls_producer_create(const ve_tls_config * config) {
             return NULL;
         }
     } else {
-        if (ve_tls_env_register_producer(producer) != 0) {
-            ve_tls_producer_destroy(producer);
-            return NULL;
-        }
         producer->sender_count = 0;
         producer->senders = NULL;
     }
@@ -1573,6 +1569,11 @@ ve_tls_producer * ve_tls_producer_create(const ve_tls_config * config) {
         }
     }
     if (producer->use_global_env) {
+        /* Publish only after every producer data structure and worker exists. */
+        if (ve_tls_env_register_producer(producer) != 0) {
+            ve_tls_producer_destroy(producer);
+            return NULL;
+        }
         ve_tls_env_notify(producer);
     }
     return producer;
@@ -1837,7 +1838,7 @@ void ve_tls_producer_destroy(ve_tls_producer * producer) {
     }
     if (producer->use_global_env) {
         (void)ve_tls_producer_close(producer, 60000);
-        producer->use_global_env = 0;
+        /* use_global_env is immutable after create; env_registered is the teardown gate. */
         ve_tls_env_unregister_producer(producer);
         while (__atomic_load_n(&producer->env_inflight, __ATOMIC_RELAXED) > 0) {
             producer->config.platform.sleep_ms(1);

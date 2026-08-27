@@ -23,6 +23,7 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <limits.h>
+#include <stdatomic.h>
 #include <sys/stat.h>
 
 #if defined(VE_TLS_HAVE_ZLIB)
@@ -426,7 +427,17 @@ static void set_alloc_failtrack(alloc_failtrack_state * st, int fail_after) {
 }
 
 static ve_tls_platform g_real_platform;
-static int64_t g_fake_time = 0;
+static _Atomic int64_t g_fake_time = 0;
+
+static int64_t test_producer_checkpoint_acked_log_id(ve_tls_producer * producer) {
+    if (!producer || !producer->persistent || !producer->persistent_mutex) {
+        return -1;
+    }
+    producer->config.platform.mutex_lock(producer->persistent_mutex);
+    int64_t acked_log_id = producer->persistent->checkpoint.acked_log_id;
+    producer->config.platform.mutex_unlock(producer->persistent_mutex);
+    return acked_log_id;
+}
 
 static int64_t test_fake_time_ms(void) {
     return g_fake_time;
@@ -556,13 +567,13 @@ static void test_track_mutex_destroy(ve_tls_mutex * m) {
 
 static void test_track_mutex_lock(ve_tls_mutex * m) {
     g_real_platform.mutex_lock(m);
-    if (m == g_track_producer_mutex) {
+    if (m == __atomic_load_n(&g_track_producer_mutex, __ATOMIC_ACQUIRE)) {
         g_track_producer_mutex_depth++;
     }
 }
 
 static void test_track_mutex_unlock(ve_tls_mutex * m) {
-    if (m == g_track_producer_mutex && g_track_producer_mutex_depth > 0) {
+    if (m == __atomic_load_n(&g_track_producer_mutex, __ATOMIC_ACQUIRE) && g_track_producer_mutex_depth > 0) {
         g_track_producer_mutex_depth--;
     }
     g_real_platform.mutex_unlock(m);
@@ -686,40 +697,41 @@ static void on_send_done_v2(
     (void)user_param;
     (void)start_id;
     (void)end_id;
-    g_http_done = 1;
     if (raw_buffer != NULL) {
         g_http_ok = 0;
-        return;
+        goto publish;
     }
     if (result != VE_TLS_DROP_ERROR || !error) {
         g_http_ok = 0;
-        return;
+        goto publish;
     }
     if (error->http_code != 500) {
         g_http_ok = 0;
-        return;
+        goto publish;
     }
     if (!error->error_code || strcmp(error->error_code, "LimitExceeded") != 0) {
         g_http_ok = 0;
-        return;
+        goto publish;
     }
     if (!error->error_message || strcmp(error->error_message, "too many") != 0) {
         g_http_ok = 0;
-        return;
+        goto publish;
     }
     if (!error->request_id || strcmp(error->request_id, "hdr-rid") != 0) {
         g_http_ok = 0;
-        return;
+        goto publish;
     }
     if (error->retryable != 1) {
         g_http_ok = 0;
-        return;
+        goto publish;
     }
     g_http_ok = 1;
+publish:
+    __atomic_store_n(&g_http_done, 1, __ATOMIC_RELEASE);
 }
 
 static int test_structured_error_and_retryable(void) {
-    g_http_done = 0;
+    __atomic_store_n(&g_http_done, 0, __ATOMIC_RELAXED);
     g_http_ok = 0;
 
     ve_tls_config cfg;
@@ -749,7 +761,7 @@ static int test_structured_error_and_retryable(void) {
         return -1;
     }
 
-    for (int i = 0; i < 200 && !g_http_done; i++) {
+    for (int i = 0; i < 200 && !__atomic_load_n(&g_http_done, __ATOMIC_ACQUIRE); i++) {
         cfg.platform.sleep_ms(10);
     }
     ve_tls_producer_destroy(p);
@@ -838,16 +850,14 @@ static void on_send_done_seq_v2(
     (void)user_param;
     (void)start_id;
     (void)end_id;
-    g_seq_state.done = 1;
     if (result == VE_TLS_OK && error && error->request_id && (strcmp(error->request_id, "rid-ok-429") == 0 || strcmp(error->request_id, "rid-ok-net") == 0)) {
         g_seq_state.ok = 1;
-        return;
-    }
-    if (result == VE_TLS_DROP_ERROR && error && error->request_id && strcmp(error->request_id, "rid-400") == 0 && error->retryable == 0) {
+    } else if (result == VE_TLS_DROP_ERROR && error && error->request_id && strcmp(error->request_id, "rid-400") == 0 && error->retryable == 0) {
         g_seq_state.ok = 1;
-        return;
+    } else {
+        g_seq_state.ok = 0;
     }
-    g_seq_state.ok = 0;
+    __atomic_store_n(&g_seq_state.done, 1, __ATOMIC_RELEASE);
 }
 
 static int test_sender_retries_429_then_ok(void) {
@@ -875,7 +885,7 @@ static int test_sender_retries_429_then_ok(void) {
         ve_tls_producer_destroy(p);
         return -1;
     }
-    for (int i = 0; i < 400 && !g_seq_state.done; i++) cfg.platform.sleep_ms(10);
+    for (int i = 0; i < 400 && !__atomic_load_n(&g_seq_state.done, __ATOMIC_ACQUIRE); i++) cfg.platform.sleep_ms(10);
     ve_tls_producer_destroy(p);
     return (g_seq_state.ok && g_seq_state.calls == 3) ? 0 : -1;
 }
@@ -905,7 +915,7 @@ static int test_sender_http_400_no_retry(void) {
         ve_tls_producer_destroy(p);
         return -1;
     }
-    for (int i = 0; i < 200 && !g_seq_state.done; i++) cfg.platform.sleep_ms(10);
+    for (int i = 0; i < 200 && !__atomic_load_n(&g_seq_state.done, __ATOMIC_ACQUIRE); i++) cfg.platform.sleep_ms(10);
     ve_tls_producer_destroy(p);
     return (g_seq_state.ok && g_seq_state.calls == 1) ? 0 : -1;
 }
@@ -935,7 +945,7 @@ static int test_sender_transport_retryable_then_ok(void) {
         ve_tls_producer_destroy(p);
         return -1;
     }
-    for (int i = 0; i < 400 && !g_seq_state.done; i++) cfg.platform.sleep_ms(10);
+    for (int i = 0; i < 400 && !__atomic_load_n(&g_seq_state.done, __ATOMIC_ACQUIRE); i++) cfg.platform.sleep_ms(10);
     ve_tls_producer_destroy(p);
     return (g_seq_state.ok && g_seq_state.calls == 3) ? 0 : -1;
 }
@@ -1001,16 +1011,17 @@ static void on_send_done_err_v2(
     (void)user_param;
     (void)start_id;
     (void)end_id;
-    g_serr.done = 1;
     if (result != VE_TLS_DROP_ERROR || !error) {
         g_serr.ok = 0;
-        return;
+        goto publish;
     }
     g_serr.retryable = error->retryable;
     if (error->error_code) snprintf(g_serr.code, sizeof(g_serr.code), "%s", error->error_code);
     if (error->error_message) snprintf(g_serr.msg, sizeof(g_serr.msg), "%s", error->error_message);
     if (error->request_id) snprintf(g_serr.rid, sizeof(g_serr.rid), "%s", error->request_id);
     g_serr.ok = 1;
+publish:
+    __atomic_store_n(&g_serr.done, 1, __ATOMIC_RELEASE);
 }
 
 static int test_sender_http_rc_minus1_defaults_error(void) {
@@ -1036,7 +1047,7 @@ static int test_sender_http_rc_minus1_defaults_error(void) {
         ve_tls_producer_destroy(p);
         return -1;
     }
-    for (int i = 0; i < 300 && !g_serr.done; i++) cfg.platform.sleep_ms(10);
+    for (int i = 0; i < 300 && !__atomic_load_n(&g_serr.done, __ATOMIC_ACQUIRE); i++) cfg.platform.sleep_ms(10);
     ve_tls_producer_destroy(p);
     if (!g_serr.ok) return -1;
     if (strcmp(g_serr.code, "ClientError") != 0) return -1;
@@ -1068,7 +1079,7 @@ static int test_sender_http_500_sets_badresponse(void) {
         ve_tls_producer_destroy(p);
         return -1;
     }
-    for (int i = 0; i < 300 && !g_serr.done; i++) cfg.platform.sleep_ms(10);
+    for (int i = 0; i < 300 && !__atomic_load_n(&g_serr.done, __ATOMIC_ACQUIRE); i++) cfg.platform.sleep_ms(10);
     ve_tls_producer_destroy(p);
     if (!g_serr.ok) return -1;
     if (strcmp(g_serr.code, "BadResponse") != 0) return -1;
@@ -1102,7 +1113,7 @@ static int test_sender_unsupported_compress_type_drops_before_http(void) {
         ve_tls_producer_destroy(p);
         return -1;
     }
-    for (int i = 0; i < 300 && !g_serr.done; i++) cfg.platform.sleep_ms(10);
+    for (int i = 0; i < 300 && !__atomic_load_n(&g_serr.done, __ATOMIC_ACQUIRE); i++) cfg.platform.sleep_ms(10);
     ve_tls_producer_destroy(p);
     if (g_http_called_unexpected) return -1;
     if (!g_serr.ok) return -1;
@@ -1153,7 +1164,7 @@ static int test_sender_build_url_calloc_fail_drops_without_http(void) {
         ve_tls_producer_destroy(p);
         return -1;
     }
-    for (int i = 0; i < 300 && !g_serr.done; i++) cfg.platform.sleep_ms(10);
+    for (int i = 0; i < 300 && !__atomic_load_n(&g_serr.done, __ATOMIC_ACQUIRE); i++) cfg.platform.sleep_ms(10);
 
     ve_tls_alloc_set_hooks(&saved);
     ve_tls_producer_destroy(p);
@@ -1208,7 +1219,7 @@ static int test_sender_build_headers_realloc_fail_drops_without_http(void) {
         ve_tls_producer_destroy(p);
         return -1;
     }
-    for (int i = 0; i < 300 && !g_serr.done; i++) cfg.platform.sleep_ms(10);
+    for (int i = 0; i < 300 && !__atomic_load_n(&g_serr.done, __ATOMIC_ACQUIRE); i++) cfg.platform.sleep_ms(10);
 
     ve_tls_alloc_set_hooks(&saved);
     ve_tls_producer_destroy(p);
@@ -1263,7 +1274,7 @@ static int test_sender_sign_realloc_fail_drops_without_http(void) {
         ve_tls_producer_destroy(p);
         return -1;
     }
-    for (int i = 0; i < 300 && !g_serr.done; i++) cfg.platform.sleep_ms(10);
+    for (int i = 0; i < 300 && !__atomic_load_n(&g_serr.done, __ATOMIC_ACQUIRE); i++) cfg.platform.sleep_ms(10);
 
     ve_tls_alloc_set_hooks(&saved);
     ve_tls_producer_destroy(p);
@@ -1279,13 +1290,23 @@ static int64_t g_sender_time_t[8] = {0};
 static int g_sender_time_n = 0;
 static int g_sender_provider_calls = 0;
 
+static void test_record_sender_time(void) {
+    int index = __atomic_load_n(&g_sender_time_n, __ATOMIC_RELAXED);
+    if (index < (int)(sizeof(g_sender_time_t) / sizeof(g_sender_time_t[0]))) {
+        g_sender_time_t[index] = test_fake_time_ms();
+        __atomic_store_n(&g_sender_time_n, index + 1, __ATOMIC_RELEASE);
+    }
+}
+
+static int test_sender_time_count(void) {
+    return __atomic_load_n(&g_sender_time_n, __ATOMIC_ACQUIRE);
+}
+
 static int test_http_sender_time_ok_do(ve_tls_http_client * client, const ve_tls_http_request * req, ve_tls_http_response * resp) {
     (void)client;
     (void)req;
     if (!resp) return -1;
-    if (g_sender_time_n < (int)(sizeof(g_sender_time_t) / sizeof(g_sender_time_t[0]))) {
-        g_sender_time_t[g_sender_time_n++] = test_fake_time_ms();
-    }
+    test_record_sender_time();
     resp->status_code = 200;
     resp->request_id = strdup("rid-ok");
     return 0;
@@ -1295,9 +1316,7 @@ static int test_http_sender_time_500_do(ve_tls_http_client * client, const ve_tl
     (void)client;
     (void)req;
     if (!resp) return -1;
-    if (g_sender_time_n < (int)(sizeof(g_sender_time_t) / sizeof(g_sender_time_t[0]))) {
-        g_sender_time_t[g_sender_time_n++] = test_fake_time_ms();
-    }
+    test_record_sender_time();
     resp->status_code = 500;
     resp->request_id = strdup("rid-500");
     resp->body = (unsigned char *)strdup("{\"errorCode\":\"E\",\"errorMessage\":\"m\",\"requestId\":\"rid-body\"}");
@@ -1357,7 +1376,7 @@ static void on_sender_done_v1(
 
 static int test_sender_key_rate_limit_delays_same_key(void) {
     memset(g_sender_time_t, 0, sizeof(g_sender_time_t));
-    g_sender_time_n = 0;
+    __atomic_store_n(&g_sender_time_n, 0, __ATOMIC_RELAXED);
     g_sender_ok_v1 = 0;
 
     ve_tls_config cfg;
@@ -1400,7 +1419,7 @@ static int test_sender_key_rate_limit_delays_same_key(void) {
     }
     for (int i = 0; i < 5000; i++) {
         g_real_platform.sleep_ms(1);
-        if (g_sender_time_n >= 2) break;
+        if (test_sender_time_count() >= 2) break;
     }
     ve_tls_producer_destroy(p);
     if (g_sender_time_n < 2) {
@@ -1423,7 +1442,7 @@ static int test_sender_key_rate_limit_delays_same_key(void) {
 
 static int test_sender_key_breaker_delays_same_key(void) {
     memset(g_sender_time_t, 0, sizeof(g_sender_time_t));
-    g_sender_time_n = 0;
+    __atomic_store_n(&g_sender_time_n, 0, __ATOMIC_RELAXED);
 
     ve_tls_config cfg;
     ve_tls_config_init(&cfg);
@@ -1466,7 +1485,7 @@ static int test_sender_key_breaker_delays_same_key(void) {
     }
     for (int i = 0; i < 8000; i++) {
         g_real_platform.sleep_ms(1);
-        if (g_sender_time_n >= 2) break;
+        if (test_sender_time_count() >= 2) break;
     }
     ve_tls_producer_destroy(p);
     if (g_sender_time_n < 2) {
@@ -1485,7 +1504,7 @@ static int test_sender_key_breaker_delays_same_key(void) {
 static int test_sender_credentials_min_interval_returns_cached(void) {
     g_sender_provider_calls = 0;
     memset(g_sender_time_t, 0, sizeof(g_sender_time_t));
-    g_sender_time_n = 0;
+    __atomic_store_n(&g_sender_time_n, 0, __ATOMIC_RELAXED);
 
     ve_tls_config cfg;
     ve_tls_config_init(&cfg);
@@ -1525,7 +1544,7 @@ static int test_sender_credentials_min_interval_returns_cached(void) {
     }
     for (int i = 0; i < 5000; i++) {
         g_real_platform.sleep_ms(1);
-        if (g_sender_time_n >= 2) break;
+        if (test_sender_time_count() >= 2) break;
     }
     ve_tls_producer_destroy(p);
     if (g_sender_time_n < 2) return -1;
@@ -1630,7 +1649,7 @@ static int test_sender_credentials_min_interval_fail_without_cached(void) {
 
 static int test_builder_flush_interval_respects_configured_deadline(void) {
     memset(g_sender_time_t, 0, sizeof(g_sender_time_t));
-    g_sender_time_n = 0;
+    __atomic_store_n(&g_sender_time_n, 0, __ATOMIC_RELAXED);
 
     ve_tls_config cfg;
     ve_tls_config_init(&cfg);
@@ -1669,9 +1688,9 @@ static int test_builder_flush_interval_respects_configured_deadline(void) {
     cfg.platform.mutex_unlock(p->mutex);
     for (int i = 0; i < 2000; i++) {
         g_real_platform.sleep_ms(1);
-        if (g_sender_time_n >= 1) break;
+        if (test_sender_time_count() >= 1) break;
     }
-    if (g_sender_time_n < 1) {
+    if (test_sender_time_count() < 1) {
         fprintf(stderr, "builder_flush_deadline: no send fake_now=%lld\n", (long long)g_fake_time);
         ve_tls_producer_destroy(p);
         return -1;
@@ -1716,7 +1735,7 @@ static int test_builder_to_send_task_strdupfail_does_not_double_free_body(void) 
 
 static int test_tls_batch_flush_interval_visible_to_worker(void) {
     memset(g_sender_time_t, 0, sizeof(g_sender_time_t));
-    g_sender_time_n = 0;
+    __atomic_store_n(&g_sender_time_n, 0, __ATOMIC_RELAXED);
 
     ve_tls_config cfg;
     ve_tls_config_init(&cfg);
@@ -1755,9 +1774,9 @@ static int test_tls_batch_flush_interval_visible_to_worker(void) {
     cfg.platform.mutex_unlock(p->mutex);
     for (int i = 0; i < 2000; i++) {
         g_real_platform.sleep_ms(1);
-        if (g_sender_time_n >= 1) break;
+        if (test_sender_time_count() >= 1) break;
     }
-    if (g_sender_time_n < 1) {
+    if (test_sender_time_count() < 1) {
         fprintf(stderr, "tls_batch_flush_deadline: no send fake_now=%lld\n", (long long)g_fake_time);
         ve_tls_producer_destroy(p);
         return -1;
@@ -4024,28 +4043,29 @@ static void on_send_done_mgr_v2(
     (void)user_param;
     (void)start_id;
     (void)end_id;
-    g_mgr_done = 1;
     if (raw_buffer != NULL) {
         g_mgr_ok = 0;
-        return;
+        goto publish;
     }
     if (result != VE_TLS_DROP_ERROR || !error) {
         g_mgr_ok = 0;
-        return;
+        goto publish;
     }
     if (!error->error_code || strcmp(error->error_code, "ClientError") != 0) {
         g_mgr_ok = 0;
-        return;
+        goto publish;
     }
     if (!error->error_message || strcmp(error->error_message, "unsupported compress_type") != 0) {
         g_mgr_ok = 0;
-        return;
+        goto publish;
     }
     g_mgr_ok = 1;
+publish:
+    __atomic_store_n(&g_mgr_done, 1, __ATOMIC_RELEASE);
 }
 
 static int test_manager_callback_no_raw_buffer_on_compress_error(void) {
-    g_mgr_done = 0;
+    __atomic_store_n(&g_mgr_done, 0, __ATOMIC_RELAXED);
     g_mgr_ok = 0;
 
     ve_tls_config cfg;
@@ -4075,7 +4095,7 @@ static int test_manager_callback_no_raw_buffer_on_compress_error(void) {
         ve_tls_producer_destroy(p);
         return -1;
     }
-    for (int i = 0; i < 200 && !g_mgr_done; i++) {
+    for (int i = 0; i < 200 && !__atomic_load_n(&g_mgr_done, __ATOMIC_ACQUIRE); i++) {
         cfg.platform.sleep_ms(10);
     }
     ve_tls_producer_destroy(p);
@@ -4104,28 +4124,29 @@ static void on_send_done_mgr_p2l_v2(
     (void)user_param;
     (void)start_id;
     (void)end_id;
-    g_mgr_p2l_done = 1;
     if (result != VE_TLS_DROP_ERROR || !error || !error->error_code || !error->error_message) {
         g_mgr_p2l_ok = 0;
-        return;
+        goto publish;
     }
     snprintf(g_mgr_p2l_code, sizeof(g_mgr_p2l_code), "%s", error->error_code);
     snprintf(g_mgr_p2l_msg, sizeof(g_mgr_p2l_msg), "%s", error->error_message);
     g_mgr_p2l_ok = 1;
+publish:
+    __atomic_store_n(&g_mgr_p2l_done, 1, __ATOMIC_RELEASE);
 }
 
 static int test_http_mgr_count_ok_do(ve_tls_http_client * client, const ve_tls_http_request * req, ve_tls_http_response * resp) {
     (void)client;
     (void)req;
     if (!resp) return -1;
-    g_mgr_p2l_http_calls++;
+    (void)__atomic_fetch_add(&g_mgr_p2l_http_calls, 1, __ATOMIC_RELEASE);
     resp->status_code = 200;
     resp->request_id = strdup("rid-ok");
     return 0;
 }
 
 static int test_manager_payload_too_large_after_comp_single(void) {
-    g_mgr_p2l_done = 0;
+    __atomic_store_n(&g_mgr_p2l_done, 0, __ATOMIC_RELAXED);
     g_mgr_p2l_ok = 0;
     g_http_called_unexpected = 0;
     memset(g_mgr_p2l_code, 0, sizeof(g_mgr_p2l_code));
@@ -4158,7 +4179,7 @@ static int test_manager_payload_too_large_after_comp_single(void) {
         ve_tls_producer_destroy(p);
         return -1;
     }
-    for (int i = 0; i < 200 && !g_mgr_p2l_done; i++) cfg.platform.sleep_ms(10);
+    for (int i = 0; i < 200 && !__atomic_load_n(&g_mgr_p2l_done, __ATOMIC_ACQUIRE); i++) cfg.platform.sleep_ms(10);
     ve_tls_producer_destroy(p);
     if (g_http_called_unexpected) return -1;
     if (!g_mgr_p2l_ok) return -1;
@@ -4168,7 +4189,7 @@ static int test_manager_payload_too_large_after_comp_single(void) {
 }
 
 static int test_manager_payload_too_large_split_into_two_requests(void) {
-    g_mgr_p2l_http_calls = 0;
+    __atomic_store_n(&g_mgr_p2l_http_calls, 0, __ATOMIC_RELAXED);
 
     ve_tls_kv kvs[1];
     kvs[0].key = "k1";
@@ -4245,18 +4266,18 @@ static int test_manager_payload_too_large_split_into_two_requests(void) {
         ve_tls_producer_destroy(p);
         return -1;
     }
-    for (int i = 0; i < 4000 && g_mgr_p2l_http_calls < 2; i++) cfg.platform.sleep_ms(1);
+    for (int i = 0; i < 4000 && __atomic_load_n(&g_mgr_p2l_http_calls, __ATOMIC_ACQUIRE) < 2; i++) cfg.platform.sleep_ms(1);
     ve_tls_producer_destroy(p);
-    if (g_mgr_p2l_http_calls >= 2) {
+    if (__atomic_load_n(&g_mgr_p2l_http_calls, __ATOMIC_ACQUIRE) >= 2) {
         return 0;
     }
     return -1;
 }
 
 static int test_manager_key_queue_limit_exceeded_drops(void) {
-    g_mgr_p2l_done = 0;
+    __atomic_store_n(&g_mgr_p2l_done, 0, __ATOMIC_RELAXED);
     g_mgr_p2l_ok = 0;
-    g_mgr_p2l_http_calls = 0;
+    __atomic_store_n(&g_mgr_p2l_http_calls, 0, __ATOMIC_RELAXED);
     g_http_called_unexpected = 0;
     memset(g_mgr_p2l_code, 0, sizeof(g_mgr_p2l_code));
     memset(g_mgr_p2l_msg, 0, sizeof(g_mgr_p2l_msg));
@@ -4288,20 +4309,20 @@ static int test_manager_key_queue_limit_exceeded_drops(void) {
         ve_tls_producer_destroy(p);
         return -1;
     }
-    for (int i = 0; i < 2000 && g_mgr_p2l_http_calls < 1; i++) cfg.platform.sleep_ms(1);
-    if (g_mgr_p2l_http_calls < 1) {
+    for (int i = 0; i < 2000 && __atomic_load_n(&g_mgr_p2l_http_calls, __ATOMIC_ACQUIRE) < 1; i++) cfg.platform.sleep_ms(1);
+    if (__atomic_load_n(&g_mgr_p2l_http_calls, __ATOMIC_ACQUIRE) < 1) {
         ve_tls_producer_destroy(p);
         return -1;
     }
 
-    g_mgr_p2l_done = 0;
+    __atomic_store_n(&g_mgr_p2l_done, 0, __ATOMIC_RELAXED);
     g_mgr_p2l_ok = 0;
     ve_tls_producer_set_send_done_v2(p, on_send_done_mgr_p2l_v2, NULL);
     if (ve_tls_producer_add_log_kv_hashkey(p, 0, "hk2", kvs, 1, 1) != VE_TLS_OK) {
         ve_tls_producer_destroy(p);
         return -1;
     }
-    for (int i = 0; i < 200 && !g_mgr_p2l_done; i++) cfg.platform.sleep_ms(10);
+    for (int i = 0; i < 200 && !__atomic_load_n(&g_mgr_p2l_done, __ATOMIC_ACQUIRE); i++) cfg.platform.sleep_ms(10);
     ve_tls_producer_destroy(p);
     if (!g_mgr_p2l_ok) return -1;
     if (strcmp(g_mgr_p2l_code, "KeyQueueLimitExceeded") != 0) return -1;
@@ -4325,9 +4346,9 @@ static int test_http_assert_headers_do(ve_tls_http_client * client, const ve_tls
     if (!req || !resp) {
         return -1;
     }
-    g_hdr_done = 1;
     if (!req->headers) {
         g_hdr_ok = 0;
+        __atomic_store_n(&g_hdr_done, 1, __ATOMIC_RELEASE);
         return -1;
     }
     const char * h = req->headers;
@@ -4350,6 +4371,7 @@ static int test_http_assert_headers_do(ve_tls_http_client * client, const ve_tls
     resp->request_id = strdup("rid-hdr");
     resp->body = NULL;
     resp->body_size = 0;
+    __atomic_store_n(&g_hdr_done, 1, __ATOMIC_RELEASE);
     return 0;
 }
 
@@ -4371,12 +4393,12 @@ static void on_send_done_hdr_v2(
     (void)start_id;
     (void)end_id;
     if (result == VE_TLS_OK) {
-        g_hdr_done = 1;
+        __atomic_store_n(&g_hdr_done, 1, __ATOMIC_RELEASE);
     }
 }
 
 static int test_sender_builds_headers_and_http_options(void) {
-    g_hdr_done = 0;
+    __atomic_store_n(&g_hdr_done, 0, __ATOMIC_RELAXED);
     g_hdr_ok = 0;
 
     ve_tls_config cfg;
@@ -4411,7 +4433,7 @@ static int test_sender_builds_headers_and_http_options(void) {
         ve_tls_producer_destroy(p);
         return -1;
     }
-    for (int i = 0; i < 200 && !g_hdr_done; i++) {
+    for (int i = 0; i < 200 && !__atomic_load_n(&g_hdr_done, __ATOMIC_ACQUIRE); i++) {
         cfg.platform.sleep_ms(10);
     }
     ve_tls_producer_destroy(p);
@@ -4421,11 +4443,10 @@ static int test_sender_builds_headers_and_http_options(void) {
 static int test_http_assert_small_comp_none_do(ve_tls_http_client * client, const ve_tls_http_request * req, ve_tls_http_response * resp) {
     (void)client;
     if (!req || !req->headers || !resp) {
-        g_hdr_small_done = 1;
         g_hdr_small_ok = 0;
+        __atomic_store_n(&g_hdr_small_done, 1, __ATOMIC_RELEASE);
         return -1;
     }
-    g_hdr_small_done = 1;
     if (strstr(req->headers, "x-tls-compresstype: none\n")) {
         g_hdr_small_ok = 1;
     } else {
@@ -4435,11 +4456,12 @@ static int test_http_assert_small_comp_none_do(ve_tls_http_client * client, cons
     resp->request_id = strdup("rid-small");
     resp->body = NULL;
     resp->body_size = 0;
+    __atomic_store_n(&g_hdr_small_done, 1, __ATOMIC_RELEASE);
     return 0;
 }
 
 static int test_sender_small_payload_uses_none_compresstype(void) {
-    g_hdr_small_done = 0;
+    __atomic_store_n(&g_hdr_small_done, 0, __ATOMIC_RELAXED);
     g_hdr_small_ok = 0;
 
     ve_tls_config cfg;
@@ -4467,7 +4489,7 @@ static int test_sender_small_payload_uses_none_compresstype(void) {
         return -1;
     }
 
-    for (int i = 0; i < 200 && !g_hdr_small_done; i++) {
+    for (int i = 0; i < 200 && !__atomic_load_n(&g_hdr_small_done, __ATOMIC_ACQUIRE); i++) {
         cfg.platform.sleep_ms(10);
     }
     ve_tls_producer_destroy(p);
@@ -4475,7 +4497,7 @@ static int test_sender_small_payload_uses_none_compresstype(void) {
 }
 
 static int test_sender_small_payload_with_agg_strategy_uses_none_compresstype(void) {
-    g_hdr_small_done = 0;
+    __atomic_store_n(&g_hdr_small_done, 0, __ATOMIC_RELAXED);
     g_hdr_small_ok = 0;
 
     ve_tls_config cfg;
@@ -4505,7 +4527,7 @@ static int test_sender_small_payload_with_agg_strategy_uses_none_compresstype(vo
         return -1;
     }
 
-    for (int i = 0; i < 200 && !g_hdr_small_done; i++) {
+    for (int i = 0; i < 200 && !__atomic_load_n(&g_hdr_small_done, __ATOMIC_ACQUIRE); i++) {
         cfg.platform.sleep_ms(10);
     }
     ve_tls_producer_destroy(p);
@@ -4514,9 +4536,9 @@ static int test_sender_small_payload_with_agg_strategy_uses_none_compresstype(vo
 
 static int test_http_assert_unsigned_headers_after_auth_do(ve_tls_http_client * client, const ve_tls_http_request * req, ve_tls_http_response * resp) {
     (void)client;
-    g_hdr_order_done = 1;
     g_hdr_order_ok = 0;
     if (!req || !req->headers || !resp) {
+        __atomic_store_n(&g_hdr_order_done, 1, __ATOMIC_RELEASE);
         return -1;
     }
     const char * h = req->headers;
@@ -4534,11 +4556,12 @@ static int test_http_assert_unsigned_headers_after_auth_do(ve_tls_http_client * 
     resp->request_id = strdup("rid-order");
     resp->body = NULL;
     resp->body_size = 0;
+    __atomic_store_n(&g_hdr_order_done, 1, __ATOMIC_RELEASE);
     return 0;
 }
 
 static int test_sender_unsigned_headers_appended_after_authorization(void) {
-    g_hdr_order_done = 0;
+    __atomic_store_n(&g_hdr_order_done, 0, __ATOMIC_RELAXED);
     g_hdr_order_ok = 0;
 
     ve_tls_config cfg;
@@ -4564,7 +4587,7 @@ static int test_sender_unsigned_headers_appended_after_authorization(void) {
         ve_tls_producer_destroy(p);
         return -1;
     }
-    for (int i = 0; i < 200 && !g_hdr_order_done; i++) {
+    for (int i = 0; i < 200 && !__atomic_load_n(&g_hdr_order_done, __ATOMIC_ACQUIRE); i++) {
         cfg.platform.sleep_ms(10);
     }
     ve_tls_producer_destroy(p);
@@ -4573,9 +4596,9 @@ static int test_sender_unsigned_headers_appended_after_authorization(void) {
 
 static int test_http_assert_content_md5_signed_do(ve_tls_http_client * client, const ve_tls_http_request * req, ve_tls_http_response * resp) {
     (void)client;
-    g_hdr_md5_done = 1;
     g_hdr_md5_ok = 0;
     if (!req || !req->headers || !resp) {
+        __atomic_store_n(&g_hdr_md5_done, 1, __ATOMIC_RELEASE);
         return -1;
     }
     const char * h = req->headers;
@@ -4588,11 +4611,12 @@ static int test_http_assert_content_md5_signed_do(ve_tls_http_client * client, c
     resp->request_id = strdup("rid-md5");
     resp->body = NULL;
     resp->body_size = 0;
+    __atomic_store_n(&g_hdr_md5_done, 1, __ATOMIC_RELEASE);
     return 0;
 }
 
 static int test_sender_putlogs_includes_content_md5_header(void) {
-    g_hdr_md5_done = 0;
+    __atomic_store_n(&g_hdr_md5_done, 0, __ATOMIC_RELAXED);
     g_hdr_md5_ok = 0;
 
     ve_tls_config cfg;
@@ -4619,7 +4643,7 @@ static int test_sender_putlogs_includes_content_md5_header(void) {
         ve_tls_producer_destroy(p);
         return -1;
     }
-    for (int i = 0; i < 200 && !g_hdr_md5_done; i++) {
+    for (int i = 0; i < 200 && !__atomic_load_n(&g_hdr_md5_done, __ATOMIC_ACQUIRE); i++) {
         cfg.platform.sleep_ms(10);
     }
     ve_tls_producer_destroy(p);
@@ -4628,9 +4652,9 @@ static int test_sender_putlogs_includes_content_md5_header(void) {
 
 static int test_http_assert_empty_hashkey_signed_do(ve_tls_http_client * client, const ve_tls_http_request * req, ve_tls_http_response * resp) {
     (void)client;
-    g_hdr_empty_hash_done = 1;
     g_hdr_empty_hash_ok = 0;
     if (!req || !req->headers || !resp) {
+        __atomic_store_n(&g_hdr_empty_hash_done, 1, __ATOMIC_RELEASE);
         return -1;
     }
     const char * h = req->headers;
@@ -4643,11 +4667,12 @@ static int test_http_assert_empty_hashkey_signed_do(ve_tls_http_client * client,
     resp->request_id = strdup("rid-empty-hash");
     resp->body = NULL;
     resp->body_size = 0;
+    __atomic_store_n(&g_hdr_empty_hash_done, 1, __ATOMIC_RELEASE);
     return 0;
 }
 
 static int test_sender_putlogs_includes_empty_hashkey_header(void) {
-    g_hdr_empty_hash_done = 0;
+    __atomic_store_n(&g_hdr_empty_hash_done, 0, __ATOMIC_RELAXED);
     g_hdr_empty_hash_ok = 0;
 
     ve_tls_config cfg;
@@ -4674,7 +4699,7 @@ static int test_sender_putlogs_includes_empty_hashkey_header(void) {
         ve_tls_producer_destroy(p);
         return -1;
     }
-    for (int i = 0; i < 200 && !g_hdr_empty_hash_done; i++) {
+    for (int i = 0; i < 200 && !__atomic_load_n(&g_hdr_empty_hash_done, __ATOMIC_ACQUIRE); i++) {
         cfg.platform.sleep_ms(10);
     }
     ve_tls_producer_destroy(p);
@@ -4702,18 +4727,18 @@ static void on_send_done_raw_v2(
     (void)start_id;
     (void)end_id;
     if (result == VE_TLS_OK && error && error->request_id && strcmp(error->request_id, "rid-ok") == 0) {
-        g_raw_ok_count++;
-        g_raw_ok = 1;
-    }
-    if (g_raw_ok_count >= 2) {
-        g_raw_done = 1;
+        __atomic_store_n(&g_raw_ok, 1, __ATOMIC_RELAXED);
+        int count = __atomic_add_fetch(&g_raw_ok_count, 1, __ATOMIC_ACQ_REL);
+        if (count >= 2) {
+            __atomic_store_n(&g_raw_done, 1, __ATOMIC_RELEASE);
+        }
     }
 }
 
 static int test_raw_add_log_paths_ok(void) {
-    g_raw_done = 0;
-    g_raw_ok = 0;
-    g_raw_ok_count = 0;
+    __atomic_store_n(&g_raw_done, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_raw_ok, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_raw_ok_count, 0, __ATOMIC_RELAXED);
 
     ve_tls_config cfg;
     ve_tls_config_init(&cfg);
@@ -4745,11 +4770,11 @@ static int test_raw_add_log_paths_ok(void) {
         return -1;
     }
 
-    for (int i = 0; i < 300 && !g_raw_done; i++) {
+    for (int i = 0; i < 300 && !__atomic_load_n(&g_raw_done, __ATOMIC_ACQUIRE); i++) {
         cfg.platform.sleep_ms(10);
     }
     ve_tls_producer_destroy(p);
-    return g_raw_ok ? 0 : -1;
+    return __atomic_load_n(&g_raw_ok, __ATOMIC_RELAXED) ? 0 : -1;
 }
 
 static int test_add_log_with_id_returns_monotonic_ids(void) {
@@ -4831,12 +4856,12 @@ static void on_send_done_sq_drop_v2(
     }
     if (strcmp(error->error_code, "SendQueueTimeout") == 0 || strcmp(error->error_code, "SendQueueFull") == 0) {
         g_sq_drop_ok = 1;
-        g_sq_drop_done = 1;
+        __atomic_store_n(&g_sq_drop_done, 1, __ATOMIC_RELEASE);
     }
 }
 
 static int test_send_queue_full_paths_drop_and_timeout(void) {
-    g_sq_drop_done = 0;
+    __atomic_store_n(&g_sq_drop_done, 0, __ATOMIC_RELAXED);
     g_sq_drop_ok = 0;
 
     ve_tls_config cfg;
@@ -4870,12 +4895,12 @@ static int test_send_queue_full_paths_drop_and_timeout(void) {
     ve_tls_kv kvs[1];
     kvs[0].key = "k1";
     kvs[0].value = "v1";
-    for (int i = 0; i < 200 && !g_sq_drop_done; i++) {
+    for (int i = 0; i < 200 && !__atomic_load_n(&g_sq_drop_done, __ATOMIC_ACQUIRE); i++) {
         (void)ve_tls_producer_add_log_kv(p, 0, kvs, 1, 1);
         cfg.platform.sleep_ms(1);
     }
 
-    for (int i = 0; i < 200 && !g_sq_drop_done; i++) {
+    for (int i = 0; i < 200 && !__atomic_load_n(&g_sq_drop_done, __ATOMIC_ACQUIRE); i++) {
         cfg.platform.sleep_ms(10);
     }
     ve_tls_producer_destroy(p);
@@ -4905,20 +4930,21 @@ static void on_send_done_env_v2(
     if (!st) {
         return;
     }
-    st->done = 1;
     if (raw_buffer != NULL) {
         st->ok = 0;
-        return;
+        goto publish;
     }
     if (result != VE_TLS_DROP_ERROR || !error) {
         st->ok = 0;
-        return;
+        goto publish;
     }
     if (!error->request_id || strcmp(error->request_id, "hdr-rid") != 0) {
         st->ok = 0;
-        return;
+        goto publish;
     }
     st->ok = 1;
+publish:
+    __atomic_store_n(&st->done, 1, __ATOMIC_RELEASE);
 }
 
 static int test_env_shared_senders_multi_producer(void) {
@@ -4984,7 +5010,9 @@ static int test_env_shared_senders_multi_producer(void) {
         return -1;
     }
 
-    for (int i = 0; i < 400 && (!s1.done || !s2.done); i++) {
+    for (int i = 0; i < 400 &&
+         (!__atomic_load_n(&s1.done, __ATOMIC_ACQUIRE) ||
+          !__atomic_load_n(&s2.done, __ATOMIC_ACQUIRE)); i++) {
         cfg.platform.sleep_ms(10);
     }
 
@@ -6056,7 +6084,6 @@ static int test_http_assert_proxy_ua_do(ve_tls_http_client * client, const ve_tl
     if (!req || !resp) {
         return -1;
     }
-    g_deepcopy_done = 1;
     if (!req->proxy || strcmp(req->proxy, "http://proxy.example") != 0) {
         g_deepcopy_ok = 0;
     } else if (!req->user_agent || strcmp(req->user_agent, "ua-test") != 0) {
@@ -6068,11 +6095,12 @@ static int test_http_assert_proxy_ua_do(ve_tls_http_client * client, const ve_tl
     resp->request_id = strdup("rid-deepcopy");
     resp->body = NULL;
     resp->body_size = 0;
+    __atomic_store_n(&g_deepcopy_done, 1, __ATOMIC_RELEASE);
     return 0;
 }
 
 static int test_create_deep_copies_string_fields(void) {
-    g_deepcopy_done = 0;
+    __atomic_store_n(&g_deepcopy_done, 0, __ATOMIC_RELAXED);
     g_deepcopy_ok = 0;
 
     ve_tls_config cfg;
@@ -6113,7 +6141,7 @@ static int test_create_deep_copies_string_fields(void) {
         ve_tls_producer_destroy(p);
         return -1;
     }
-    for (int i = 0; i < 200 && !g_deepcopy_done; i++) {
+    for (int i = 0; i < 200 && !__atomic_load_n(&g_deepcopy_done, __ATOMIC_ACQUIRE); i++) {
         cfg.platform.sleep_ms(10);
     }
     ve_tls_producer_destroy(p);
@@ -7094,7 +7122,6 @@ static int test_http_capture_url_and_ak_do(ve_tls_http_client * client, const ve
     if (!req || !resp) {
         return -1;
     }
-    g_update_called++;
     if (req->url) {
         snprintf(g_update_seen_url, sizeof(g_update_seen_url), "%s", req->url);
     } else {
@@ -7112,6 +7139,7 @@ static int test_http_capture_url_and_ak_do(ve_tls_http_client * client, const ve
             g_update_seen_ak[n] = 0;
         }
     }
+    (void)__atomic_add_fetch(&g_update_called, 1, __ATOMIC_RELEASE);
     resp->status_code = 200;
     resp->request_id = strdup("rid-update");
     resp->body = NULL;
@@ -7169,7 +7197,7 @@ static int test_create_fail_fast_missing_required(void) {
 }
 
 static int test_runtime_config_update_effective_for_new_requests(void) {
-    g_update_called = 0;
+    __atomic_store_n(&g_update_called, 0, __ATOMIC_RELAXED);
     g_update_seen_url[0] = 0;
     g_update_seen_ak[0] = 0;
 
@@ -7206,11 +7234,11 @@ static int test_runtime_config_update_effective_for_new_requests(void) {
         ve_tls_producer_destroy(p);
         return -1;
     }
-    for (int i = 0; i < 200 && g_update_called == 0; i++) {
+    for (int i = 0; i < 200 && __atomic_load_n(&g_update_called, __ATOMIC_ACQUIRE) == 0; i++) {
         cfg.platform.sleep_ms(10);
     }
     int ok = 0;
-    if (g_update_called > 0 && strstr(g_update_seen_url, "https://new.example.com") != NULL && strcmp(g_update_seen_ak, "ak2") == 0) {
+    if (__atomic_load_n(&g_update_called, __ATOMIC_ACQUIRE) > 0 && strstr(g_update_seen_url, "https://new.example.com") != NULL && strcmp(g_update_seen_ak, "ak2") == 0) {
         ok = 1;
     }
     ve_tls_producer_destroy(p);
@@ -7497,7 +7525,7 @@ static void on_send_done_cred(
     (void)user_param;
     (void)start_id;
     (void)end_id;
-    g_cred_cb++;
+    (void)__atomic_fetch_add(&g_cred_cb, 1, __ATOMIC_RELEASE);
     g_cred_done = 1;
 }
 
@@ -7517,16 +7545,12 @@ static void on_send_done_metrics(
     (void)user_param;
     (void)start_id;
     (void)end_id;
-    g_metrics_done = 1;
-    if (result != VE_TLS_OK || !error) {
-        g_metrics_ok = 0;
-        return;
-    }
-    g_metrics_ok = 1;
+    g_metrics_ok = (result == VE_TLS_OK && error != NULL) ? 1 : 0;
+    __atomic_store_n(&g_metrics_done, 1, __ATOMIC_RELEASE);
 }
 
 static int test_metrics_basic(void) {
-    g_metrics_done = 0;
+    __atomic_store_n(&g_metrics_done, 0, __ATOMIC_RELAXED);
     g_metrics_ok = 0;
     g_metrics_latency_events = 0;
 
@@ -7561,7 +7585,7 @@ static int test_metrics_basic(void) {
         return -1;
     }
 
-    for (int i = 0; i < 200 && !g_metrics_done; i++) {
+    for (int i = 0; i < 200 && !__atomic_load_n(&g_metrics_done, __ATOMIC_ACQUIRE); i++) {
         cfg.platform.sleep_ms(10);
     }
     if (!g_metrics_ok) {
@@ -7602,11 +7626,12 @@ static int test_rl_do(ve_tls_http_client * client, const ve_tls_http_request * r
         return -1;
     }
     rl_state * s = (rl_state *)client->user_data;
-    if (s && s->platform && s->count < 2) {
-        s->t[s->count] = s->platform->time_ms();
-    }
     if (s) {
-        s->count++;
+        int index = __atomic_load_n(&s->count, __ATOMIC_RELAXED);
+        if (s->platform && index < 2) {
+            s->t[index] = s->platform->time_ms();
+        }
+        __atomic_store_n(&s->count, index + 1, __ATOMIC_RELEASE);
     }
     resp->status_code = 200;
     resp->request_id = strdup("rid-ok");
@@ -7744,7 +7769,7 @@ static int test_send_queue_blocking_push(void) {
 
 static int test_dynamic_credentials_refreshes_token(void) {
     g_cred_done = 0;
-    g_cred_cb = 0;
+    __atomic_store_n(&g_cred_cb, 0, __ATOMIC_RELAXED);
     g_cred_req = 0;
     g_cred_provider_calls = 0;
     memset(g_cred_seen_1, 0, sizeof(g_cred_seen_1));
@@ -7785,10 +7810,10 @@ static int test_dynamic_credentials_refreshes_token(void) {
         ve_tls_producer_destroy(p);
         return 2;
     }
-    for (int i = 0; i < 200 && g_cred_cb < 1; i++) {
+    for (int i = 0; i < 200 && __atomic_load_n(&g_cred_cb, __ATOMIC_ACQUIRE) < 1; i++) {
         cfg.platform.sleep_ms(10);
     }
-    if (g_cred_cb < 1) {
+    if (__atomic_load_n(&g_cred_cb, __ATOMIC_ACQUIRE) < 1) {
         ve_tls_producer_destroy(p);
         return 3;
     }
@@ -7798,12 +7823,12 @@ static int test_dynamic_credentials_refreshes_token(void) {
         ve_tls_producer_destroy(p);
         return 4;
     }
-    for (int i = 0; i < 200 && g_cred_cb < 2; i++) {
+    for (int i = 0; i < 200 && __atomic_load_n(&g_cred_cb, __ATOMIC_ACQUIRE) < 2; i++) {
         cfg.platform.sleep_ms(10);
     }
     ve_tls_producer_destroy(p);
 
-    if (g_cred_cb < 2) {
+    if (__atomic_load_n(&g_cred_cb, __ATOMIC_ACQUIRE) < 2) {
         return 5;
     }
     if (g_cred_seen_1[0] == 0) {
@@ -7823,7 +7848,7 @@ static int test_dynamic_credentials_refreshes_token(void) {
 
 static int test_dynamic_credentials_failure_does_not_deadlock(void) {
     g_cred_done = 0;
-    g_cred_cb = 0;
+    __atomic_store_n(&g_cred_cb, 0, __ATOMIC_RELAXED);
     g_cred_req = 0;
     g_cred_provider_calls = 0;
     memset(g_cred_seen_1, 0, sizeof(g_cred_seen_1));
@@ -7864,10 +7889,10 @@ static int test_dynamic_credentials_failure_does_not_deadlock(void) {
         ve_tls_producer_destroy(p);
         return -1;
     }
-    for (int i = 0; i < 200 && g_cred_cb < 1; i++) {
+    for (int i = 0; i < 200 && __atomic_load_n(&g_cred_cb, __ATOMIC_ACQUIRE) < 1; i++) {
         cfg.platform.sleep_ms(10);
     }
-    if (g_cred_cb < 1) {
+    if (__atomic_load_n(&g_cred_cb, __ATOMIC_ACQUIRE) < 1) {
         ve_tls_producer_destroy(p);
         return -1;
     }
@@ -7877,12 +7902,12 @@ static int test_dynamic_credentials_failure_does_not_deadlock(void) {
         ve_tls_producer_destroy(p);
         return -1;
     }
-    for (int i = 0; i < 200 && g_cred_cb < 2; i++) {
+    for (int i = 0; i < 200 && __atomic_load_n(&g_cred_cb, __ATOMIC_ACQUIRE) < 2; i++) {
         cfg.platform.sleep_ms(10);
     }
     ve_tls_producer_destroy(p);
 
-    if (g_cred_cb < 2) {
+    if (__atomic_load_n(&g_cred_cb, __ATOMIC_ACQUIRE) < 2) {
         return -1;
     }
     if (g_cred_provider_calls < 2) {
@@ -7905,11 +7930,12 @@ static int test_cb_do(ve_tls_http_client * client, const ve_tls_http_request * r
         return -1;
     }
     cb_state * s = (cb_state *)client->user_data;
-    if (s && s->platform && s->count < 2) {
-        s->t[s->count] = s->platform->time_ms();
-    }
     if (s) {
-        s->count++;
+        int index = __atomic_load_n(&s->count, __ATOMIC_RELAXED);
+        if (s->platform && index < 2) {
+            s->t[index] = s->platform->time_ms();
+        }
+        __atomic_store_n(&s->count, index + 1, __ATOMIC_RELEASE);
     }
     resp->status_code = 500;
     resp->request_id = strdup("hdr-rid");
@@ -7987,15 +8013,15 @@ static void on_send_done_ordered(
     if (result == VE_TLS_OK) {
         int n = __atomic_add_fetch(&g_order_cb, 1, __ATOMIC_RELAXED);
         if (n >= 2) {
-            g_order_done = 1;
+            __atomic_store_n(&g_order_done, 1, __ATOMIC_RELEASE);
         }
     } else {
-        g_order_done = 1;
+        __atomic_store_n(&g_order_done, 1, __ATOMIC_RELEASE);
     }
 }
 
 static int test_ordered_send_max_concurrency_one(void) {
-    g_order_done = 0;
+    __atomic_store_n(&g_order_done, 0, __ATOMIC_RELAXED);
     g_order_cb = 0;
     g_order_cur = 0;
     g_order_max = 0;
@@ -8034,11 +8060,11 @@ static int test_ordered_send_max_concurrency_one(void) {
         return -1;
     }
 
-    for (int i = 0; i < 400 && !g_order_done; i++) {
+    for (int i = 0; i < 400 && !__atomic_load_n(&g_order_done, __ATOMIC_ACQUIRE); i++) {
         cfg.platform.sleep_ms(10);
     }
     ve_tls_producer_destroy(p);
-    if (!g_order_done) {
+    if (!__atomic_load_n(&g_order_done, __ATOMIC_ACQUIRE)) {
         return -1;
     }
     return g_order_max == 1 ? 0 : -1;
@@ -8127,12 +8153,12 @@ static void on_send_done_hashkey(
     (void)start_id;
     (void)end_id;
     if (result != VE_TLS_OK) {
-        g_hk_done = 1;
+        __atomic_store_n(&g_hk_done, 1, __ATOMIC_RELEASE);
         return;
     }
     int n = __atomic_add_fetch(&g_hk_cb, 1, __ATOMIC_RELAXED);
     if (n >= 4) {
-        g_hk_done = 1;
+        __atomic_store_n(&g_hk_done, 1, __ATOMIC_RELEASE);
     }
 }
 
@@ -8142,7 +8168,7 @@ static int test_hashkey_partition_parallelism(void) {
     g_hk_total_cur = 0;
     g_hk_total_max = 0;
     g_hk_cb = 0;
-    g_hk_done = 0;
+    __atomic_store_n(&g_hk_done, 0, __ATOMIC_RELAXED);
 
     ve_tls_config cfg;
     ve_tls_config_init(&cfg);
@@ -8176,11 +8202,11 @@ static int test_hashkey_partition_parallelism(void) {
         }
     }
 
-    for (int i = 0; i < 500 && !g_hk_done; i++) {
+    for (int i = 0; i < 500 && !__atomic_load_n(&g_hk_done, __ATOMIC_ACQUIRE); i++) {
         cfg.platform.sleep_ms(10);
     }
     ve_tls_producer_destroy(p);
-    if (!g_hk_done || g_hk_cb < 4) {
+    if (!__atomic_load_n(&g_hk_done, __ATOMIC_ACQUIRE) || g_hk_cb < 4) {
         return -1;
     }
     for (int i = 0; i < 4; i++) {
@@ -8335,7 +8361,6 @@ static int test_key_queue_max_active_drops(void) {
 
 static int64_t g_keyrl_t[4] = {0};
 static int g_keyrl_n[2] = {0};
-static int64_t g_keyrl_start = 0;
 
 static int test_key_rate_limit_do(ve_tls_http_client * client, const ve_tls_http_request * req, ve_tls_http_response * resp) {
     if (!req || !req->headers || !resp) {
@@ -8355,14 +8380,12 @@ static int test_key_rate_limit_do(ve_tls_http_client * client, const ve_tls_http
     if (idx < 0) {
         return -1;
     }
-    int n = __atomic_add_fetch(&g_keyrl_n[idx], 1, __ATOMIC_RELAXED);
+    int n = __atomic_load_n(&g_keyrl_n[idx], __ATOMIC_RELAXED) + 1;
     if (n <= 2) {
         int64_t now = ((ve_tls_platform *)client->user_data)->time_ms();
-        if (g_keyrl_start == 0) {
-            g_keyrl_start = now;
-        }
         g_keyrl_t[idx * 2 + (n - 1)] = now;
     }
+    __atomic_store_n(&g_keyrl_n[idx], n, __ATOMIC_RELEASE);
     resp->status_code = 200;
     resp->request_id = strdup("rid-ok");
     return 0;
@@ -8374,9 +8397,8 @@ static void test_key_rate_limit_free(ve_tls_http_client * client, ve_tls_http_re
 
 static int test_key_rate_limit_is_per_key(void) {
     memset(g_keyrl_t, 0, sizeof(g_keyrl_t));
-    g_keyrl_n[0] = 0;
-    g_keyrl_n[1] = 0;
-    g_keyrl_start = 0;
+    __atomic_store_n(&g_keyrl_n[0], 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_keyrl_n[1], 0, __ATOMIC_RELAXED);
 
     ve_tls_config cfg;
     ve_tls_config_init(&cfg);
@@ -8420,11 +8442,14 @@ static int test_key_rate_limit_is_per_key(void) {
         ve_tls_producer_destroy(p);
         return -1;
     }
-    for (int i = 0; i < 400 && (g_keyrl_n[0] < 2 || g_keyrl_n[1] < 2); i++) {
+    for (int i = 0; i < 400 &&
+         (__atomic_load_n(&g_keyrl_n[0], __ATOMIC_ACQUIRE) < 2 ||
+          __atomic_load_n(&g_keyrl_n[1], __ATOMIC_ACQUIRE) < 2); i++) {
         cfg.platform.sleep_ms(10);
     }
     ve_tls_producer_destroy(p);
-    if (g_keyrl_n[0] < 2 || g_keyrl_n[1] < 2) {
+    if (__atomic_load_n(&g_keyrl_n[0], __ATOMIC_ACQUIRE) < 2 ||
+        __atomic_load_n(&g_keyrl_n[1], __ATOMIC_ACQUIRE) < 2) {
         return -1;
     }
     int64_t dt1 = g_keyrl_t[1] - g_keyrl_t[0];
@@ -8475,13 +8500,14 @@ static int test_rate_limit_rps_throttles(void) {
         ve_tls_producer_destroy(p);
         return -1;
     }
-    for (int i = 0; i < 200 && g_rl_state.count < 2; i++) {
+    for (int i = 0; i < 200 && __atomic_load_n(&g_rl_state.count, __ATOMIC_ACQUIRE) < 2; i++) {
         cfg.platform.sleep_ms(10);
     }
     ve_tls_producer_destroy(p);
-    if (g_rl_state.count < 2 || g_rl_state.t[0] == 0 || g_rl_state.t[1] == 0) {
+    int count = __atomic_load_n(&g_rl_state.count, __ATOMIC_ACQUIRE);
+    if (count < 2 || g_rl_state.t[0] == 0 || g_rl_state.t[1] == 0) {
         fprintf(stderr, "rate_limit_rps: count=%d t0=%lld t1=%lld\n",
-            g_rl_state.count, (long long)g_rl_state.t[0], (long long)g_rl_state.t[1]);
+            count, (long long)g_rl_state.t[0], (long long)g_rl_state.t[1]);
         return -1;
     }
     int64_t dt = g_rl_state.t[1] - g_rl_state.t[0];
@@ -8530,11 +8556,11 @@ static int test_circuit_breaker_delays_second_send(void) {
         return -1;
     }
 
-    for (int i = 0; i < 200 && g_cb_state.count < 2; i++) {
+    for (int i = 0; i < 200 && __atomic_load_n(&g_cb_state.count, __ATOMIC_ACQUIRE) < 2; i++) {
         cfg.platform.sleep_ms(10);
     }
     ve_tls_producer_destroy(p);
-    if (g_cb_state.count < 2 || g_cb_state.t[0] == 0 || g_cb_state.t[1] == 0) {
+    if (__atomic_load_n(&g_cb_state.count, __ATOMIC_ACQUIRE) < 2 || g_cb_state.t[0] == 0 || g_cb_state.t[1] == 0) {
         return -1;
     }
     int64_t dt = g_cb_state.t[1] - g_cb_state.t[0];
@@ -10559,13 +10585,13 @@ static int test_persistent_sender_ack_updates_checkpoint_and_reclaims_closed_seg
         return -1;
     }
     for (int i = 0; i < 300; i++) {
-        if (p->persistent->checkpoint.acked_log_id >= 2) {
+        if (test_producer_checkpoint_acked_log_id(p) >= 2) {
             break;
         }
         cfg.platform.sleep_ms(10);
     }
     close_rc = (int)ve_tls_producer_close(p, 10000);
-    if (p->persistent->checkpoint.acked_log_id < 2 ||
+    if (test_producer_checkpoint_acked_log_id(p) < 2 ||
         close_rc != VE_TLS_OK ||
         cfg.platform.path_stat(seg1, &info1) != 0 ||
         cfg.platform.path_stat(seg2, &info2) != 0 ||
@@ -10629,7 +10655,7 @@ static int test_persistent_retry_exhausted_retains_and_recovers(void) {
     ve_tls_producer_get_metrics(p1, &metrics);
     close_rc = (int)ve_tls_producer_close(p1, 10000);
     if (metrics.requests_failed_total < 1 ||
-        p1->persistent->checkpoint.acked_log_id != 0 ||
+        test_producer_checkpoint_acked_log_id(p1) != 0 ||
         close_rc != VE_TLS_OK) {
         ve_tls_producer_destroy(p1);
         cleanup_persistent_dir(dir);
@@ -10652,7 +10678,7 @@ static int test_persistent_retry_exhausted_retains_and_recovers(void) {
         metrics.logs_enqueued_total != 1 ||
         metrics.requests_total != 1 ||
         metrics.requests_failed_total != 0 ||
-        p2->persistent->checkpoint.acked_log_id < 1) {
+        test_producer_checkpoint_acked_log_id(p2) < 1) {
         ve_tls_producer_destroy(p2);
         cleanup_persistent_dir(dir);
         return -1;
@@ -10673,9 +10699,9 @@ static int test_persistent_key_queue_failure_retains_and_recovers(void) {
     if (make_temp_dir(dir, sizeof(dir)) != 0) {
         return -1;
     }
-    g_mgr_p2l_done = 0;
+    __atomic_store_n(&g_mgr_p2l_done, 0, __ATOMIC_RELAXED);
     g_mgr_p2l_ok = 0;
-    g_mgr_p2l_http_calls = 0;
+    __atomic_store_n(&g_mgr_p2l_http_calls, 0, __ATOMIC_RELAXED);
     memset(g_mgr_p2l_code, 0, sizeof(g_mgr_p2l_code));
     memset(g_mgr_p2l_msg, 0, sizeof(g_mgr_p2l_msg));
 
@@ -10711,12 +10737,12 @@ static int test_persistent_key_queue_failure_retains_and_recovers(void) {
         return -3;
     }
     for (int i = 0; i < 2000; i++) {
-        if (p1->persistent->checkpoint.acked_log_id >= 1) {
+        if (test_producer_checkpoint_acked_log_id(p1) >= 1) {
             break;
         }
         cfg.platform.sleep_ms(1);
     }
-    if (p1->persistent->checkpoint.acked_log_id != 1) {
+    if (test_producer_checkpoint_acked_log_id(p1) != 1) {
         ve_tls_producer_destroy(p1);
         cleanup_persistent_dir(dir);
         return -4;
@@ -10728,20 +10754,20 @@ static int test_persistent_key_queue_failure_retains_and_recovers(void) {
         cleanup_persistent_dir(dir);
         return -5;
     }
-    for (int i = 0; i < 300 && !g_mgr_p2l_done; i++) {
+    for (int i = 0; i < 300 && !__atomic_load_n(&g_mgr_p2l_done, __ATOMIC_ACQUIRE); i++) {
         cfg.platform.sleep_ms(10);
     }
     close_rc = (int)ve_tls_producer_close(p1, 10000);
     if (!g_mgr_p2l_ok ||
         strcmp(g_mgr_p2l_code, "KeyQueueLimitExceeded") != 0 ||
-        p1->persistent->checkpoint.acked_log_id != 1 ||
+        test_producer_checkpoint_acked_log_id(p1) != 1 ||
         close_rc != VE_TLS_OK) {
         fprintf(stderr,
             "persistent key queue retain debug done=%d ok=%d code=%s checkpoint=%lld close=%d\n",
             g_mgr_p2l_done,
             g_mgr_p2l_ok,
             g_mgr_p2l_code,
-            (long long)p1->persistent->checkpoint.acked_log_id,
+            (long long)test_producer_checkpoint_acked_log_id(p1),
             close_rc);
         ve_tls_producer_destroy(p1);
         cleanup_persistent_dir(dir);
@@ -10765,13 +10791,13 @@ static int test_persistent_key_queue_failure_retains_and_recovers(void) {
         metrics.logs_enqueued_total != 1 ||
         metrics.requests_total != 1 ||
         metrics.requests_failed_total != 0 ||
-        p2->persistent->checkpoint.acked_log_id < 2) {
+        test_producer_checkpoint_acked_log_id(p2) < 2) {
         fprintf(stderr,
             "persistent key queue recover debug logs=%llu requests=%llu failed=%llu checkpoint=%lld close=%d\n",
             (unsigned long long)metrics.logs_enqueued_total,
             (unsigned long long)metrics.requests_total,
             (unsigned long long)metrics.requests_failed_total,
-            (long long)p2->persistent->checkpoint.acked_log_id,
+            (long long)test_producer_checkpoint_acked_log_id(p2),
             close_rc);
         ve_tls_producer_destroy(p2);
         cleanup_persistent_dir(dir);
@@ -11855,7 +11881,7 @@ static int test_persistent_concurrent_append_ack_and_reclaim(void) {
     int failed = args[0].unexpected != 0 || args[1].unexpected != 0 ||
         accepted != 200 || flush_rc != VE_TLS_OK || close_rc != VE_TLS_OK ||
         !producer->persistent ||
-        producer->persistent->checkpoint.acked_log_id != 200 ||
+        test_producer_checkpoint_acked_log_id(producer) != 200 ||
         producer->persistent->durable_checkpoint_acked_log_id != 200 ||
         producer->persistent->current_segments != 1 ||
         producer->persistent->current_segments > producer->persistent->max_segments;
@@ -11869,7 +11895,7 @@ static int test_persistent_concurrent_append_ack_and_reclaim(void) {
             (int)close_rc,
             producer->persistent ? producer->persistent->current_segments : 0,
             producer->persistent ? producer->persistent->max_segments : 0,
-            (long long)(producer->persistent ? producer->persistent->checkpoint.acked_log_id : 0),
+            (long long)test_producer_checkpoint_acked_log_id(producer),
             (long long)(producer->persistent ? producer->persistent->durable_checkpoint_acked_log_id : 0));
     }
     ve_tls_producer_destroy(producer);
@@ -12294,18 +12320,18 @@ static int test_persistent_append_releases_producer_mutex_for_disk_write(void) {
     cfg.max_persistent_file_count = 4;
     p = ve_tls_producer_create(&cfg);
     if (!p || !p->persistent) {
-        g_track_producer_mutex = NULL;
+        __atomic_store_n(&g_track_producer_mutex, NULL, __ATOMIC_RELEASE);
         cleanup_persistent_dir(dir);
         return -1;
     }
-    g_track_producer_mutex = p->mutex;
+    __atomic_store_n(&g_track_producer_mutex, p->mutex, __ATOMIC_RELEASE);
     g_track_file_write_saw_producer_mutex = 0;
     g_track_producer_mutex_depth = 0;
     kvs[0].key = "message";
     kvs[0].value = "persistent-mutex";
     rc = ve_tls_producer_add_log_kv_hashkey(p, 0, NULL, kvs, 1, 0);
     ve_tls_producer_destroy(p);
-    g_track_producer_mutex = NULL;
+    __atomic_store_n(&g_track_producer_mutex, NULL, __ATOMIC_RELEASE);
     cleanup_persistent_dir(dir);
     if (rc != VE_TLS_OK || g_track_file_write_saw_producer_mutex) {
         return -1;
@@ -12347,13 +12373,13 @@ static int test_persistent_out_of_order_ack_waits_for_contiguous_prefix(void) {
         return -1;
     }
     ve_tls_persistent_on_final_result(p, VE_TLS_OK, 2, 3);
-    if (p->persistent->checkpoint.acked_log_id != 0) {
+    if (test_producer_checkpoint_acked_log_id(p) != 0) {
         ve_tls_producer_destroy(p);
         cleanup_persistent_dir(dir);
         return -1;
     }
     ve_tls_persistent_on_final_result(p, VE_TLS_OK, 1, 1);
-    if (p->persistent->checkpoint.acked_log_id != 3) {
+    if (test_producer_checkpoint_acked_log_id(p) != 3) {
         ve_tls_producer_destroy(p);
         cleanup_persistent_dir(dir);
         return -1;
@@ -12408,7 +12434,7 @@ static int test_persistent_checkpoint_fsync_failure_stays_dirty_and_emits_metric
     if (g_checkpoint_save_failed_events != 1 ||
         g_checkpoint_save_failed_start_id != 1 ||
         g_checkpoint_save_failed_end_id != 1 ||
-        p->persistent->checkpoint.acked_log_id != 1 ||
+        test_producer_checkpoint_acked_log_id(p) != 1 ||
         p->persistent->durable_checkpoint_acked_log_id != 0 ||
         !p->persistent->checkpoint_dirty) {
         ve_tls_producer_destroy(p);

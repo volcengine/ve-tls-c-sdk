@@ -3,6 +3,7 @@
 #include "ve_tls_alloc.h"
 #include "ve_tls_persistent_format.h"
 
+#include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -52,6 +53,18 @@ static int64_t persistent_now_ms(ve_tls_persistent * persistent) {
         return 0;
     }
     return persistent->platform->time_ms();
+}
+
+static void persistent_heartbeat_lock(ve_tls_persistent * persistent) {
+    if (persistent && persistent->heartbeat_mutex && persistent->platform && persistent->platform->mutex_lock) {
+        persistent->platform->mutex_lock(persistent->heartbeat_mutex);
+    }
+}
+
+static void persistent_heartbeat_unlock(ve_tls_persistent * persistent) {
+    if (persistent && persistent->heartbeat_mutex && persistent->platform && persistent->platform->mutex_unlock) {
+        persistent->platform->mutex_unlock(persistent->heartbeat_mutex);
+    }
 }
 
 static int write_manifest_full(ve_tls_platform * platform, ve_tls_file * file, const void * data, size_t size) {
@@ -399,7 +412,7 @@ static int is_soft_limit_above(uint64_t current, uint64_t max, int32_t pct) {
     return floor != UINT64_MAX && current > floor;
 }
 
-static int validate_current_lease(ve_tls_persistent * persistent) {
+static int validate_current_lease_locked(ve_tls_persistent * persistent) {
     ve_tls_lease_state current;
     if (!persistent || !persistent->platform) {
         return -1;
@@ -416,7 +429,18 @@ static int validate_current_lease(ve_tls_persistent * persistent) {
     return 0;
 }
 
-static int validate_current_lease_if_needed(ve_tls_persistent * persistent) {
+static int validate_current_lease(ve_tls_persistent * persistent) {
+    int rc;
+    if (!persistent || !persistent->platform) {
+        return -1;
+    }
+    persistent_heartbeat_lock(persistent);
+    rc = validate_current_lease_locked(persistent);
+    persistent_heartbeat_unlock(persistent);
+    return rc;
+}
+
+static int validate_current_lease_if_needed_locked(ve_tls_persistent * persistent) {
     int64_t now_ms;
     if (!persistent) {
         return -1;
@@ -424,26 +448,25 @@ static int validate_current_lease_if_needed(ve_tls_persistent * persistent) {
     if (persistent->heartbeat_interval_ms <= 0 ||
         persistent->lease_timeout_ms <= 0 ||
         persistent->heartbeat_interval_ms >= persistent->lease_timeout_ms) {
-        return validate_current_lease(persistent);
+        return validate_current_lease_locked(persistent);
     }
     now_ms = persistent_now_ms(persistent);
-    if (now_ms <= 0 || persistent->next_heartbeat_ms <= 0 || now_ms >= persistent->next_heartbeat_ms) {
-        return validate_current_lease(persistent);
+    if (now_ms <= 0 || atomic_load_explicit(&persistent->next_heartbeat_ms, memory_order_relaxed) <= 0 ||
+        now_ms >= atomic_load_explicit(&persistent->next_heartbeat_ms, memory_order_relaxed)) {
+        return validate_current_lease_locked(persistent);
     }
     return 0;
 }
 
-int ve_tls_persistent_heartbeat_if_due(ve_tls_persistent * persistent, int force) {
+static int ve_tls_persistent_heartbeat_if_due_locked(ve_tls_persistent * persistent, int force) {
     ve_tls_lease_options options;
     int64_t now_ms;
-    if (!persistent || !persistent->platform) {
-        return -1;
-    }
     now_ms = persistent_now_ms(persistent);
-    if (!force && persistent->heartbeat_interval_ms > 0 && now_ms > 0 && now_ms < persistent->next_heartbeat_ms) {
+    if (!force && persistent->heartbeat_interval_ms > 0 && now_ms > 0 &&
+        now_ms < atomic_load_explicit(&persistent->next_heartbeat_ms, memory_order_relaxed)) {
         return 0;
     }
-    if (validate_current_lease(persistent) != 0) {
+    if (validate_current_lease_locked(persistent) != 0) {
         return -1;
     }
     memset(&options, 0, sizeof(options));
@@ -459,11 +482,39 @@ int ve_tls_persistent_heartbeat_if_due(ve_tls_persistent * persistent, int force
         return -1;
     }
     if (persistent->heartbeat_interval_ms > 0 && now_ms > 0) {
-        persistent->next_heartbeat_ms = now_ms + persistent->heartbeat_interval_ms;
+        atomic_store_explicit(
+            &persistent->next_heartbeat_ms,
+            now_ms + persistent->heartbeat_interval_ms,
+            memory_order_relaxed);
     } else {
-        persistent->next_heartbeat_ms = now_ms;
+        atomic_store_explicit(&persistent->next_heartbeat_ms, now_ms, memory_order_relaxed);
     }
     return 0;
+}
+
+static int persistent_heartbeat_and_validate_if_needed(ve_tls_persistent * persistent, int force) {
+    int rc;
+    if (!persistent || !persistent->platform) {
+        return -1;
+    }
+    persistent_heartbeat_lock(persistent);
+    rc = ve_tls_persistent_heartbeat_if_due_locked(persistent, force);
+    if (rc == 0) {
+        rc = validate_current_lease_if_needed_locked(persistent);
+    }
+    persistent_heartbeat_unlock(persistent);
+    return rc;
+}
+
+int ve_tls_persistent_heartbeat_if_due(ve_tls_persistent * persistent, int force) {
+    int rc;
+    if (!persistent || !persistent->platform) {
+        return -1;
+    }
+    persistent_heartbeat_lock(persistent);
+    rc = ve_tls_persistent_heartbeat_if_due_locked(persistent, force);
+    persistent_heartbeat_unlock(persistent);
+    return rc;
 }
 
 static int remove_segment(
@@ -936,16 +987,33 @@ int ve_tls_persistent_open(ve_tls_persistent * persistent, const ve_tls_persiste
         ve_tls_persistent_close(persistent);
         return -1;
     }
-    persistent->next_heartbeat_ms = options->now_ms > 0 && persistent->heartbeat_interval_ms > 0
-        ? options->now_ms + persistent->heartbeat_interval_ms
-        : options->now_ms;
+    if (!persistent->platform->mutex_create || !persistent->platform->mutex_destroy ||
+        !persistent->platform->mutex_lock || !persistent->platform->mutex_unlock) {
+        ve_tls_persistent_close(persistent);
+        return -1;
+    }
+    persistent->heartbeat_mutex = persistent->platform->mutex_create();
+    if (!persistent->heartbeat_mutex) {
+        ve_tls_persistent_close(persistent);
+        return -1;
+    }
+    atomic_store_explicit(
+        &persistent->next_heartbeat_ms,
+        options->now_ms > 0 && persistent->heartbeat_interval_ms > 0
+            ? options->now_ms + persistent->heartbeat_interval_ms
+            : options->now_ms,
+        memory_order_relaxed);
     return 0;
 }
 
 void ve_tls_persistent_close(ve_tls_persistent * persistent) {
+    ve_tls_platform * platform;
+    ve_tls_mutex * heartbeat_mutex;
     if (!persistent || !persistent->platform) {
         return;
     }
+    platform = persistent->platform;
+    heartbeat_mutex = persistent->heartbeat_mutex;
     (void)ve_tls_persistent_flush(persistent);
     ve_tls_segment_store_close(&persistent->store);
     ve_tls_free(persistent->segment_meta);
@@ -956,6 +1024,9 @@ void ve_tls_persistent_close(ve_tls_persistent * persistent) {
     persistent->append_buf_cap = 0;
     if (persistent->lease_path[0] != 0 && validate_current_lease(persistent) == 0) {
         (void)ve_tls_lease_release(persistent->platform, persistent->lease_path);
+    }
+    if (heartbeat_mutex && platform->mutex_destroy) {
+        platform->mutex_destroy(heartbeat_mutex);
     }
     memset(persistent, 0, sizeof(*persistent));
 }
@@ -995,10 +1066,7 @@ int ve_tls_persistent_append(ve_tls_persistent * persistent, int64_t log_id, con
     if (!persistent->platform || !payload || payload_size == 0) {
         return -1;
     }
-    if (ve_tls_persistent_heartbeat_if_due(persistent, 0) != 0) {
-        return -1;
-    }
-    if (validate_current_lease_if_needed(persistent) != 0) {
+    if (persistent_heartbeat_and_validate_if_needed(persistent, 0) != 0) {
         return -1;
     }
     memset(&view, 0, sizeof(view));
@@ -1078,10 +1146,7 @@ int ve_tls_persistent_recover(ve_tls_persistent * persistent, int (*on_record)(i
     if (!persistent || !persistent->platform || !on_record) {
         return -1;
     }
-    if (ve_tls_persistent_heartbeat_if_due(persistent, 1) != 0) {
-        return -1;
-    }
-    if (validate_current_lease_if_needed(persistent) != 0) {
+    if (persistent_heartbeat_and_validate_if_needed(persistent, 1) != 0) {
         return -1;
     }
     last_segment = persistent->store.active_segment_id;
@@ -1099,10 +1164,7 @@ int ve_tls_persistent_recover(ve_tls_persistent * persistent, int (*on_record)(i
         if (!info.exists) {
             continue;
         }
-        if (ve_tls_persistent_heartbeat_if_due(persistent, 0) != 0) {
-            return -1;
-        }
-        if (validate_current_lease_if_needed(persistent) != 0) {
+        if (persistent_heartbeat_and_validate_if_needed(persistent, 0) != 0) {
             return -1;
         }
         if (ve_tls_segment_store_reader_open(&persistent->store, segment_id, info.size, &reader) != 0) {
@@ -1168,10 +1230,7 @@ int ve_tls_persistent_ack_range(ve_tls_persistent * persistent, int64_t start_id
         start_id > persistent->checkpoint.acked_log_id + 1) {
         return -1;
     }
-    if (ve_tls_persistent_heartbeat_if_due(persistent, 0) != 0) {
-        return -1;
-    }
-    if (validate_current_lease_if_needed(persistent) != 0) {
+    if (persistent_heartbeat_and_validate_if_needed(persistent, 0) != 0) {
         return -1;
     }
     if (end_id > persistent->checkpoint.acked_log_id) {
