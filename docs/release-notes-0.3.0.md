@@ -14,7 +14,9 @@
   wrapper to an immutable C core commit.
 - Added a shared-library ABI boundary with hidden default visibility and a
   checked approved export surface.
-- Added the versioned producer constructor to the approved 0.3.0 ABI surface.
+- Added paired size/version entry points for config initialization, producer
+  creation, and Android config translation. Legacy entry points read only their
+  original struct prefixes.
 - Added public-header C++ compile/link coverage for core, adapter, and Android
   binding headers.
 - Added install rules, a relocatable CMake package, and an independent C

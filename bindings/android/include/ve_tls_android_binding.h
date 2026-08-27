@@ -9,6 +9,10 @@
 
 VE_TLS_BEGIN_DECLS
 
+#define VE_TLS_ANDROID_CONFIG_VIEW_VERSION_1 1u
+#define VE_TLS_ANDROID_CONFIG_VIEW_VERSION_2 2u
+#define VE_TLS_ANDROID_CONFIG_VIEW_VERSION_CURRENT VE_TLS_ANDROID_CONFIG_VIEW_VERSION_2
+
 typedef ve_tls_result (*ve_tls_android_recover_fn)(ve_tls_producer * producer);
 typedef ve_tls_result (*ve_tls_android_close_fn)(ve_tls_producer * producer, int32_t timeout_ms);
 typedef ve_tls_result (*ve_tls_android_close_split_fn)(ve_tls_producer * producer, int32_t flusher_timeout_ms, int32_t sender_timeout_ms);
@@ -59,6 +63,11 @@ typedef struct {
     int32_t max_persistent_file_size;
     int32_t max_persistent_file_count;
     int32_t force_flush_disk;
+    int32_t destroy_wait_ms;
+    int32_t destroy_flusher_wait_ms;
+    int32_t destroy_sender_wait_ms;
+    int32_t destroy_wait_split_enabled;
+    const ve_tls_android_http_client_bridge * http_client;
     int32_t persistent_durability;
     int32_t persistent_max_bytes;
     int32_t persistent_max_records;
@@ -68,12 +77,10 @@ typedef struct {
     int32_t persistent_overflow_policy;
     int32_t persistent_sample_every_n;
     int32_t persistent_block_timeout_ms;
-    int32_t destroy_wait_ms;
-    int32_t destroy_flusher_wait_ms;
-    int32_t destroy_sender_wait_ms;
-    int32_t destroy_wait_split_enabled;
-    const ve_tls_android_http_client_bridge * http_client;
 } ve_tls_android_config_view;
+
+/* Size of the original Android binding view consumed by the legacy entry point. */
+#define VE_TLS_ANDROID_CONFIG_VIEW_V1_SIZE offsetof(ve_tls_android_config_view, persistent_durability)
 
 typedef struct {
     int32_t destroy_wait_ms;
@@ -90,6 +97,16 @@ typedef struct {
 VE_TLS_API ve_tls_result ve_tls_android_binding_build_config(
     const ve_tls_android_config_view * in,
     ve_tls_config * out,
+    ve_tls_android_runtime_options * runtime
+);
+
+VE_TLS_API ve_tls_result ve_tls_android_binding_build_config_versioned(
+    const ve_tls_android_config_view * in,
+    size_t in_size,
+    uint32_t in_version,
+    ve_tls_config * out,
+    size_t out_size,
+    uint32_t out_version,
     ve_tls_android_runtime_options * runtime
 );
 

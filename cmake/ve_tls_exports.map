@@ -17,6 +17,7 @@ VE_TLS_0.3 {
         ve_tls_retry_next_interval_ms;
         ve_tls_platform_init_default;
         ve_tls_config_init;
+        ve_tls_config_init_versioned;
         ve_tls_producer_create;
         ve_tls_producer_create_versioned;
         ve_tls_producer_update_endpoint;
@@ -53,6 +54,7 @@ VE_TLS_0.3 {
         ve_tls_producer_import_raw_buffer;
         ve_tls_producer_free_raw_buffer;
         ve_tls_android_binding_build_config;
+        ve_tls_android_binding_build_config_versioned;
         ve_tls_android_binding_build_persistent_path;
         ve_tls_android_binding_after_create;
         ve_tls_android_binding_before_destroy;

@@ -47,6 +47,12 @@ static void ve_tls_android_config_view_copy_runtime_fields(const ve_tls_android_
     out->max_persistent_file_size = in->max_persistent_file_size;
     out->max_persistent_file_count = in->max_persistent_file_count;
     out->force_flush_disk = in->force_flush_disk;
+}
+
+static void ve_tls_android_config_view_copy_persistent_v2_fields(const ve_tls_android_config_view * in, ve_tls_config * out) {
+    if (!in || !out) {
+        return;
+    }
     out->persistent_durability = (ve_tls_persistent_durability)in->persistent_durability;
     out->persistent_max_bytes = in->persistent_max_bytes;
     out->persistent_max_records = in->persistent_max_records;
@@ -161,15 +167,26 @@ void ve_tls_android_binding_before_destroy(
     destroy_fn(producer);
 }
 
-ve_tls_result ve_tls_android_binding_build_config(
+static ve_tls_result ve_tls_android_binding_build_config_impl(
     const ve_tls_android_config_view * in,
     ve_tls_config * out,
-    ve_tls_android_runtime_options * runtime
+    ve_tls_android_runtime_options * runtime,
+    size_t out_size,
+    uint32_t out_version,
+    int versioned_output,
+    int include_v2_fields
 ) {
     if (!out || !in) {
         return VE_TLS_INVALID;
     }
-    ve_tls_config_init(out);
+    if (versioned_output) {
+        if (ve_tls_config_init_versioned(
+                out, out_size, out_version) != VE_TLS_OK) {
+            return VE_TLS_INVALID;
+        }
+    } else {
+        ve_tls_config_init(out);
+    }
     out->use_persistent = in->use_persistent;
     out->send_thread_count = in->send_thread_count;
     if (in->use_persistent) {
@@ -203,6 +220,40 @@ ve_tls_result ve_tls_android_binding_build_config(
     }
     ve_tls_android_config_view_copy_strings(in, out);
     ve_tls_android_config_view_copy_runtime_fields(in, out);
+    if (include_v2_fields) {
+        ve_tls_android_config_view_copy_persistent_v2_fields(in, out);
+    }
     ve_tls_android_config_view_copy_http_client(in, out);
     return VE_TLS_OK;
+}
+
+ve_tls_result ve_tls_android_binding_build_config(
+    const ve_tls_android_config_view * in,
+    ve_tls_config * out,
+    ve_tls_android_runtime_options * runtime
+) {
+    return ve_tls_android_binding_build_config_impl(in, out, runtime, 0, 0, 0, 0);
+}
+
+ve_tls_result ve_tls_android_binding_build_config_versioned(
+    const ve_tls_android_config_view * in,
+    size_t in_size,
+    uint32_t in_version,
+    ve_tls_config * out,
+    size_t out_size,
+    uint32_t out_version,
+    ve_tls_android_runtime_options * runtime
+) {
+    int include_v2_fields;
+    if ((in_version == VE_TLS_ANDROID_CONFIG_VIEW_VERSION_1 &&
+         in_size == VE_TLS_ANDROID_CONFIG_VIEW_V1_SIZE)) {
+        include_v2_fields = 0;
+    } else if (in_version == VE_TLS_ANDROID_CONFIG_VIEW_VERSION_2 &&
+               in_size == sizeof(ve_tls_android_config_view)) {
+        include_v2_fields = 1;
+    } else {
+        return VE_TLS_INVALID;
+    }
+    return ve_tls_android_binding_build_config_impl(
+        in, out, runtime, out_size, out_version, 1, include_v2_fields);
 }

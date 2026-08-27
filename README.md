@@ -150,7 +150,7 @@ Persistent 的可靠性边界需要说清楚：
 - SDK 提供 at-least-once。崩溃、重试和 checkpoint 持久化边界可能产生少量重复；如果业务不能接受重复，需要用业务主键或消费侧去重。
 - at-least-once 只覆盖已经成功进入 persistent 的日志。如果 `add_log` 因参数错误、内存背压或 persistent quota 返回失败，这条日志不在恢复范围内。
 - `success callback` 表示请求进入成功路径，不等于 checkpoint 已经 durable 落盘。崩溃发生在两者之间时，recover 可能重放边界内日志。
-- persistent 默认使用 buffered WAL，在 segment rotation、显式 flush 和正常 close 时同步；`force_flush_disk=1` 兼容映射为每条 append 同步的 sync WAL。新接入优先显式配置 `persistent_durability`。
+- persistent 默认使用 buffered WAL，在 segment rotation、显式 flush 和正常 close 时同步；`force_flush_disk=1` 兼容映射为每条 append 同步的 sync WAL。新接入显式配置 `persistent_durability` 时，必须配对使用 `ve_tls_config_init_versioned` 与 `ve_tls_producer_create_versioned`。
 - lease 用于避免多个活跃 owner 同时写一个目录。`TAKEOVER_IF_STALE` 适合崩溃恢复，不适合多个活跃进程共享同一路径。
 - `DROP_OLDEST_UNACKED` 会牺牲完整性，只适合明确要保新丢旧的场景。
 

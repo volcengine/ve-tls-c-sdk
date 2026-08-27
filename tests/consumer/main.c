@@ -12,7 +12,10 @@ int main(void) {
     ve_tls_http_response response;
     ve_tls_producer *producer;
 
-    ve_tls_config_init(&config);
+    if (ve_tls_config_init_versioned(
+            &config, sizeof(config), VE_TLS_CONFIG_VERSION_CURRENT) != VE_TLS_OK) {
+        return 1;
+    }
     ve_tls_platform_init_default(&platform);
     ve_tls_retry_policy_init(&retry);
     ve_tls_http_response_init(&response);
