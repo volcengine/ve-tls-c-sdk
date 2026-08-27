@@ -16,8 +16,8 @@ if(NOT DEFINED VE_TLS_SYSTEM_NAME OR VE_TLS_SYSTEM_NAME STREQUAL "")
     set(VE_TLS_SYSTEM_NAME "${CMAKE_HOST_SYSTEM_NAME}")
 endif()
 
-if(VE_TLS_SYSTEM_NAME STREQUAL "Darwin")
-    # Darwin nm uses the compact -gU spelling for external defined symbols.
+if(VE_TLS_SYSTEM_NAME MATCHES "^(Darwin|iOS|tvOS|watchOS|visionOS)$")
+    # Apple nm uses the compact -gU spelling for external defined symbols.
     set(nm_arguments -gU)
 else()
     # Keep the GNU/LLVM spelling used by Linux and Android toolchains.
