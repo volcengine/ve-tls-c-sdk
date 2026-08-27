@@ -12,6 +12,25 @@ typedef struct {
     size_t size;
 } ve_tls_buf;
 
+static void ve_tls_http_curl_response_reset(ve_tls_http_response * resp) {
+    if (!resp) {
+        return;
+    }
+    free(resp->body);
+    free(resp->request_id);
+    free(resp->error_code);
+    free(resp->error_message);
+    resp->body = NULL;
+    resp->body_size = 0;
+    resp->request_id = NULL;
+    resp->error_code = NULL;
+    resp->error_message = NULL;
+    resp->status_code = 0;
+    resp->transport_kind = VE_TLS_TRANSPORT_NONE;
+    resp->transport_code = 0;
+    resp->transport_retryable = 0;
+}
+
 static int ve_tls_ascii_tolower(int c) {
     return (c >= 'A' && c <= 'Z') ? (c + ('a' - 'A')) : c;
 }
@@ -118,6 +137,22 @@ static const char * ve_tls_curl_error_code(CURLcode code) {
     }
 }
 
+#if defined(VE_TLS_CURL_TEST_HOOKS)
+static int g_test_fail_easy_get_once = 0;
+
+void ve_tls_http_curl_test_fail_easy_get_once(void) {
+    __atomic_store_n(&g_test_fail_easy_get_once, 1, __ATOMIC_RELEASE);
+}
+
+static int ve_tls_http_curl_test_should_fail_easy_get(void) {
+    return __atomic_exchange_n(&g_test_fail_easy_get_once, 0, __ATOMIC_ACQ_REL);
+}
+#else
+static int ve_tls_http_curl_test_should_fail_easy_get(void) {
+    return 0;
+}
+#endif
+
 #if !defined(_WIN32)
 static pthread_once_t g_easy_key_once = PTHREAD_ONCE_INIT;
 static pthread_key_t g_easy_key;
@@ -133,6 +168,9 @@ static void ve_tls_easy_key_init(void) {
 }
 
 static CURL * ve_tls_easy_get(void) {
+    if (ve_tls_http_curl_test_should_fail_easy_get()) {
+        return NULL;
+    }
     (void)pthread_once(&g_easy_key_once, ve_tls_easy_key_init);
     CURL * curl = (CURL *)pthread_getspecific(g_easy_key);
     if (!curl) {
@@ -146,6 +184,9 @@ static CURL * ve_tls_easy_get(void) {
 #else
 static _Thread_local CURL * g_tls_easy = NULL;
 static CURL * ve_tls_easy_get(void) {
+    if (ve_tls_http_curl_test_should_fail_easy_get()) {
+        return NULL;
+    }
     if (!g_tls_easy) {
         g_tls_easy = curl_easy_init();
     }
@@ -155,26 +196,11 @@ static CURL * ve_tls_easy_get(void) {
 
 static int ve_tls_http_curl_do(ve_tls_http_client * client, const ve_tls_http_request * req, ve_tls_http_response * resp) {
     (void)client;
+    /* Reset a reused response before any operation that can fail. */
+    ve_tls_http_curl_response_reset(resp);
     CURL * curl = ve_tls_easy_get();
     if (!curl) {
         return -1;
-    }
-    /* 入口统一清理上一次复用 resp 时残留的动态字段，避免成功/失败路径覆盖指针时泄漏旧的 strdup 内存。
-     * 调用方仍可在终止使用时显式调用 free_response 释放本次结果；free(NULL) 安全。 */
-    if (resp) {
-        free(resp->body);
-        free(resp->request_id);
-        free(resp->error_code);
-        free(resp->error_message);
-        resp->body = NULL;
-        resp->body_size = 0;
-        resp->request_id = NULL;
-        resp->error_code = NULL;
-        resp->error_message = NULL;
-        resp->status_code = 0;
-        resp->transport_kind = VE_TLS_TRANSPORT_NONE;
-        resp->transport_code = 0;
-        resp->transport_retryable = 0;
     }
     curl_easy_reset(curl);
     ve_tls_buf body = {0};
@@ -311,22 +337,7 @@ static int ve_tls_http_curl_do(ve_tls_http_client * client, const ve_tls_http_re
 
 static void ve_tls_http_curl_free(ve_tls_http_client * client, ve_tls_http_response * resp) {
     (void)client;
-    if (!resp) {
-        return;
-    }
-    free(resp->body);
-    free(resp->request_id);
-    free(resp->error_code);
-    free(resp->error_message);
-    resp->body = NULL;
-    resp->request_id = NULL;
-    resp->error_message = NULL;
-    resp->body_size = 0;
-    resp->error_code = NULL;
-    resp->status_code = 0;
-    resp->transport_kind = VE_TLS_TRANSPORT_NONE;
-    resp->transport_code = 0;
-    resp->transport_retryable = 0;
+    ve_tls_http_curl_response_reset(resp);
 }
 
 

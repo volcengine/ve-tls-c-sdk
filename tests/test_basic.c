@@ -8,6 +8,7 @@
 #include "ve_tls_error.h"
 #include "ve_tls_http.h"
 #include "ve_tls_version.h"
+#include "ve_tls_http_curl.h"
 #include "producer/ve_tls_persistent_format.h"
 #include "producer/ve_tls_segment_store.h"
 #include "producer/ve_tls_checkpoint.h"
@@ -2067,6 +2068,71 @@ static int test_sender_transport_curl_retryable_flag(void) {
     ve_tls_producer_destroy(p);
     return (__atomic_load_n(&g_sender_seen_transport_curl, __ATOMIC_ACQUIRE) &&
             __atomic_load_n(&g_sender_seen_retryable, __ATOMIC_ACQUIRE)) ? 0 : -1;
+}
+
+#if defined(VE_TLS_HAVE_CURL)
+static int seed_stale_curl_response(ve_tls_http_response * response) {
+    response->body = (unsigned char *)strdup("stale-body");
+    response->body_size = strlen("stale-body");
+    response->request_id = strdup("stale-request-id");
+    response->error_code = strdup("stale-error-code");
+    response->error_message = strdup("stale-error-message");
+    response->status_code = 599;
+    response->transport_kind = VE_TLS_TRANSPORT_GENERIC;
+    response->transport_code = 123;
+    response->transport_retryable = 1;
+    return response->body && response->request_id && response->error_code && response->error_message ? 0 : -1;
+}
+
+#if defined(VE_TLS_CURL_TEST_HOOKS)
+extern void ve_tls_http_curl_test_fail_easy_get_once(void);
+#endif
+#endif
+
+static int test_curl_response_reuse_resets_dynamic_fields(void) {
+#if defined(VE_TLS_HAVE_CURL)
+    ve_tls_http_client client;
+    ve_tls_http_request request;
+    ve_tls_http_response response;
+    memset(&client, 0, sizeof(client));
+    memset(&request, 0, sizeof(request));
+    memset(&response, 0, sizeof(response));
+    ve_tls_http_client_init_curl(&client);
+    if (!client.do_request || !client.free_response) {
+        return -1;
+    }
+    if (seed_stale_curl_response(&response) != 0) {
+        client.free_response(&client, &response);
+        return -1;
+    }
+    request.method = "GET";
+    request.url = "://invalid";
+    request.headers = "";
+#if defined(VE_TLS_CURL_TEST_HOOKS)
+    ve_tls_http_curl_test_fail_easy_get_once();
+    if (client.do_request(&client, &request, &response) != -1 ||
+        response.body != NULL || response.body_size != 0 || response.request_id != NULL ||
+        response.error_code != NULL || response.error_message != NULL || response.status_code != 0 ||
+        response.transport_kind != VE_TLS_TRANSPORT_NONE || response.transport_code != 0 ||
+        response.transport_retryable != 0 || seed_stale_curl_response(&response) != 0) {
+        client.free_response(&client, &response);
+        return -1;
+    }
+#endif
+    if (client.do_request(&client, &request, &response) != -1 ||
+        response.body != NULL || response.body_size != 0 || response.request_id != NULL ||
+        response.status_code != 0 || response.transport_kind != VE_TLS_TRANSPORT_CURL ||
+        response.transport_code == 0 || response.transport_retryable != 0 ||
+        !response.error_code || !response.error_message) {
+        client.free_response(&client, &response);
+        return -1;
+    }
+    client.free_response(&client, &response);
+    return response.body == NULL && response.request_id == NULL &&
+        response.error_code == NULL && response.error_message == NULL ? 0 : -1;
+#else
+    return 0;
+#endif
 }
 
 static int test_producer_update_endpoint_affects_url(void) {
@@ -14783,6 +14849,7 @@ int main(void) {
     RUN(78, test_sender_credentials_min_interval_fail_without_cached());
     RUN(79, test_sender_default_hash_key_header_set());
     RUN(80, test_sender_transport_curl_retryable_flag());
+    RUN(304, test_curl_response_reuse_resets_dynamic_fields());
     RUN(81, test_producer_update_endpoint_affects_url());
     RUN(167, test_producer_topic_id_percent_encoded_in_url());
     RUN(82, test_producer_update_static_credentials_affects_auth_header());
