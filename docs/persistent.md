@@ -28,7 +28,19 @@ Persistent 目录包含这些文件：
 
 每个 Producer 或进程建议使用独立目录。多个活跃进程写同一个目录会破坏语义，`lease` 只能降低误用概率，不能把它变成多写者队列。
 
-`manifest` 当前格式版本为 V2。V1 会在打开时兼容升级；未知版本或损坏内容会使打开失败，SDK 不会先覆盖原文件。WAL record V2 在扩展字段中保存 `enqueue_time_ms`，没有该字段的旧记录按 V1 读取且时间为 `0`。该时间目前只用于保留格式能力，不会自动触发过期删除。
+`manifest` 当前格式版本为 V2。V1 会在打开时兼容升级；未知版本或损坏内容会使打开失败，SDK 不会先覆盖原文件。WAL record V2 在扩展字段中保存 `enqueue_time_ms`，没有该字段的旧记录按 V1 读取且时间为 `0`。只有显式配置 max-age 后，该时间才会在 recover 时参与超龄判断；时间为 `0` 或无法判断年龄的旧记录不会被误删。
+
+## Recover max-age
+
+Core 默认 `persistent_max_log_delay_ms=0`，即关闭 max-age，保持已有调用方行为。
+启用后只在 `ve_tls_producer_recover()` 读取 WAL 时处理超龄记录：
+
+- `VE_TLS_PEXPIRED_REWRITE`：把可解析日志的时间字段重写为本次 recover 时间后继续发送；原 WAL record 不就地改写。无法解析的 raw payload 保留原样发送，不会因重写失败被误删。
+- `VE_TLS_PEXPIRED_DROP`：把该记录作为显式终态 drop，记录指标并推进连续 checkpoint。
+- `enqueue_time_ms <= 0`、本地时钟回退或年龄无法判断：按未过期处理。
+
+语言 wrapper 可以定义自己的公开默认。例如 iOS 第一阶段可显式使用“7 天 + rewrite”；
+这不改变 C Core 默认，也不要求 manifest 或 WAL 升级到 V3。
 
 ## 落盘模式
 
@@ -51,8 +63,9 @@ active segment、未 durable ACK segment 和 replay cursor 对应 segment 不会
 
 - SDK 提供 at-least-once。崩溃、重试和 checkpoint 持久化边界可能带来少量重复。
 - `success callback` 表示请求已经进入发送成功路径，不表示 checkpoint 已经 durable 落盘。
-- 只有服务端请求成功才推进 checkpoint。重试预算耗尽、不可重试响应、凭证刷新失败和内部 queue/budget 暂时失败都不会隐式 ACK 已 append 的记录。
-- 发送失败 callback 描述的是本轮发送结果，不代表 persistent 记录已经永久丢弃。当前没有“发送失败后显式永久丢弃”的公共策略。
+- 服务端请求成功会推进 checkpoint。重试预算耗尽、普通不可重试响应和内部 queue/budget 暂时失败不会隐式 ACK 已 append 的记录。
+- `401/403` 与凭证刷新失败属于 authentication failure。默认 `VE_TLS_PAUTH_RETAIN` 保留 WAL；用户显式选择 `VE_TLS_PAUTH_DROP` 时，才作为终态 drop 推进 checkpoint。发送失败 callback 仍描述本轮失败。
+- recover 发现超龄记录且配置 `VE_TLS_PEXPIRED_DROP` 时，也会作为显式终态 drop 推进 checkpoint。除这些明确策略外，发送失败不代表 persistent 记录永久丢弃。
 - 本轮发送结束后，未 ACK 记录保留在 WAL 中；当前实现不会自动开启下一轮长期重试，需要进程重启或再次调用 `ve_tls_producer_recover()` 才会重新入队。
 - `add_log` 在 persistent append 之前失败时不在恢复范围内；如果 append 已成功、后续内存入队失败，接口可能返回失败但记录仍会被 recover，调用方需要用 log id 或业务主键处理潜在重复。
 - sync WAL 中，record `write` 成功但 `fsync` 失败时，`add_log` 返回 `VE_TLS_PERSISTENT_ERROR`，已写 record 仍保留并可在后续 flush/recover 中出现。调用方重试可能形成重复。

@@ -419,6 +419,151 @@ int ve_tls_log_builder_add_kv_lens(ve_tls_log_group_builder * b, int64_t id, int
     return 0;
 }
 
+static int ve_tls_wire_read_varint(
+    const unsigned char * data,
+    size_t size,
+    size_t * offset,
+    uint64_t * out
+) {
+    uint64_t value = 0;
+    unsigned int shift = 0;
+    if (!data || !offset || !out) {
+        return -1;
+    }
+    for (unsigned int i = 0; i < 10 && *offset < size; i++) {
+        unsigned char byte = data[(*offset)++];
+        if (shift == 63 && (byte & 0xFEu) != 0) {
+            return -1;
+        }
+        value |= (uint64_t)(byte & 0x7Fu) << shift;
+        if ((byte & 0x80u) == 0) {
+            *out = value;
+            return 0;
+        }
+        shift += 7;
+    }
+    return -1;
+}
+
+int ve_tls_log_payload_rewrite_time(
+    const unsigned char * payload,
+    size_t payload_size,
+    int64_t time_ms,
+    unsigned char ** out_payload,
+    size_t * out_size
+) {
+    size_t outer_key_end = 0;
+    size_t outer_message_start;
+    size_t outer_message_end;
+    size_t cursor = 0;
+    size_t time_value_start = 0;
+    size_t time_value_end = 0;
+    uint64_t key = 0;
+    uint64_t outer_size_u64 = 0;
+    size_t new_time_size;
+    size_t new_message_size;
+    size_t new_outer_size_size;
+    size_t trailing_size;
+    size_t total_size;
+    unsigned char * result;
+    unsigned char * dst;
+    if (!payload || payload_size == 0 || time_ms <= 0 || !out_payload || !out_size) {
+        return -2;
+    }
+    *out_payload = NULL;
+    *out_size = 0;
+
+    if (ve_tls_wire_read_varint(payload, payload_size, &cursor, &key) != 0 ||
+        key != ((1u << 3) | 2u)) {
+        return -2;
+    }
+    outer_key_end = cursor;
+    if (ve_tls_wire_read_varint(payload, payload_size, &cursor, &outer_size_u64) != 0 ||
+        outer_size_u64 > SIZE_MAX) {
+        return -2;
+    }
+    outer_message_start = cursor;
+    if ((size_t)outer_size_u64 > payload_size - outer_message_start) {
+        return -2;
+    }
+    outer_message_end = outer_message_start + (size_t)outer_size_u64;
+
+    while (cursor < outer_message_end) {
+        uint64_t field_key = 0;
+        uint32_t field_number;
+        uint32_t wire_type;
+        if (ve_tls_wire_read_varint(payload, outer_message_end, &cursor, &field_key) != 0) {
+            return -2;
+        }
+        field_number = (uint32_t)(field_key >> 3);
+        wire_type = (uint32_t)(field_key & 7u);
+        if (field_number == 1 && wire_type == 0) {
+            uint64_t ignored = 0;
+            time_value_start = cursor;
+            if (ve_tls_wire_read_varint(payload, outer_message_end, &cursor, &ignored) != 0) {
+                return -2;
+            }
+            time_value_end = cursor;
+            break;
+        }
+        if (wire_type == 0) {
+            uint64_t ignored = 0;
+            if (ve_tls_wire_read_varint(payload, outer_message_end, &cursor, &ignored) != 0) return -2;
+        } else if (wire_type == 1) {
+            if (outer_message_end - cursor < 8) return -2;
+            cursor += 8;
+        } else if (wire_type == 2) {
+            uint64_t field_size = 0;
+            if (ve_tls_wire_read_varint(payload, outer_message_end, &cursor, &field_size) != 0 ||
+                field_size > SIZE_MAX || (size_t)field_size > outer_message_end - cursor) return -2;
+            cursor += (size_t)field_size;
+        } else if (wire_type == 5) {
+            if (outer_message_end - cursor < 4) return -2;
+            cursor += 4;
+        } else {
+            return -2;
+        }
+    }
+    if (time_value_end <= time_value_start) {
+        return -2;
+    }
+
+    new_time_size = ve_tls_varint_u64_size((uint64_t)time_ms);
+    new_message_size = (size_t)outer_size_u64 - (time_value_end - time_value_start);
+    new_message_size = ve_tls_size_add_safe(new_message_size, new_time_size);
+    if (new_message_size == SIZE_MAX) {
+        return -2;
+    }
+    new_outer_size_size = ve_tls_varint_u64_size((uint64_t)new_message_size);
+    trailing_size = payload_size - outer_message_end;
+    total_size = ve_tls_size_add_safe(outer_key_end, new_outer_size_size);
+    total_size = ve_tls_size_add_safe(total_size, new_message_size);
+    total_size = ve_tls_size_add_safe(total_size, trailing_size);
+    if (total_size == SIZE_MAX) {
+        return -2;
+    }
+    result = (unsigned char *)ve_tls_malloc(total_size);
+    if (!result) {
+        return -1;
+    }
+    dst = result;
+    memcpy(dst, payload, outer_key_end);
+    dst += outer_key_end;
+    dst = ve_tls_varint_u64_pack((uint64_t)new_message_size, dst);
+    memcpy(dst, payload + outer_message_start, time_value_start - outer_message_start);
+    dst += time_value_start - outer_message_start;
+    dst = ve_tls_varint_u64_pack((uint64_t)time_ms, dst);
+    memcpy(dst, payload + time_value_end, outer_message_end - time_value_end);
+    dst += outer_message_end - time_value_end;
+    if (trailing_size > 0) {
+        memcpy(dst, payload + outer_message_end, trailing_size);
+        dst += trailing_size;
+    }
+    *out_payload = result;
+    *out_size = (size_t)(dst - result);
+    return 0;
+}
+
 int ve_tls_producer_build_group_suffix(ve_tls_producer * producer) {
     if (!producer) {
         return -1;

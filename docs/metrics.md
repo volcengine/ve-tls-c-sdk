@@ -44,6 +44,10 @@ Persistent 模式下，指标要和本地目录状态一起看：
 - `persistent_flush_failed(0, 0)`：flush 的非 sync、非 checkpoint 阶段失败。
 - `persistent_overflow_drop_oldest_unacked(records, wal_bytes)`：overflow policy 显式删除了旧未 ACK closed segment；两个值是本次损失的记录数和 WAL 字节数，同时累加 dropped totals。
 - `persistent_backlog_retarget(records, wal_bytes)`：更新 endpoint、region 或 topic 时本地仍有 persistent backlog；这些记录会使用更新后的 current target。该事件只告警，不阻止更新。
+- `persistent_auth_failure_drop(start_id, end_id)`：用户显式配置认证失败 drop 后，对应范围作为终态推进 checkpoint，并累计 dropped totals。
+- `persistent_expired_rewrite(log_id, enqueue_time_ms)`：recover 时发现超龄记录并成功重写日志时间。
+- `persistent_expired_rewrite_skipped(log_id, enqueue_time_ms)`：超龄 raw payload 无法安全解析，SDK 保留原 payload 继续发送，不执行隐式 drop。
+- `persistent_expired_drop(log_id, enqueue_time_ms)`：用户显式配置 max-age drop 后，该记录作为终态推进 checkpoint，并累计 dropped totals。
 - `log_dropped_persistent_overflow(1, bytes)`：`REJECT_NEW` 或 sample 策略拒绝当前新日志。
 - `log_dropped_persistent_overflow_timeout(1, bytes)`：`BLOCK` 或 sample 策略等待当前新日志超时。
 
