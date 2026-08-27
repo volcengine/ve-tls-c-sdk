@@ -34,6 +34,8 @@
 */
 #pragma once
 
+#include "lz4_namespace.h"
+
 #if defined (__cplusplus)
 extern "C" {
 #endif

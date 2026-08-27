@@ -11,7 +11,8 @@
 #include "ve_tls_platform.h"
 
 #define VE_TLS_CONFIG_VERSION_1 1u
-#define VE_TLS_CONFIG_VERSION_CURRENT VE_TLS_CONFIG_VERSION_1
+#define VE_TLS_CONFIG_VERSION_2 2u
+#define VE_TLS_CONFIG_VERSION_CURRENT VE_TLS_CONFIG_VERSION_2
 
 VE_TLS_BEGIN_DECLS
 
@@ -55,6 +56,20 @@ typedef enum {
     VE_TLS_PDURABILITY_BUFFERED_WAL = 1,
     VE_TLS_PDURABILITY_SYNC_WAL = 2
 } ve_tls_persistent_durability;
+
+typedef enum {
+    /* Preserve authentication failures in WAL for a later recovery attempt. */
+    VE_TLS_PAUTH_RETAIN = 0,
+    /* Explicitly treat authentication failures as terminal persistent drops. */
+    VE_TLS_PAUTH_DROP = 1
+} ve_tls_persistent_auth_failure_policy;
+
+typedef enum {
+    /* Rewrite an expired recovered log timestamp to the recovery time. */
+    VE_TLS_PEXPIRED_REWRITE = 0,
+    /* Explicitly drop an expired recovered log and advance its checkpoint. */
+    VE_TLS_PEXPIRED_DROP = 1
+} ve_tls_persistent_expired_log_policy;
 
 typedef struct {
     const char * key;
@@ -160,10 +175,16 @@ typedef struct {
     ve_tls_platform platform;
     ve_tls_http_client http_client;
     ve_tls_persistent_durability persistent_durability;
+    /* Version 2 tail. Zero disables persistent max-age; negative is invalid. */
+    int64_t persistent_max_log_delay_ms;
+    ve_tls_persistent_expired_log_policy persistent_expired_log_policy;
+    ve_tls_persistent_auth_failure_policy persistent_auth_failure_policy;
 } ve_tls_config;
 
 /* Size of the pre-versioned layout consumed by the legacy init/create APIs. */
 #define VE_TLS_CONFIG_LEGACY_SIZE offsetof(ve_tls_config, persistent_durability)
+/* Exact layout size used by version 1 callers. */
+#define VE_TLS_CONFIG_VERSION_1_SIZE offsetof(ve_tls_config, persistent_max_log_delay_ms)
 
 typedef void (*ve_tls_send_done_fn)(
     ve_tls_result result,
@@ -216,11 +237,13 @@ VE_TLS_API ve_tls_producer * ve_tls_producer_create_versioned(
 );
 /*
  * Updates the active send target for subsequent requests. Requests that have already
- * entered the send path may still use the previously captured endpoint/region/topic,
- * but new requests are expected to converge quickly to the refreshed target. Persistent
- * backlog is not bound to its original target and will also use the refreshed target.
+ * entered the send path may still use the previously captured endpoint/region/topic.
+ * The update is transactional: failure leaves config, version, and runtime snapshot
+ * unchanged; senders observe either the complete old snapshot or the complete new one.
+ * Persistent backlog is not bound to its original target and uses the refreshed target.
  */
 VE_TLS_API ve_tls_result ve_tls_producer_update_endpoint(ve_tls_producer * producer, const char * endpoint, const char * region, const char * topic_id);
+/* Transactional with the same rollback and old-or-new snapshot guarantee. */
 VE_TLS_API ve_tls_result ve_tls_producer_update_static_credentials(ve_tls_producer * producer, const char * access_key_id, const char * access_key_secret, const char * security_token);
 VE_TLS_API ve_tls_result ve_tls_producer_close(ve_tls_producer * producer, int32_t timeout_ms);
 VE_TLS_API ve_tls_result ve_tls_producer_close_split(ve_tls_producer * producer, int32_t flusher_timeout_ms, int32_t sender_timeout_ms);

@@ -138,6 +138,9 @@ void ve_tls_producer_config_init(ve_tls_config * config) {
     config->persistent_heartbeat_interval_ms = 10000;
     config->persistent_open_mode = VE_TLS_POPEN_TAKEOVER_IF_STALE;
     config->persistent_durability = VE_TLS_PDURABILITY_DEFAULT;
+    config->persistent_max_log_delay_ms = 0;
+    config->persistent_expired_log_policy = VE_TLS_PEXPIRED_REWRITE;
+    config->persistent_auth_failure_policy = VE_TLS_PAUTH_RETAIN;
     ve_tls_retry_policy_init(&config->retry_policy);
     ve_tls_platform_init_default(&config->platform);
 #if defined(VE_TLS_HAVE_CURL)

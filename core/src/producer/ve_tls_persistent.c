@@ -1143,7 +1143,18 @@ int ve_tls_persistent_append(ve_tls_persistent * persistent, int64_t log_id, con
     return rc;
 }
 
-int ve_tls_persistent_recover(ve_tls_persistent * persistent, int (*on_record)(int64_t log_id, const char * hash_key, const unsigned char * payload, size_t payload_size, void * user), void * user) {
+int ve_tls_persistent_recover(
+    ve_tls_persistent * persistent,
+    int (*on_record)(
+        int64_t log_id,
+        int64_t enqueue_time_ms,
+        const char * hash_key,
+        const unsigned char * payload,
+        size_t payload_size,
+        void * user
+    ),
+    void * user
+) {
     uint32_t last_segment;
     if (!persistent || !persistent->platform || !on_record) {
         return -1;
@@ -1211,7 +1222,13 @@ int ve_tls_persistent_recover(ve_tls_persistent * persistent, int (*on_record)(i
             ve_tls_segment_store_read_free(record_buf);
             record_buf = NULL;
             if (record.log_id > persistent->checkpoint.acked_log_id) {
-                if (on_record(record.log_id, record.hash_key, record.payload, record.payload_size, user) != 0) {
+                if (on_record(
+                        record.log_id,
+                        record.enqueue_time_ms,
+                        record.hash_key,
+                        record.payload,
+                        record.payload_size,
+                        user) != 0) {
                     ve_tls_persistent_record_free(&record);
                     ve_tls_segment_store_reader_close(&persistent->store, &reader);
                     return -1;

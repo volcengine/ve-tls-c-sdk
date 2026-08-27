@@ -27,6 +27,12 @@ transitive type dependencies. Source-tree headers for protocol, signing,
 hashing, compression, and the legacy adapter are internal implementation
 interfaces; they are neither installed nor supported as shared-library ABI.
 
+The bundled static LZ4 copy is compiled with the private `VE_TLS_LZ4_*`
+namespace. The build-time symbol check rejects any defined bare `LZ4_*`
+symbol, and a consumer link test verifies coexistence with host-provided bare
+LZ4 symbols. The private prefixed symbols are implementation details and are
+not added to `abi/approved-symbols.txt`.
+
 The 0.3.0 shared release gate supports Mach-O and ELF targets, including
 Android ELF. Windows is not a supported build target for this POSIX/mobile
 core release. The Windows branch of `VE_TLS_API` preserves header portability
@@ -42,11 +48,13 @@ callback ABI compatible; the size/version contract and the target-platform
 layout must also match.
 
 `ve_tls_config_init` and `ve_tls_producer_create` retain the pre-versioned
-layout through `VE_TLS_CONFIG_LEGACY_SIZE`; they do not consume the trailing
-`persistent_durability` field. Consumers that use that field must pair
-`ve_tls_config_init_versioned` with `ve_tls_producer_create_versioned` and pass
-`sizeof(ve_tls_config)` plus `VE_TLS_CONFIG_VERSION_CURRENT`. Size or version
-mismatches fail without reading the versioned tail.
+layout through `VE_TLS_CONFIG_LEGACY_SIZE`; they do not consume any versioned
+tail. Version 1 ends after `persistent_durability` and uses the exact
+`VE_TLS_CONFIG_VERSION_1_SIZE`. Version 2 appends persistent max-age and
+authentication-failure policy fields and uses `sizeof(ve_tls_config)`.
+Consumers must pair `ve_tls_config_init_versioned` with
+`ve_tls_producer_create_versioned` and pass the exact size for the selected
+version. Size or version mismatches fail without reading beyond that layout.
 
 The same rule applies to the Android bridge. The legacy
 `ve_tls_android_binding_build_config` consumes only
@@ -62,17 +70,17 @@ The following are release baselines, not cross-platform promises. Each entry is
 `sizeof / alignment` in bytes and was obtained from clang record-layout dumps
 or the corresponding baseline snapshot.
 
-| Target | `ve_tls_config` | `ve_tls_platform` | `ve_tls_android_config_view` |
-| --- | ---: | ---: | ---: |
-| macOS arm64, clang | 744 / 8 | 208 / 8 | 240 / 8 |
-| Android NDK r21.4, armeabi-v7a API19 | 512 / 8 | 104 / 4 | 180 / 4 |
-| Android NDK r21.4, arm64-v8a API21 | 744 / 8 | 208 / 8 | 240 / 8 |
-| Android NDK r21.4, x86 API19 | 504 / 4 | 104 / 4 | 180 / 4 |
-| Android NDK r21.4, x86_64 API21 | 744 / 8 | 208 / 8 | 240 / 8 |
+| Target | config V1 prefix | config V2 | `ve_tls_platform` | `ve_tls_android_config_view` |
+| --- | ---: | ---: | ---: | ---: |
+| macOS arm64, clang | 744 / 8 | 760 / 8 | 208 / 8 | 240 / 8 |
+| Android NDK r21.4, armeabi-v7a API19 | 512 / 8 | 528 / 8 | 104 / 4 | 180 / 4 |
+| Android NDK r21.4, arm64-v8a API21 | 744 / 8 | 760 / 8 | 208 / 8 | 240 / 8 |
+| Android NDK r21.4, x86 API19 | 504 / 4 | 520 / 4 | 104 / 4 | 180 / 4 |
+| Android NDK r21.4, x86_64 API21 | 744 / 8 | 760 / 8 | 208 / 8 | 240 / 8 |
 
-In particular, the two 32-bit Android rows are not interchangeable:
-`armeabi-v7a` has `ve_tls_config` size 512 with alignment 8, while x86 has
-size 504 with alignment 4. Do not hard-code any row as a universal value.
+In particular, the two 32-bit Android rows are not interchangeable. For V2,
+`armeabi-v7a` has size 528 with alignment 8, while x86 has size 520 with
+alignment 4. Do not hard-code any row as a universal value.
 
 The ABI acceptance rule is `sizeof`/alignment plus the API version contract and
 a fresh record-layout dump for every supported platform and compiler

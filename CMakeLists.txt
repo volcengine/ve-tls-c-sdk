@@ -277,6 +277,18 @@ if(VE_TLS_BUILD_TESTS)
             target_compile_definitions(ve_tls_test_basic PRIVATE VE_TLS_CURL_TEST_HOOKS=1)
         endif()
         add_test(NAME ve_tls_test_basic COMMAND ve_tls_test_basic)
+
+        if(VE_TLS_ENABLE_LZ4)
+            add_executable(ve_tls_test_lz4_host_consumer tests/test_lz4_host_consumer.c)
+            target_link_libraries(ve_tls_test_lz4_host_consumer PRIVATE ve_tls_core)
+            add_test(NAME ve_tls_lz4_host_consumer COMMAND ve_tls_test_lz4_host_consumer)
+            add_test(NAME ve_tls_lz4_symbols
+                COMMAND ${CMAKE_COMMAND}
+                    "-DVE_TLS_LIBRARY=$<TARGET_FILE:ve_tls_core>"
+                    "-DVE_TLS_NM=${CMAKE_NM}"
+                    -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_lz4_symbols.cmake
+            )
+        endif()
     endif()
 
     add_executable(ve_tls_test_android_binding tests/test_android_binding.c)
@@ -391,6 +403,7 @@ if(VE_TLS_ENABLE_ASAN OR VE_TLS_ENABLE_UBSAN)
     foreach(tgt IN ITEMS
         ve_tls_core
         ve_tls_test_basic
+        ve_tls_test_lz4_host_consumer
         ve_tls_test_android_binding
         ve_tls_test_cpp_headers
         ve_tls_demo

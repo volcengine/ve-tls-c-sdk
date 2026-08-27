@@ -160,6 +160,7 @@ struct ve_tls_producer {
     int closing;
     int32_t worker_flushing_count;
     int32_t active_persistent_appends;
+    int32_t runtime_updates_inflight;
     ve_tls_completed_ack_range * persistent_ack_head;
     _Alignas(8) int64_t next_id;
     ve_tls_log_item * queue;
@@ -289,6 +290,13 @@ ve_tls_log_group_builder * ve_tls_log_builder_create(const char * norm_key);
 void ve_tls_log_builder_free(ve_tls_log_group_builder * b);
 size_t ve_tls_log_builder_estimate_kv_lens_size(int64_t time_ms, uint32_t time_ns, int32_t has_time_ns, const size_t * key_lens, const size_t * val_lens, size_t kv_count);
 int ve_tls_log_builder_add_kv_lens(ve_tls_log_group_builder * b, int64_t id, int64_t time_ms, uint32_t time_ns, int32_t has_time_ns, const ve_tls_kv * kvs, const size_t * key_lens, const size_t * val_lens, size_t kv_count);
+int ve_tls_log_payload_rewrite_time(
+    const unsigned char * payload,
+    size_t payload_size,
+    int64_t time_ms,
+    unsigned char ** out_payload,
+    size_t * out_size
+);
 int ve_tls_log_builder_append(ve_tls_log_group_builder * b, const unsigned char * logs, size_t logs_len, int32_t log_count, int64_t earliest, int64_t latest, int64_t start_id, int64_t end_id, int64_t last_time_ms, uint32_t last_time_ns, int32_t last_has_time_ns);
 void ve_tls_log_builder_shrink_if_needed(ve_tls_log_group_builder * b, size_t shrink_threshold, size_t shrink_to);
 int ve_tls_producer_build_group_suffix(ve_tls_producer * producer);

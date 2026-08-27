@@ -97,6 +97,10 @@
 | `retry_max_attempts` | 批次重试次数上限。 |
 | `retry_policy` | 单请求退避、总耗时和尝试次数策略。 |
 
+HTTP `429`、`500`、`502`、`503`、`504` 属于可重试状态。`401/403` 会分类为
+authentication failure；Persistent 模式下是否保留由
+`persistent_auth_failure_policy` 决定。
+
 ## Persistent
 
 | 字段 | 默认值 | 说明 |
@@ -119,8 +123,14 @@
 | `persistent_open_mode` | `VE_TLS_POPEN_TAKEOVER_IF_STALE` | `FAIL_IF_OWNED` 会在目录被占用时失败；`TAKEOVER_IF_STALE` 允许 stale 后接管。 |
 | `persistent_durability` | `VE_TLS_PDURABILITY_DEFAULT` | 默认解析为 `BUFFERED_WAL`；也可显式选择 `BUFFERED_WAL` 或 `SYNC_WAL`。 |
 | `force_flush_disk` | `0` | 兼容字段。durability 为 `DEFAULT` 且该值非零时映射为 `SYNC_WAL`；与显式 `BUFFERED_WAL` 同时设置会拒绝创建。 |
+| `persistent_max_log_delay_ms` | `0` | recover 时的最大记录年龄；`0` 表示关闭，负值是非法配置。只有 WAL 中 `enqueue_time_ms > 0` 的记录才参与判断。 |
+| `persistent_expired_log_policy` | `VE_TLS_PEXPIRED_REWRITE` | 超龄记录重写为当前恢复时间后发送，或显式 `DROP` 并推进 checkpoint。字段只在 max delay 开启时生效。 |
+| `persistent_auth_failure_policy` | `VE_TLS_PAUTH_RETAIN` | `401/403` 或凭证刷新失败达到本轮终态时保留 WAL；只有显式 `DROP` 才推进对应 checkpoint。 |
 
-`persistent_durability` 位于 versioned config 尾部。设置该字段时必须使用
-`ve_tls_config_init_versioned` 和 `ve_tls_producer_create_versioned`；旧的
-init/create 入口只消费 `VE_TLS_CONFIG_LEGACY_SIZE`，继续通过
-`force_flush_disk` 保留原有 sync-WAL 映射。
+`persistent_durability` 属于 version 1 尾部；三个 max-age/auth 字段属于 version 2
+尾部。使用这些字段时必须配对调用 `ve_tls_config_init_versioned` 和
+`ve_tls_producer_create_versioned`，并传对应版本的精确 size。旧 init/create 只消费
+`VE_TLS_CONFIG_LEGACY_SIZE`，继续通过 `force_flush_disk` 保留原有 sync-WAL 映射。
+
+Core 默认不启用 max-age。需要与 SLS iOS 行为对齐的语言层可以显式配置 7 天并选择
+`VE_TLS_PEXPIRED_REWRITE`，但该语言层默认不应反向改变 C Core 和其他 SDK 的兼容默认。

@@ -49,6 +49,13 @@ static int g_cred_req = 0;
 static int g_cred_provider_calls = 0;
 static char g_cred_seen_1[64];
 static char g_cred_seen_2[64];
+static const unsigned char * g_rewrite_expected_payload = NULL;
+static size_t g_rewrite_expected_payload_size = 0;
+static int g_rewrite_http_calls = 0;
+static int g_rewrite_payload_matched = 0;
+static const unsigned char * g_secure_headers_buffer = NULL;
+static size_t g_secure_headers_size = 0;
+static int g_secure_headers_had_token = 0;
 
 typedef struct {
     ve_tls_platform * platform;
@@ -89,6 +96,116 @@ static void * alloc_fail_realloc(void * p, size_t n, void * user_data) {
 static void alloc_fail_free(void * p, void * user_data) {
     (void)user_data;
     free(p);
+}
+
+typedef struct {
+    void * ptr;
+    size_t size;
+    int active;
+    int freed;
+} secure_free_record;
+
+typedef struct {
+    secure_free_record records[256];
+    int count;
+    int bad;
+    const char * fail_value;
+    int fail_match_after;
+    int fail_matches;
+} secure_free_state;
+
+static void * secure_test_malloc(size_t size, void * user_data) {
+    (void)user_data;
+    return malloc(size);
+}
+
+static void * secure_test_calloc(size_t count, size_t size, void * user_data) {
+    (void)user_data;
+    return calloc(count, size);
+}
+
+static void * secure_test_realloc(void * ptr, size_t size, void * user_data) {
+    (void)user_data;
+    return realloc(ptr, size);
+}
+
+static char * secure_test_strdup(const char * value, void * user_data) {
+    secure_free_state * state = (secure_free_state *)user_data;
+    if (!value) return NULL;
+    if (state && state->fail_value && strcmp(value, state->fail_value) == 0) {
+        int match = __atomic_add_fetch(&state->fail_matches, 1, __ATOMIC_ACQ_REL);
+        if (match == __atomic_load_n(&state->fail_match_after, __ATOMIC_ACQUIRE)) {
+            return NULL;
+        }
+    }
+    size_t size = strlen(value);
+    char * copy = (char *)malloc(size + 1);
+    if (!copy) return NULL;
+    memcpy(copy, value, size + 1);
+    if (state && strncmp(value, "p0-secret-", strlen("p0-secret-")) == 0) {
+        int slot = __atomic_fetch_add(&state->count, 1, __ATOMIC_ACQ_REL);
+        if (slot >= 0 && slot < (int)(sizeof(state->records) / sizeof(state->records[0]))) {
+            state->records[slot].ptr = copy;
+            state->records[slot].size = size;
+            __atomic_store_n(&state->records[slot].active, 1, __ATOMIC_RELEASE);
+        } else {
+            __atomic_store_n(&state->bad, 1, __ATOMIC_RELEASE);
+        }
+    }
+    return copy;
+}
+
+static void secure_test_free(void * ptr, void * user_data) {
+    secure_free_state * state = (secure_free_state *)user_data;
+    if (ptr && state) {
+        int count = __atomic_load_n(&state->count, __ATOMIC_ACQUIRE);
+        if (count > (int)(sizeof(state->records) / sizeof(state->records[0]))) {
+            count = (int)(sizeof(state->records) / sizeof(state->records[0]));
+        }
+        /* malloc may reuse an address; match the most recent live allocation. */
+        for (int i = count - 1; i >= 0; i--) {
+            if (__atomic_load_n(&state->records[i].active, __ATOMIC_ACQUIRE) &&
+                state->records[i].ptr == ptr) {
+                const unsigned char * bytes = (const unsigned char *)ptr;
+                for (size_t j = 0; j < state->records[i].size; j++) {
+                    if (bytes[j] != 0) {
+                        __atomic_store_n(&state->bad, 1, __ATOMIC_RELEASE);
+                        break;
+                    }
+                }
+                __atomic_store_n(&state->records[i].freed, 1, __ATOMIC_RELEASE);
+                __atomic_store_n(&state->records[i].active, 0, __ATOMIC_RELEASE);
+                break;
+            }
+        }
+    }
+    free(ptr);
+}
+
+static int secure_test_credentials_provider(ve_tls_credentials * out, void * user_param) {
+    (void)user_param;
+    if (!out) return -1;
+    out->access_key_id = "p0-secret-dynamic-ak";
+    out->access_key_secret = "p0-secret-dynamic-sk";
+    out->security_token = "p0-secret-dynamic-token";
+    out->expire_time_ms = INT64_MAX;
+    return 0;
+}
+
+static void secure_test_fail_strdup_on(
+    secure_free_state * state,
+    const char * value,
+    int match_after
+) {
+    __atomic_store_n(&state->fail_matches, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&state->fail_match_after, match_after, __ATOMIC_RELEASE);
+    __atomic_store_n(&state->fail_value, value, __ATOMIC_RELEASE);
+}
+
+static void secure_test_clear_strdup_failure(secure_free_state * state) {
+    __atomic_store_n(&state->fail_value, NULL, __ATOMIC_RELEASE);
+    __atomic_store_n(&state->fail_match_after, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&state->fail_matches, 0, __ATOMIC_RELEASE);
 }
 
 static char * alloc_fail_strdup(const char * s, void * user_data) {
@@ -838,6 +955,21 @@ static int test_http_transport_retryable_then_ok_do(ve_tls_http_client * client,
     return 0;
 }
 
+static int test_http_504_then_ok_do(ve_tls_http_client * client, const ve_tls_http_request * req, ve_tls_http_response * resp) {
+    (void)client;
+    (void)req;
+    if (!resp) return -1;
+    g_seq_state.calls++;
+    if (g_seq_state.calls == 1) {
+        resp->status_code = 504;
+        resp->request_id = strdup("rid-504");
+        return 0;
+    }
+    resp->status_code = 200;
+    resp->request_id = strdup("rid-ok-504");
+    return 0;
+}
+
 static void on_send_done_seq_v2(
     ve_tls_result result,
     size_t log_bytes,
@@ -854,7 +986,10 @@ static void on_send_done_seq_v2(
     (void)user_param;
     (void)start_id;
     (void)end_id;
-    if (result == VE_TLS_OK && error && error->request_id && (strcmp(error->request_id, "rid-ok-429") == 0 || strcmp(error->request_id, "rid-ok-net") == 0)) {
+    if (result == VE_TLS_OK && error && error->request_id &&
+        (strcmp(error->request_id, "rid-ok-429") == 0 ||
+         strcmp(error->request_id, "rid-ok-net") == 0 ||
+         strcmp(error->request_id, "rid-ok-504") == 0)) {
         g_seq_state.ok = 1;
     } else if (result == VE_TLS_DROP_ERROR && error && error->request_id && strcmp(error->request_id, "rid-400") == 0 && error->retryable == 0) {
         g_seq_state.ok = 1;
@@ -952,6 +1087,36 @@ static int test_sender_transport_retryable_then_ok(void) {
     for (int i = 0; i < 400 && !__atomic_load_n(&g_seq_state.done, __ATOMIC_ACQUIRE); i++) cfg.platform.sleep_ms(10);
     ve_tls_producer_destroy(p);
     return (g_seq_state.ok && g_seq_state.calls == 3) ? 0 : -1;
+}
+
+static int test_sender_retries_504_then_ok(void) {
+    memset(&g_seq_state, 0, sizeof(g_seq_state));
+    ve_tls_config cfg;
+    ve_tls_config_init(&cfg);
+    cfg.endpoint = "https://example.com";
+    cfg.region = "cn-beijing";
+    cfg.topic_id = "t";
+    cfg.access_key_id = "ak";
+    cfg.access_key_secret = "sk";
+    cfg.flush_interval_ms = 0;
+    cfg.retry_policy.max_attempts = 2;
+    cfg.retry_policy.initial_interval_ms = 1;
+    cfg.retry_policy.max_interval_ms = 1;
+    cfg.http_client.do_request = test_http_504_then_ok_do;
+    cfg.http_client.free_response = test_http_free;
+    ve_tls_producer * p = ve_tls_producer_create(&cfg);
+    if (!p) return -1;
+    ve_tls_producer_set_send_done_v2(p, on_send_done_seq_v2, NULL);
+    ve_tls_kv kv = {"k1", "v1"};
+    if (ve_tls_producer_add_log_kv(p, 0, &kv, 1, 1) != VE_TLS_OK) {
+        ve_tls_producer_destroy(p);
+        return -1;
+    }
+    for (int i = 0; i < 200 && !__atomic_load_n(&g_seq_state.done, __ATOMIC_ACQUIRE); i++) {
+        cfg.platform.sleep_ms(10);
+    }
+    ve_tls_producer_destroy(p);
+    return (g_seq_state.ok && g_seq_state.calls == 2) ? 0 : -1;
 }
 
 typedef struct {
@@ -2826,6 +2991,18 @@ static int test_http_step_status_403_plain_do(ve_tls_http_client * client, const
     return 0;
 }
 
+static int test_http_step_status_401_plain_do(ve_tls_http_client * client, const ve_tls_http_request * req, ve_tls_http_response * resp) {
+    (void)client;
+    (void)req;
+    if (!resp) return -1;
+    g_step_http_calls++;
+    resp->status_code = 401;
+    resp->request_id = strdup("rid-401");
+    resp->body = (unsigned char *)strdup("plain");
+    resp->body_size = strlen((const char *)resp->body);
+    return 0;
+}
+
 static int test_sender_step_compress_unsupported_drops(void) {
     g_step_http_calls = 0;
     g_step_ok_calls = 0;
@@ -3022,7 +3199,7 @@ static int test_sender_step_http_non200_plain_message(void) {
     destroy_fake_sender_producer(&p);
     if (g_step_http_calls != 1) return -1;
     if (g_step_drop_calls < 1) return -1;
-    if (strcmp(g_step_drop_code, "BadResponse") != 0) return -1;
+    if (strcmp(g_step_drop_code, "AuthenticationFailed") != 0) return -1;
     return 0;
 }
 
@@ -5851,6 +6028,11 @@ static int test_producer_create_versioned_validation(void) {
             &cfg, sizeof(cfg), VE_TLS_CONFIG_VERSION_CURRENT) != VE_TLS_OK) {
         return -1;
     }
+    if (cfg.persistent_max_log_delay_ms != 0 ||
+        cfg.persistent_expired_log_policy != VE_TLS_PEXPIRED_REWRITE ||
+        cfg.persistent_auth_failure_policy != VE_TLS_PAUTH_RETAIN) {
+        return -1;
+    }
     cfg.endpoint = "https://example.com";
     cfg.region = "cn-beijing";
     cfg.topic_id = "t";
@@ -5858,28 +6040,36 @@ static int test_producer_create_versioned_validation(void) {
     cfg.access_key_secret = "sk";
 
     ve_tls_producer * p = ve_tls_producer_create_versioned(
-        &cfg, sizeof(cfg), VE_TLS_CONFIG_VERSION_1);
+        &cfg, VE_TLS_CONFIG_VERSION_1_SIZE, VE_TLS_CONFIG_VERSION_1);
     if (!p) {
+        return -1;
+    }
+    if (p->config.persistent_max_log_delay_ms != 0 ||
+        p->config.persistent_expired_log_policy != VE_TLS_PEXPIRED_REWRITE ||
+        p->config.persistent_auth_failure_policy != VE_TLS_PAUTH_RETAIN) {
+        ve_tls_producer_destroy(p);
         return -1;
     }
     ve_tls_producer_destroy(p);
 
     p = ve_tls_producer_create_versioned(
-        &cfg, sizeof(cfg), VE_TLS_CONFIG_VERSION_1 + 1u);
+        &cfg, sizeof(cfg), VE_TLS_CONFIG_VERSION_CURRENT + 1u);
     if (p) {
         ve_tls_producer_destroy(p);
         return -2;
     }
     p = ve_tls_producer_create_versioned(
-        &cfg, sizeof(cfg) - 1u, VE_TLS_CONFIG_VERSION_1);
+        &cfg, VE_TLS_CONFIG_VERSION_1_SIZE - 1u, VE_TLS_CONFIG_VERSION_1);
     if (p) {
         ve_tls_producer_destroy(p);
         return -3;
     }
     if (ve_tls_config_init_versioned(
-            &cfg, sizeof(cfg) - 1u, VE_TLS_CONFIG_VERSION_1) != VE_TLS_INVALID ||
+            &cfg, VE_TLS_CONFIG_VERSION_1_SIZE - 1u, VE_TLS_CONFIG_VERSION_1) != VE_TLS_INVALID ||
         ve_tls_config_init_versioned(
-            &cfg, sizeof(cfg), VE_TLS_CONFIG_VERSION_1 + 1u) != VE_TLS_INVALID) {
+            &cfg, sizeof(cfg), VE_TLS_CONFIG_VERSION_CURRENT + 1u) != VE_TLS_INVALID ||
+        ve_tls_config_init_versioned(
+            &cfg, sizeof(cfg), VE_TLS_CONFIG_VERSION_1) != VE_TLS_INVALID) {
         return -4;
     }
     legacy = (unsigned char *)malloc(VE_TLS_CONFIG_LEGACY_SIZE);
@@ -6943,6 +7133,77 @@ static int test_http_ok_do(ve_tls_http_client * client, const ve_tls_http_reques
     return 0;
 }
 
+static int secure_test_http_capture_do(
+    ve_tls_http_client * client,
+    const ve_tls_http_request * req,
+    ve_tls_http_response * resp
+) {
+    if (!req || !req->headers) {
+        return -1;
+    }
+    __atomic_store_n(&g_secure_headers_size, strlen(req->headers), __ATOMIC_RELAXED);
+    if (strstr(req->headers, "p0-secret-static-token-") != NULL) {
+        __atomic_store_n(&g_secure_headers_had_token, 1, __ATOMIC_RELEASE);
+    }
+    __atomic_store_n(
+        &g_secure_headers_buffer,
+        (const unsigned char *)req->headers,
+        __ATOMIC_RELEASE);
+    return test_http_ok_do(client, req, resp);
+}
+
+static int secure_test_captured_headers_are_zeroed(void) {
+    const unsigned char * buffer = __atomic_load_n(
+        &g_secure_headers_buffer, __ATOMIC_ACQUIRE);
+    size_t size = __atomic_load_n(&g_secure_headers_size, __ATOMIC_RELAXED);
+    if (!buffer || size == 0) {
+        return 0;
+    }
+    for (size_t i = 0; i < size; i++) {
+        if (buffer[i] != 0) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int test_bytes_contains(
+    const unsigned char * haystack,
+    size_t haystack_size,
+    const unsigned char * needle,
+    size_t needle_size
+) {
+    if (!haystack || !needle || needle_size == 0 || haystack_size < needle_size) {
+        return 0;
+    }
+    for (size_t i = 0; i <= haystack_size - needle_size; i++) {
+        if (memcmp(haystack + i, needle, needle_size) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int test_http_capture_rewritten_payload_do(
+    ve_tls_http_client * client,
+    const ve_tls_http_request * req,
+    ve_tls_http_response * resp
+) {
+    (void)client;
+    if (!req || !resp) return -1;
+    __atomic_add_fetch(&g_rewrite_http_calls, 1, __ATOMIC_RELAXED);
+    if (test_bytes_contains(
+            req->body,
+            req->body_size,
+            g_rewrite_expected_payload,
+            g_rewrite_expected_payload_size)) {
+        __atomic_store_n(&g_rewrite_payload_matched, 1, __ATOMIC_RELEASE);
+    }
+    resp->status_code = 200;
+    resp->request_id = strdup("rid-rewrite");
+    return 0;
+}
+
 static void test_http_ok_free(ve_tls_http_client * client, ve_tls_http_response * resp) {
     (void)client;
     if (!resp) {
@@ -7413,6 +7674,677 @@ static int test_runtime_snapshot_reflects_runtime_updates(void) {
     ve_tls_runtime_snapshot_release(s2);
     ve_tls_producer_destroy(p);
     return ok ? 0 : -1;
+}
+
+static int test_runtime_snapshot_allocation_count(const ve_tls_runtime_snapshot * snapshot) {
+    int count = 1;
+    if (!snapshot) {
+        return 0;
+    }
+#define COUNT_SNAPSHOT_STRING(field) do { if (snapshot->field) count++; } while (0)
+    COUNT_SNAPSHOT_STRING(endpoint);
+    COUNT_SNAPSHOT_STRING(region);
+    COUNT_SNAPSHOT_STRING(topic_id);
+    COUNT_SNAPSHOT_STRING(api_version);
+    COUNT_SNAPSHOT_STRING(compress_type);
+    COUNT_SNAPSHOT_STRING(default_hash_key);
+    COUNT_SNAPSHOT_STRING(ca_cert_path);
+    COUNT_SNAPSHOT_STRING(proxy);
+    COUNT_SNAPSHOT_STRING(user_agent);
+    COUNT_SNAPSHOT_STRING(access_key_id);
+    COUNT_SNAPSHOT_STRING(access_key_secret);
+    COUNT_SNAPSHOT_STRING(security_token);
+#undef COUNT_SNAPSHOT_STRING
+    return count;
+}
+
+static int test_runtime_endpoint_update_snapshot_alloc_failure_is_atomic(void) {
+    ve_tls_config cfg;
+    ve_tls_config_init(&cfg);
+    cfg.endpoint = "https://old.example.com";
+    cfg.region = "old-region";
+    cfg.topic_id = "old-topic";
+    cfg.access_key_id = "ak1";
+    cfg.access_key_secret = "sk1";
+    int allocation_count = 0;
+
+    ve_tls_producer * probe = ve_tls_producer_create(&cfg);
+    if (!probe) return -1;
+    const ve_tls_runtime_snapshot * probe_snapshot = ve_tls_runtime_snapshot_acquire(probe);
+    allocation_count = 3 + test_runtime_snapshot_allocation_count(probe_snapshot);
+    ve_tls_runtime_snapshot_release(probe_snapshot);
+    ve_tls_producer_destroy(probe);
+    if (allocation_count <= 3) return -2;
+
+    for (int fail_after = 0; fail_after < allocation_count; fail_after++) {
+        ve_tls_producer * p = ve_tls_producer_create(&cfg);
+        if (!p) return -3;
+        int64_t old_version = p->send_cfg_version;
+        ve_tls_alloc_fault_inject("update_endpoint", fail_after, 1);
+        ve_tls_result rc = ve_tls_producer_update_endpoint(
+            p, "https://new.example.com", "new-region", "new-topic");
+        ve_tls_alloc_fault_inject(NULL, 0, 0);
+        const ve_tls_runtime_snapshot * snapshot = ve_tls_runtime_snapshot_acquire(p);
+        int ok = rc == VE_TLS_DROP_ERROR &&
+            p->cfg_endpoint && strcmp(p->cfg_endpoint, "https://old.example.com") == 0 &&
+            p->cfg_region && strcmp(p->cfg_region, "old-region") == 0 &&
+            p->cfg_topic_id && strcmp(p->cfg_topic_id, "old-topic") == 0 &&
+            p->config.endpoint == p->cfg_endpoint && p->config.region == p->cfg_region &&
+            p->config.topic_id == p->cfg_topic_id && p->send_cfg_version == old_version &&
+            snapshot && snapshot->endpoint &&
+            strcmp(snapshot->endpoint, "https://old.example.com") == 0 &&
+            snapshot->region && strcmp(snapshot->region, "old-region") == 0 &&
+            snapshot->topic_id && strcmp(snapshot->topic_id, "old-topic") == 0 &&
+            snapshot->send_cfg_version == old_version;
+        ve_tls_runtime_snapshot_release(snapshot);
+        ve_tls_producer_destroy(p);
+        if (!ok) return -100 - fail_after;
+    }
+
+    ve_tls_producer * p = ve_tls_producer_create(&cfg);
+    if (!p) return -4;
+    int64_t old_version = p->send_cfg_version;
+    ve_tls_alloc_fault_inject("update_endpoint", allocation_count, 1);
+    ve_tls_result rc = ve_tls_producer_update_endpoint(
+        p, "https://new.example.com", "new-region", "new-topic");
+    ve_tls_alloc_fault_inject(NULL, 0, 0);
+    const ve_tls_runtime_snapshot * snapshot = ve_tls_runtime_snapshot_acquire(p);
+    int ok = rc == VE_TLS_OK && p->send_cfg_version == old_version + 3 &&
+        p->cfg_endpoint && strcmp(p->cfg_endpoint, "https://new.example.com") == 0 &&
+        p->cfg_region && strcmp(p->cfg_region, "new-region") == 0 &&
+        p->cfg_topic_id && strcmp(p->cfg_topic_id, "new-topic") == 0 &&
+        snapshot && snapshot->send_cfg_version == old_version + 3 &&
+        snapshot->endpoint && strcmp(snapshot->endpoint, "https://new.example.com") == 0 &&
+        snapshot->region && strcmp(snapshot->region, "new-region") == 0 &&
+        snapshot->topic_id && strcmp(snapshot->topic_id, "new-topic") == 0;
+    ve_tls_runtime_snapshot_release(snapshot);
+    ve_tls_producer_destroy(p);
+    return ok ? 0 : -5;
+}
+
+static int test_runtime_credentials_update_snapshot_alloc_failure_is_atomic(void) {
+    ve_tls_config cfg;
+    ve_tls_config_init(&cfg);
+    cfg.endpoint = "https://example.com";
+    cfg.region = "cn-beijing";
+    cfg.topic_id = "topic";
+    cfg.access_key_id = "old-ak";
+    cfg.access_key_secret = "old-sk";
+    cfg.security_token = "old-token";
+    int allocation_count = 0;
+
+    ve_tls_producer * probe = ve_tls_producer_create(&cfg);
+    if (!probe) return -1;
+    const ve_tls_runtime_snapshot * probe_snapshot = ve_tls_runtime_snapshot_acquire(probe);
+    allocation_count = 3 + test_runtime_snapshot_allocation_count(probe_snapshot);
+    ve_tls_runtime_snapshot_release(probe_snapshot);
+    ve_tls_producer_destroy(probe);
+    if (allocation_count <= 3) return -2;
+
+    for (int fail_after = 0; fail_after < allocation_count; fail_after++) {
+        ve_tls_producer * p = ve_tls_producer_create(&cfg);
+        if (!p) return -3;
+        int64_t old_version = p->static_cred_version;
+        ve_tls_alloc_fault_inject("update_credentials", fail_after, 1);
+        ve_tls_result rc = ve_tls_producer_update_static_credentials(
+            p, "new-ak", "new-sk", "new-token");
+        ve_tls_alloc_fault_inject(NULL, 0, 0);
+        const ve_tls_runtime_snapshot * snapshot = ve_tls_runtime_snapshot_acquire(p);
+        int ok = rc == VE_TLS_DROP_ERROR &&
+            p->cfg_access_key_id && strcmp(p->cfg_access_key_id, "old-ak") == 0 &&
+            p->cfg_access_key_secret && strcmp(p->cfg_access_key_secret, "old-sk") == 0 &&
+            p->cfg_security_token && strcmp(p->cfg_security_token, "old-token") == 0 &&
+            p->config.access_key_id == p->cfg_access_key_id &&
+            p->config.access_key_secret == p->cfg_access_key_secret &&
+            p->config.security_token == p->cfg_security_token &&
+            p->static_cred_version == old_version && snapshot &&
+            snapshot->access_key_id && strcmp(snapshot->access_key_id, "old-ak") == 0 &&
+            snapshot->access_key_secret && strcmp(snapshot->access_key_secret, "old-sk") == 0 &&
+            snapshot->security_token && strcmp(snapshot->security_token, "old-token") == 0 &&
+            snapshot->static_cred_version == old_version;
+        ve_tls_runtime_snapshot_release(snapshot);
+        ve_tls_producer_destroy(p);
+        if (!ok) return -100 - fail_after;
+    }
+
+    ve_tls_producer * p = ve_tls_producer_create(&cfg);
+    if (!p) return -4;
+    int64_t old_version = p->static_cred_version;
+    ve_tls_alloc_fault_inject("update_credentials", allocation_count, 1);
+    ve_tls_result rc = ve_tls_producer_update_static_credentials(
+        p, "new-ak", "new-sk", "new-token");
+    ve_tls_alloc_fault_inject(NULL, 0, 0);
+    const ve_tls_runtime_snapshot * snapshot = ve_tls_runtime_snapshot_acquire(p);
+    int ok = rc == VE_TLS_OK && p->static_cred_version == old_version + 2 &&
+        p->cfg_access_key_id && strcmp(p->cfg_access_key_id, "new-ak") == 0 &&
+        p->cfg_access_key_secret && strcmp(p->cfg_access_key_secret, "new-sk") == 0 &&
+        p->cfg_security_token && strcmp(p->cfg_security_token, "new-token") == 0 &&
+        snapshot && snapshot->static_cred_version == old_version + 2 &&
+        snapshot->access_key_id && strcmp(snapshot->access_key_id, "new-ak") == 0 &&
+        snapshot->access_key_secret && strcmp(snapshot->access_key_secret, "new-sk") == 0 &&
+        snapshot->security_token && strcmp(snapshot->security_token, "new-token") == 0;
+    ve_tls_runtime_snapshot_release(snapshot);
+    ve_tls_producer_destroy(p);
+    return ok ? 0 : -5;
+}
+
+typedef struct {
+    ve_tls_producer * producer;
+    int update_credentials;
+    int iterations;
+    int failed;
+} runtime_update_race_arg;
+
+typedef struct {
+    ve_tls_producer * producer;
+    int stop;
+    int failed;
+} runtime_snapshot_observer_arg;
+
+static int g_runtime_update_http_calls = 0;
+static int g_runtime_update_http_bad = 0;
+
+static void * test_runtime_update_race_thread(void * arg) {
+    runtime_update_race_arg * state = (runtime_update_race_arg *)arg;
+    if (!state || !state->producer) return NULL;
+    for (int i = 0; i < state->iterations; i++) {
+        int use_b = i & 1;
+        ve_tls_result rc = state->update_credentials
+            ? ve_tls_producer_update_static_credentials(
+                state->producer,
+                use_b ? "ak-b" : "ak-a",
+                use_b ? "sk-b" : "sk-a",
+                use_b ? "token-b" : "token-a")
+            : ve_tls_producer_update_endpoint(
+                state->producer,
+                use_b ? "https://b.example.com" : "https://a.example.com",
+                use_b ? "region-b" : "region-a",
+                use_b ? "topic-b" : "topic-a");
+        if (rc != VE_TLS_OK) {
+            __atomic_store_n(&state->failed, 1, __ATOMIC_RELEASE);
+            break;
+        }
+    }
+    return NULL;
+}
+
+static void * test_runtime_snapshot_observer_thread(void * arg) {
+    runtime_snapshot_observer_arg * state = (runtime_snapshot_observer_arg *)arg;
+    if (!state || !state->producer) return NULL;
+    while (!__atomic_load_n(&state->stop, __ATOMIC_ACQUIRE)) {
+        const ve_tls_runtime_snapshot * snapshot =
+            ve_tls_runtime_snapshot_acquire(state->producer);
+        if (!snapshot) {
+            __atomic_store_n(&state->failed, 1, __ATOMIC_RELEASE);
+            break;
+        }
+        int endpoint_a = snapshot->endpoint && snapshot->region && snapshot->topic_id &&
+            strcmp(snapshot->endpoint, "https://a.example.com") == 0 &&
+            strcmp(snapshot->region, "region-a") == 0 &&
+            strcmp(snapshot->topic_id, "topic-a") == 0;
+        int endpoint_b = snapshot->endpoint && snapshot->region && snapshot->topic_id &&
+            strcmp(snapshot->endpoint, "https://b.example.com") == 0 &&
+            strcmp(snapshot->region, "region-b") == 0 &&
+            strcmp(snapshot->topic_id, "topic-b") == 0;
+        int creds_a = snapshot->access_key_id && snapshot->access_key_secret &&
+            snapshot->security_token && strcmp(snapshot->access_key_id, "ak-a") == 0 &&
+            strcmp(snapshot->access_key_secret, "sk-a") == 0 &&
+            strcmp(snapshot->security_token, "token-a") == 0;
+        int creds_b = snapshot->access_key_id && snapshot->access_key_secret &&
+            snapshot->security_token && strcmp(snapshot->access_key_id, "ak-b") == 0 &&
+            strcmp(snapshot->access_key_secret, "sk-b") == 0 &&
+            strcmp(snapshot->security_token, "token-b") == 0;
+        ve_tls_runtime_snapshot_release(snapshot);
+        if ((!endpoint_a && !endpoint_b) || (!creds_a && !creds_b)) {
+            __atomic_store_n(&state->failed, 1, __ATOMIC_RELEASE);
+            break;
+        }
+    }
+    return NULL;
+}
+
+static int test_http_runtime_update_race_do(
+    ve_tls_http_client * client,
+    const ve_tls_http_request * req,
+    ve_tls_http_response * resp
+) {
+    (void)client;
+    if (!req || !resp || !req->url || !req->headers) return -1;
+    int endpoint_ok =
+        strstr(req->url, "https://a.example.com/PutLogs?TopicId=topic-a") != NULL ||
+        strstr(req->url, "https://b.example.com/PutLogs?TopicId=topic-b") != NULL;
+    const char * credential = strstr(req->headers, "Credential=");
+    int credential_ok = credential &&
+        (strncmp(credential + strlen("Credential="), "ak-a/", 5) == 0 ||
+         strncmp(credential + strlen("Credential="), "ak-b/", 5) == 0);
+    if (!endpoint_ok || !credential_ok) {
+        __atomic_store_n(&g_runtime_update_http_bad, 1, __ATOMIC_RELEASE);
+    }
+    __atomic_add_fetch(&g_runtime_update_http_calls, 1, __ATOMIC_RELAXED);
+    resp->status_code = 200;
+    resp->request_id = strdup("rid-runtime-race");
+    return 0;
+}
+
+static int test_runtime_updates_concurrent_with_senders(void) {
+    ve_tls_config cfg;
+    ve_tls_config_init(&cfg);
+    cfg.endpoint = "https://a.example.com";
+    cfg.region = "region-a";
+    cfg.topic_id = "topic-a";
+    cfg.access_key_id = "ak-a";
+    cfg.access_key_secret = "sk-a";
+    cfg.security_token = "token-a";
+    cfg.compress_type = "none";
+    cfg.flush_interval_ms = 0;
+    cfg.log_count_per_package = 1;
+    cfg.send_thread_count = 2;
+    cfg.pack_thread_count = 2;
+    cfg.http_client.do_request = test_http_runtime_update_race_do;
+    cfg.http_client.free_response = test_http_ok_free;
+    ve_tls_producer * producer = ve_tls_producer_create(&cfg);
+    if (!producer) return -1;
+
+    runtime_update_race_arg endpoint_arg = {producer, 0, 200, 0};
+    runtime_update_race_arg credentials_arg = {producer, 1, 200, 0};
+    runtime_snapshot_observer_arg observer_arg = {producer, 0, 0};
+    __atomic_store_n(&g_runtime_update_http_calls, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_runtime_update_http_bad, 0, __ATOMIC_RELAXED);
+    ve_tls_thread * endpoint_thread = cfg.platform.thread_create(
+        test_runtime_update_race_thread, &endpoint_arg);
+    ve_tls_thread * credentials_thread = cfg.platform.thread_create(
+        test_runtime_update_race_thread, &credentials_arg);
+    ve_tls_thread * observer_thread = cfg.platform.thread_create(
+        test_runtime_snapshot_observer_thread, &observer_arg);
+    if (!endpoint_thread || !credentials_thread || !observer_thread) {
+        if (endpoint_thread) cfg.platform.thread_join(endpoint_thread);
+        if (credentials_thread) cfg.platform.thread_join(credentials_thread);
+        __atomic_store_n(&observer_arg.stop, 1, __ATOMIC_RELEASE);
+        if (observer_thread) cfg.platform.thread_join(observer_thread);
+        ve_tls_producer_destroy(producer);
+        return -2;
+    }
+    for (int i = 0; i < 200; i++) {
+        if (ve_tls_producer_add_log_raw(producer, "race", 4, 1) != VE_TLS_OK) {
+            __atomic_store_n(&observer_arg.failed, 1, __ATOMIC_RELEASE);
+            break;
+        }
+    }
+    cfg.platform.thread_join(endpoint_thread);
+    cfg.platform.thread_join(credentials_thread);
+    __atomic_store_n(&observer_arg.stop, 1, __ATOMIC_RELEASE);
+    cfg.platform.thread_join(observer_thread);
+    ve_tls_result close_rc = ve_tls_producer_close(producer, 10000);
+    int ok = close_rc == VE_TLS_OK && !endpoint_arg.failed &&
+        !credentials_arg.failed && !observer_arg.failed &&
+        !__atomic_load_n(&g_runtime_update_http_bad, __ATOMIC_ACQUIRE) &&
+        __atomic_load_n(&g_runtime_update_http_calls, __ATOMIC_ACQUIRE) > 0;
+    ve_tls_producer_destroy(producer);
+    return ok ? 0 : -3;
+}
+
+typedef struct {
+    int armed;
+    int entered;
+    int release;
+    int metric_entered;
+    int metric_release;
+} update_destroy_alloc_gate;
+
+typedef struct {
+    ve_tls_producer * producer;
+    ve_tls_result rc;
+    int * sequence;
+    int order;
+} update_destroy_update_arg;
+
+typedef struct {
+    ve_tls_producer * producer;
+    int done;
+    int * sequence;
+    int order;
+} update_destroy_destroy_arg;
+
+static void test_update_during_destroy_metrics(
+    const char * name,
+    int64_t v1,
+    int64_t v2,
+    void * user_param
+) {
+    update_destroy_alloc_gate * gate = (update_destroy_alloc_gate *)user_param;
+    (void)v1;
+    (void)v2;
+    if (!gate || !name || strcmp(name, "config_update_endpoint") != 0) {
+        return;
+    }
+    __atomic_store_n(&gate->metric_entered, 1, __ATOMIC_RELEASE);
+    while (!__atomic_load_n(&gate->metric_release, __ATOMIC_ACQUIRE)) {
+        usleep(1000);
+    }
+}
+
+static void * update_destroy_malloc(size_t size, void * user_data) {
+    (void)user_data;
+    return malloc(size);
+}
+
+static void * update_destroy_calloc(size_t count, size_t size, void * user_data) {
+    update_destroy_alloc_gate * gate = (update_destroy_alloc_gate *)user_data;
+    if (gate && count == 1 && size == sizeof(ve_tls_runtime_snapshot) &&
+        __atomic_exchange_n(&gate->armed, 0, __ATOMIC_ACQ_REL)) {
+        __atomic_store_n(&gate->entered, 1, __ATOMIC_RELEASE);
+        while (!__atomic_load_n(&gate->release, __ATOMIC_ACQUIRE)) {
+            usleep(1000);
+        }
+    }
+    return calloc(count, size);
+}
+
+static void * update_destroy_realloc(void * ptr, size_t size, void * user_data) {
+    (void)user_data;
+    return realloc(ptr, size);
+}
+
+static void update_destroy_free(void * ptr, void * user_data) {
+    (void)user_data;
+    free(ptr);
+}
+
+static char * update_destroy_strdup(const char * value, void * user_data) {
+    (void)user_data;
+    return value ? strdup(value) : NULL;
+}
+
+static void * test_update_during_destroy_update_thread(void * arg) {
+    update_destroy_update_arg * state = (update_destroy_update_arg *)arg;
+    state->rc = ve_tls_producer_update_endpoint(
+        state->producer, "https://b.example.com", "region-b", "topic-b");
+    state->order = __atomic_add_fetch(state->sequence, 1, __ATOMIC_ACQ_REL);
+    return NULL;
+}
+
+static void * test_update_during_destroy_destroy_thread(void * arg) {
+    update_destroy_destroy_arg * state = (update_destroy_destroy_arg *)arg;
+    ve_tls_producer_destroy(state->producer);
+    state->order = __atomic_add_fetch(state->sequence, 1, __ATOMIC_ACQ_REL);
+    __atomic_store_n(&state->done, 1, __ATOMIC_RELEASE);
+    return NULL;
+}
+
+static int test_runtime_update_inflight_blocks_destroy(void) {
+    ve_tls_config cfg;
+    ve_tls_alloc_hooks saved;
+    ve_tls_alloc_hooks hooks;
+    update_destroy_alloc_gate gate;
+    int sequence = 0;
+    memset(&gate, 0, sizeof(gate));
+    ve_tls_config_init(&cfg);
+    cfg.endpoint = "https://a.example.com";
+    cfg.region = "region-a";
+    cfg.topic_id = "topic-a";
+    cfg.access_key_id = "ak-a";
+    cfg.access_key_secret = "sk-a";
+    cfg.metrics_sink.emit = test_update_during_destroy_metrics;
+    cfg.metrics_sink.user_param = &gate;
+    ve_tls_producer * producer = ve_tls_producer_create(&cfg);
+    if (!producer) return -1;
+    memset(&hooks, 0, sizeof(hooks));
+    hooks.malloc_fn = update_destroy_malloc;
+    hooks.calloc_fn = update_destroy_calloc;
+    hooks.realloc_fn = update_destroy_realloc;
+    hooks.free_fn = update_destroy_free;
+    hooks.strdup_fn = update_destroy_strdup;
+    hooks.user_data = &gate;
+    ve_tls_alloc_get_hooks(&saved);
+    ve_tls_alloc_set_hooks(&hooks);
+    __atomic_store_n(&gate.armed, 1, __ATOMIC_RELEASE);
+
+    update_destroy_update_arg update_arg = {producer, VE_TLS_INVALID, &sequence, 0};
+    update_destroy_destroy_arg destroy_arg = {producer, 0, &sequence, 0};
+    ve_tls_thread * update_thread = cfg.platform.thread_create(
+        test_update_during_destroy_update_thread, &update_arg);
+    if (!update_thread) {
+        ve_tls_alloc_set_hooks(&saved);
+        ve_tls_producer_destroy(producer);
+        return -2;
+    }
+    for (int i = 0; i < 2000 &&
+         !__atomic_load_n(&gate.entered, __ATOMIC_ACQUIRE); i++) {
+        usleep(1000);
+    }
+    if (!__atomic_load_n(&gate.entered, __ATOMIC_ACQUIRE)) {
+        __atomic_store_n(&gate.release, 1, __ATOMIC_RELEASE);
+        __atomic_store_n(&gate.metric_release, 1, __ATOMIC_RELEASE);
+        cfg.platform.thread_join(update_thread);
+        ve_tls_alloc_set_hooks(&saved);
+        ve_tls_producer_destroy(producer);
+        return -3;
+    }
+    ve_tls_thread * destroy_thread = cfg.platform.thread_create(
+        test_update_during_destroy_destroy_thread, &destroy_arg);
+    if (!destroy_thread) {
+        __atomic_store_n(&gate.release, 1, __ATOMIC_RELEASE);
+        __atomic_store_n(&gate.metric_release, 1, __ATOMIC_RELEASE);
+        cfg.platform.thread_join(update_thread);
+        ve_tls_alloc_set_hooks(&saved);
+        ve_tls_producer_destroy(producer);
+        return -4;
+    }
+    usleep(10000);
+    int destroy_waited = !__atomic_load_n(&destroy_arg.done, __ATOMIC_ACQUIRE);
+    __atomic_store_n(&gate.release, 1, __ATOMIC_RELEASE);
+    for (int i = 0; i < 2000 &&
+         !__atomic_load_n(&gate.metric_entered, __ATOMIC_ACQUIRE); i++) {
+        usleep(1000);
+    }
+    int destroy_waited_for_cleanup =
+        __atomic_load_n(&gate.metric_entered, __ATOMIC_ACQUIRE) &&
+        !__atomic_load_n(&destroy_arg.done, __ATOMIC_ACQUIRE);
+    __atomic_store_n(&gate.metric_release, 1, __ATOMIC_RELEASE);
+    cfg.platform.thread_join(update_thread);
+    cfg.platform.thread_join(destroy_thread);
+    ve_tls_alloc_set_hooks(&saved);
+    return destroy_waited && destroy_waited_for_cleanup &&
+        update_arg.rc == VE_TLS_OK && update_arg.order == 1 && destroy_arg.order == 2
+        ? 0 : -5;
+}
+
+static int test_credentials_owned_copies_are_zeroed_before_free(void) {
+    ve_tls_alloc_hooks saved;
+    ve_tls_alloc_hooks hooks;
+    secure_free_state state;
+    ve_tls_config cfg;
+    ve_tls_producer * producer = NULL;
+    ve_tls_metrics metrics;
+    int failed = 0;
+    memset(&state, 0, sizeof(state));
+    memset(&hooks, 0, sizeof(hooks));
+    hooks.malloc_fn = secure_test_malloc;
+    hooks.calloc_fn = secure_test_calloc;
+    hooks.realloc_fn = secure_test_realloc;
+    hooks.free_fn = secure_test_free;
+    hooks.strdup_fn = secure_test_strdup;
+    hooks.user_data = &state;
+    ve_tls_alloc_get_hooks(&saved);
+    ve_tls_alloc_set_hooks(&hooks);
+
+    ve_tls_config_init(&cfg);
+    cfg.endpoint = "https://example.com";
+    cfg.region = "cn-beijing";
+    cfg.topic_id = "t";
+    cfg.access_key_id = "p0-secret-static-ak-1";
+    cfg.access_key_secret = "p0-secret-static-sk-1";
+    cfg.security_token = "p0-secret-static-token-1";
+    cfg.compress_type = "none";
+    cfg.flush_interval_ms = 0;
+    cfg.log_count_per_package = 1;
+    cfg.http_client.do_request = secure_test_http_capture_do;
+    cfg.http_client.free_response = test_http_ok_free;
+    __atomic_store_n(&g_secure_headers_buffer, NULL, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_secure_headers_size, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_secure_headers_had_token, 0, __ATOMIC_RELAXED);
+    producer = ve_tls_producer_create(&cfg);
+    if (!producer || ve_tls_producer_add_log_raw(producer, "one", 3, 1) != VE_TLS_OK) {
+        failed = 1;
+        goto cleanup;
+    }
+    for (int i = 0; i < 300; i++) {
+        memset(&metrics, 0, sizeof(metrics));
+        ve_tls_producer_get_metrics(producer, &metrics);
+        if (metrics.requests_total >= 1) break;
+        cfg.platform.sleep_ms(10);
+    }
+    if (ve_tls_producer_update_static_credentials(
+            producer,
+            "p0-secret-static-ak-2",
+            "p0-secret-static-sk-2",
+            "p0-secret-static-token-2") != VE_TLS_OK ||
+        ve_tls_producer_add_log_raw(producer, "two", 3, 1) != VE_TLS_OK) {
+        failed = 1;
+        goto cleanup;
+    }
+    for (int i = 0; i < 300; i++) {
+        memset(&metrics, 0, sizeof(metrics));
+        ve_tls_producer_get_metrics(producer, &metrics);
+        if (metrics.requests_total >= 2) break;
+        cfg.platform.sleep_ms(10);
+    }
+    ve_tls_alloc_fault_inject("update_credentials", 3, 1);
+    ve_tls_result update_rc = ve_tls_producer_update_static_credentials(
+        producer,
+        "p0-secret-failed-ak",
+        "p0-secret-failed-sk",
+        "p0-secret-failed-token");
+    ve_tls_alloc_fault_inject(NULL, 0, 0);
+    if (update_rc != VE_TLS_DROP_ERROR ||
+        ve_tls_producer_close(producer, 10000) != VE_TLS_OK ||
+        !__atomic_load_n(&g_secure_headers_had_token, __ATOMIC_ACQUIRE) ||
+        !secure_test_captured_headers_are_zeroed()) {
+        failed = 1;
+        goto cleanup;
+    }
+    ve_tls_producer_destroy(producer);
+    producer = NULL;
+
+    ve_tls_config_init(&cfg);
+    cfg.endpoint = "https://example.com";
+    cfg.region = "cn-beijing";
+    cfg.topic_id = "t";
+    cfg.credentials_provider = secure_test_credentials_provider;
+    cfg.credentials_expire_advance_ms = 0;
+    cfg.credentials_refresh_min_interval_ms = 0;
+    cfg.compress_type = "none";
+    cfg.flush_interval_ms = 0;
+    cfg.http_client.do_request = test_http_ok_do;
+    cfg.http_client.free_response = test_http_ok_free;
+    producer = ve_tls_producer_create(&cfg);
+    if (!producer || ve_tls_producer_add_log_raw(producer, "dynamic", 7, 1) != VE_TLS_OK ||
+        ve_tls_producer_close(producer, 10000) != VE_TLS_OK) {
+        failed = 1;
+        goto cleanup;
+    }
+    ve_tls_producer_destroy(producer);
+    producer = NULL;
+
+    secure_test_fail_strdup_on(
+        &state, "p0-secret-partial-static-token", 3);
+    ve_tls_config_init(&cfg);
+    cfg.endpoint = "https://example.com";
+    cfg.region = "cn-beijing";
+    cfg.topic_id = "t";
+    cfg.access_key_id = "p0-secret-partial-static-ak";
+    cfg.access_key_secret = "p0-secret-partial-static-sk";
+    cfg.security_token = "p0-secret-partial-static-token";
+    cfg.compress_type = "none";
+    cfg.http_client.do_request = test_http_ok_do;
+    cfg.http_client.free_response = test_http_ok_free;
+    producer = ve_tls_producer_create(&cfg);
+    if (!producer || ve_tls_producer_add_log_raw(
+            producer, "static-partial", 14, 1) != VE_TLS_OK ||
+        ve_tls_producer_close(producer, 10000) != VE_TLS_OK ||
+        __atomic_load_n(&state.fail_matches, __ATOMIC_ACQUIRE) < 3) {
+        failed = 1;
+        goto cleanup;
+    }
+    ve_tls_producer_destroy(producer);
+    producer = NULL;
+    secure_test_clear_strdup_failure(&state);
+
+    secure_test_fail_strdup_on(&state, "p0-secret-dynamic-token", 1);
+    ve_tls_config_init(&cfg);
+    cfg.endpoint = "https://example.com";
+    cfg.region = "cn-beijing";
+    cfg.topic_id = "t";
+    cfg.credentials_provider = secure_test_credentials_provider;
+    cfg.credentials_expire_advance_ms = 0;
+    cfg.credentials_refresh_min_interval_ms = 0;
+    cfg.compress_type = "none";
+    cfg.http_client.do_request = test_http_ok_do;
+    cfg.http_client.free_response = test_http_ok_free;
+    producer = ve_tls_producer_create(&cfg);
+    if (!producer || ve_tls_producer_add_log_raw(
+            producer, "provider-partial", 16, 1) != VE_TLS_OK ||
+        ve_tls_producer_close(producer, 10000) != VE_TLS_OK ||
+        __atomic_load_n(&state.fail_matches, __ATOMIC_ACQUIRE) < 1) {
+        failed = 1;
+        goto cleanup;
+    }
+    ve_tls_producer_destroy(producer);
+    producer = NULL;
+    secure_test_clear_strdup_failure(&state);
+
+    secure_test_fail_strdup_on(&state, "p0-secret-dynamic-token", 2);
+    ve_tls_config_init(&cfg);
+    cfg.endpoint = "https://example.com";
+    cfg.region = "cn-beijing";
+    cfg.topic_id = "t";
+    cfg.credentials_provider = secure_test_credentials_provider;
+    cfg.credentials_expire_advance_ms = 0;
+    cfg.credentials_refresh_min_interval_ms = 0;
+    cfg.compress_type = "none";
+    cfg.http_client.do_request = test_http_ok_do;
+    cfg.http_client.free_response = test_http_ok_free;
+    producer = ve_tls_producer_create(&cfg);
+    if (!producer || ve_tls_producer_add_log_raw(
+            producer, "owned-partial", 13, 1) != VE_TLS_OK ||
+        ve_tls_producer_close(producer, 10000) != VE_TLS_OK ||
+        __atomic_load_n(&state.fail_matches, __ATOMIC_ACQUIRE) < 2) {
+        failed = 1;
+        goto cleanup;
+    }
+    ve_tls_producer_destroy(producer);
+    producer = NULL;
+    secure_test_clear_strdup_failure(&state);
+
+    int count = __atomic_load_n(&state.count, __ATOMIC_ACQUIRE);
+    if (count < 12 || __atomic_load_n(&state.bad, __ATOMIC_ACQUIRE)) {
+        failed = 1;
+        goto cleanup;
+    }
+    for (int i = 0; i < count; i++) {
+        if (!__atomic_load_n(&state.records[i].freed, __ATOMIC_ACQUIRE)) {
+            failed = 1;
+            break;
+        }
+    }
+
+cleanup:
+    ve_tls_alloc_fault_inject(NULL, 0, 0);
+    ve_tls_producer_destroy(producer);
+    secure_test_clear_strdup_failure(&state);
+    ve_tls_alloc_set_hooks(&saved);
+    if (failed) {
+        int count = __atomic_load_n(&state.count, __ATOMIC_ACQUIRE);
+        fprintf(stderr, "secure-free debug count=%d bad=%d\n", count,
+            __atomic_load_n(&state.bad, __ATOMIC_ACQUIRE));
+        for (int i = 0; i < count && i < 256; i++) {
+            if (!__atomic_load_n(&state.records[i].freed, __ATOMIC_ACQUIRE)) {
+                fprintf(stderr, "secure-free record not freed index=%d size=%zu\n",
+                    i, state.records[i].size);
+            }
+        }
+    }
+    return failed ? -1 : 0;
 }
 
 static int test_obj_pool_reuses_recent_item(void) {
@@ -9794,6 +10726,7 @@ typedef struct {
 
 static int test_sync_failure_recover_record(
     int64_t log_id,
+    int64_t enqueue_time_ms,
     const char * hash_key,
     const unsigned char * payload,
     size_t payload_size,
@@ -9801,7 +10734,8 @@ static int test_sync_failure_recover_record(
 ) {
     static const unsigned char expected[] = "sync-failure-record";
     test_sync_failure_recover_state * state = (test_sync_failure_recover_state *)user;
-    if (!state || log_id != 1 || (hash_key && hash_key[0] != 0) ||
+    if (!state || log_id != 1 || enqueue_time_ms != g_fake_time ||
+        (hash_key && hash_key[0] != 0) ||
         payload_size != sizeof(expected) - 1 || memcmp(payload, expected, payload_size) != 0) {
         return -1;
     }
@@ -10726,6 +11660,7 @@ typedef struct {
 
 static int test_persistent_recover_count_record(
     int64_t log_id,
+    int64_t enqueue_time_ms,
     const char * hash_key,
     const unsigned char * payload,
     size_t payload_size,
@@ -10733,7 +11668,8 @@ static int test_persistent_recover_count_record(
 ) {
     test_persistent_recover_counter * counter = (test_persistent_recover_counter *)user;
     static const unsigned char expected_payload[] = "recover-stream";
-    if (!counter || !payload || payload_size != sizeof(expected_payload) - 1 ||
+    if (!counter || enqueue_time_ms != g_fake_time || !payload ||
+        payload_size != sizeof(expected_payload) - 1 ||
         memcmp(payload, expected_payload, sizeof(expected_payload) - 1) != 0) {
         return -1;
     }
@@ -10803,6 +11739,309 @@ static int test_persistent_recover_streams_single_segment_with_one_open(void) {
     ve_tls_persistent_close(&persistent);
     cleanup_persistent_dir(dir);
     return 0;
+}
+
+static int test_log_payload_rewrite_time_updates_encoded_log(void) {
+    ve_tls_kv kv = {"message", "rewrite"};
+    ve_tls_log_group_builder * old_builder = ve_tls_log_builder_create("");
+    ve_tls_log_group_builder * new_builder = ve_tls_log_builder_create("");
+    unsigned char * rewritten = NULL;
+    size_t rewritten_size = 0;
+    if (!old_builder || !new_builder ||
+        ve_tls_log_builder_add_kv_lens(old_builder, 1, 127, 0, 0, &kv, NULL, NULL, 1) != 0 ||
+        ve_tls_log_builder_add_kv_lens(new_builder, 1, 1710000000000LL, 0, 0, &kv, NULL, NULL, 1) != 0 ||
+        ve_tls_log_payload_rewrite_time(
+            old_builder->logs,
+            old_builder->logs_len,
+            1710000000000LL,
+            &rewritten,
+            &rewritten_size) != 0 ||
+        rewritten_size != new_builder->logs_len ||
+        memcmp(rewritten, new_builder->logs, rewritten_size) != 0) {
+        ve_tls_free(rewritten);
+        ve_tls_log_builder_free(old_builder);
+        ve_tls_log_builder_free(new_builder);
+        return -1;
+    }
+    ve_tls_free(rewritten);
+    rewritten = NULL;
+    rewritten_size = 0;
+    if (ve_tls_log_payload_rewrite_time(
+            (const unsigned char *)"invalid", 7, 1000, &rewritten, &rewritten_size) != -2 ||
+        rewritten != NULL || rewritten_size != 0) {
+        ve_tls_log_builder_free(old_builder);
+        ve_tls_log_builder_free(new_builder);
+        return -2;
+    }
+    ve_tls_log_builder_free(old_builder);
+    ve_tls_log_builder_free(new_builder);
+    return 0;
+}
+
+static int test_init_persistent_v2_config(ve_tls_config * cfg, const char * dir) {
+    if (!cfg || !dir || ve_tls_config_init_versioned(
+            cfg, sizeof(*cfg), VE_TLS_CONFIG_VERSION_CURRENT) != VE_TLS_OK) {
+        return -1;
+    }
+    cfg->endpoint = "https://example.com";
+    cfg->region = "cn-beijing";
+    cfg->topic_id = "t";
+    cfg->access_key_id = "ak";
+    cfg->access_key_secret = "sk";
+    cfg->retry_policy.max_attempts = 1;
+    cfg->flush_interval_ms = 0;
+    cfg->agg_strategy = 0;
+    cfg->compress_type = "none";
+    cfg->use_persistent = 1;
+    cfg->persistent_file_path = dir;
+    cfg->max_persistent_log_count = 64;
+    cfg->max_persistent_file_size = 4096;
+    cfg->max_persistent_file_count = 4;
+    cfg->platform.time_ms = test_fake_time_ms;
+    cfg->http_client.free_response = test_http_ok_free;
+    return 0;
+}
+
+static int test_append_persistent_encoded_log(
+    const char * dir,
+    int64_t enqueue_time_ms,
+    int64_t log_time_ms
+) {
+    ve_tls_config cfg;
+    ve_tls_kv kv = {"message", "max-age"};
+    ve_tls_log_group_builder * builder = NULL;
+    ve_tls_producer * producer = NULL;
+    if (test_init_persistent_v2_config(&cfg, dir) != 0) return -1;
+    g_fake_time = enqueue_time_ms;
+    producer = ve_tls_producer_create_versioned(
+        &cfg, sizeof(cfg), VE_TLS_CONFIG_VERSION_CURRENT);
+    builder = ve_tls_log_builder_create("");
+    if (!producer || !producer->persistent || !builder ||
+        ve_tls_log_builder_add_kv_lens(
+            builder, 1, log_time_ms, 0, 0, &kv, NULL, NULL, 1) != 0) {
+        ve_tls_log_builder_free(builder);
+        ve_tls_producer_destroy(producer);
+        return -1;
+    }
+    producer->config.platform.mutex_lock(producer->persistent_mutex);
+    int rc = ve_tls_persistent_append(
+        producer->persistent, 1, NULL, builder->logs, builder->logs_len);
+    producer->config.platform.mutex_unlock(producer->persistent_mutex);
+    ve_tls_log_builder_free(builder);
+    ve_tls_producer_destroy(producer);
+    return rc == 0 ? 0 : -1;
+}
+
+static int test_run_persistent_auth_policy(
+    ve_tls_persistent_auth_failure_policy policy,
+    int expect_recover,
+    int failure_kind
+) {
+    char dir[PATH_MAX];
+    ve_tls_config cfg;
+    ve_tls_producer * producer = NULL;
+    ve_tls_metrics metrics;
+    if (make_temp_dir(dir, sizeof(dir)) != 0 ||
+        test_init_persistent_v2_config(&cfg, dir) != 0) {
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    cfg.persistent_auth_failure_policy = policy;
+    if (failure_kind == 401) {
+        cfg.http_client.do_request = test_http_step_status_401_plain_do;
+    } else if (failure_kind == 403) {
+        cfg.http_client.do_request = test_http_step_status_403_plain_do;
+    } else {
+        cfg.access_key_id = NULL;
+        cfg.access_key_secret = NULL;
+        cfg.credentials_provider = sender_creds_provider_always_fail;
+        cfg.http_client.do_request = test_http_ok_do;
+    }
+    producer = ve_tls_producer_create_versioned(
+        &cfg, sizeof(cfg), VE_TLS_CONFIG_VERSION_CURRENT);
+    if (!producer || ve_tls_producer_add_log_raw(
+            producer, "auth", strlen("auth"), 1) != VE_TLS_OK) {
+        ve_tls_producer_destroy(producer);
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    for (int i = 0; i < 300; i++) {
+        memset(&metrics, 0, sizeof(metrics));
+        ve_tls_producer_get_metrics(producer, &metrics);
+        if (metrics.requests_failed_total >= 1) break;
+        cfg.platform.sleep_ms(10);
+    }
+    int64_t acked = test_producer_checkpoint_acked_log_id(producer);
+    int dropped_ok = expect_recover
+        ? metrics.logs_dropped_total == 0
+        : metrics.logs_dropped_total == 1 && metrics.bytes_dropped_total == strlen("auth");
+    if (ve_tls_producer_close(producer, 10000) != VE_TLS_OK ||
+        (expect_recover ? acked != 0 : acked < 1) || !dropped_ok) {
+        ve_tls_producer_destroy(producer);
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    ve_tls_producer_destroy(producer);
+
+    cfg.credentials_provider = NULL;
+    cfg.access_key_id = "ak";
+    cfg.access_key_secret = "sk";
+    cfg.http_client.do_request = test_http_ok_do;
+    producer = ve_tls_producer_create_versioned(
+        &cfg, sizeof(cfg), VE_TLS_CONFIG_VERSION_CURRENT);
+    if (!producer || ve_tls_producer_recover(producer) != VE_TLS_OK ||
+        ve_tls_producer_close(producer, 10000) != VE_TLS_OK) {
+        ve_tls_producer_destroy(producer);
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    memset(&metrics, 0, sizeof(metrics));
+    ve_tls_producer_get_metrics(producer, &metrics);
+    int ok = expect_recover
+        ? (metrics.logs_enqueued_total == 1 && metrics.requests_total == 1)
+        : (metrics.logs_enqueued_total == 0 && metrics.requests_total == 0);
+    ve_tls_producer_destroy(producer);
+    cleanup_persistent_dir(dir);
+    return ok ? 0 : -1;
+}
+
+static int test_persistent_auth_failure_retain_drop_policy(void) {
+    if (test_run_persistent_auth_policy(VE_TLS_PAUTH_RETAIN, 1, 403) != 0) return -1;
+    if (test_run_persistent_auth_policy(VE_TLS_PAUTH_DROP, 0, 403) != 0) return -2;
+    if (test_run_persistent_auth_policy(VE_TLS_PAUTH_RETAIN, 1, 401) != 0) return -3;
+    if (test_run_persistent_auth_policy(VE_TLS_PAUTH_DROP, 0, 401) != 0) return -4;
+    if (test_run_persistent_auth_policy(VE_TLS_PAUTH_RETAIN, 1, 0) != 0) return -5;
+    if (test_run_persistent_auth_policy(VE_TLS_PAUTH_DROP, 0, 0) != 0) return -6;
+    return 0;
+}
+
+static int test_persistent_max_age_rewrite_drop_and_unknown_time(void) {
+    char rewrite_dir[PATH_MAX] = {0};
+    char drop_dir[PATH_MAX] = {0};
+    char unknown_dir[PATH_MAX] = {0};
+    ve_tls_config cfg;
+    ve_tls_kv kv = {"message", "max-age"};
+    ve_tls_log_group_builder * expected = NULL;
+    ve_tls_producer * producer = NULL;
+    ve_tls_metrics metrics;
+    int failed = 0;
+    if (make_temp_dir(rewrite_dir, sizeof(rewrite_dir)) != 0 ||
+        make_temp_dir(drop_dir, sizeof(drop_dir)) != 0 ||
+        make_temp_dir(unknown_dir, sizeof(unknown_dir)) != 0 ||
+        test_append_persistent_encoded_log(rewrite_dir, 1000, 1234) != 0 ||
+        test_append_persistent_encoded_log(drop_dir, 1000, 1234) != 0 ||
+        test_append_persistent_encoded_log(unknown_dir, 0, 1234) != 0) {
+        failed = 1;
+        goto cleanup;
+    }
+
+    if (test_init_persistent_v2_config(&cfg, rewrite_dir) != 0) {
+        failed = 1;
+        goto cleanup;
+    }
+    cfg.persistent_max_log_delay_ms = -1;
+    producer = ve_tls_producer_create_versioned(
+        &cfg, sizeof(cfg), VE_TLS_CONFIG_VERSION_CURRENT);
+    if (producer) {
+        failed = 1;
+        goto cleanup;
+    }
+
+    if (test_init_persistent_v2_config(&cfg, rewrite_dir) != 0) {
+        failed = 1;
+        goto cleanup;
+    }
+    g_fake_time = 10000;
+    cfg.persistent_max_log_delay_ms = 5000;
+    cfg.persistent_expired_log_policy = VE_TLS_PEXPIRED_REWRITE;
+    cfg.http_client.do_request = test_http_capture_rewritten_payload_do;
+    expected = ve_tls_log_builder_create("");
+    if (!expected || ve_tls_log_builder_add_kv_lens(
+            expected, 1, 10000, 0, 0, &kv, NULL, NULL, 1) != 0) {
+        failed = 1;
+        goto cleanup;
+    }
+    g_rewrite_expected_payload = expected->logs;
+    g_rewrite_expected_payload_size = expected->logs_len;
+    __atomic_store_n(&g_rewrite_http_calls, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_rewrite_payload_matched, 0, __ATOMIC_RELAXED);
+    producer = ve_tls_producer_create_versioned(
+        &cfg, sizeof(cfg), VE_TLS_CONFIG_VERSION_CURRENT);
+    if (!producer || ve_tls_producer_recover(producer) != VE_TLS_OK ||
+        ve_tls_producer_close(producer, 10000) != VE_TLS_OK ||
+        __atomic_load_n(&g_rewrite_http_calls, __ATOMIC_ACQUIRE) != 1 ||
+        !__atomic_load_n(&g_rewrite_payload_matched, __ATOMIC_ACQUIRE)) {
+        failed = 1;
+        goto cleanup;
+    }
+    ve_tls_producer_destroy(producer);
+    producer = NULL;
+    ve_tls_log_builder_free(expected);
+    expected = NULL;
+
+    if (test_init_persistent_v2_config(&cfg, drop_dir) != 0) {
+        failed = 1;
+        goto cleanup;
+    }
+    g_fake_time = 10000;
+    cfg.persistent_max_log_delay_ms = 5000;
+    cfg.persistent_expired_log_policy = VE_TLS_PEXPIRED_DROP;
+    cfg.http_client.do_request = test_http_capture_rewritten_payload_do;
+    __atomic_store_n(&g_rewrite_http_calls, 0, __ATOMIC_RELAXED);
+    producer = ve_tls_producer_create_versioned(
+        &cfg, sizeof(cfg), VE_TLS_CONFIG_VERSION_CURRENT);
+    if (!producer || ve_tls_producer_recover(producer) != VE_TLS_OK) {
+        failed = 1;
+        goto cleanup;
+    }
+    memset(&metrics, 0, sizeof(metrics));
+    ve_tls_producer_get_metrics(producer, &metrics);
+    if (metrics.logs_dropped_total != 1 ||
+        test_producer_checkpoint_acked_log_id(producer) < 1 ||
+        ve_tls_producer_close(producer, 10000) != VE_TLS_OK ||
+        __atomic_load_n(&g_rewrite_http_calls, __ATOMIC_ACQUIRE) != 0) {
+        failed = 1;
+        goto cleanup;
+    }
+    ve_tls_producer_destroy(producer);
+    producer = NULL;
+
+    if (test_init_persistent_v2_config(&cfg, unknown_dir) != 0) {
+        failed = 1;
+        goto cleanup;
+    }
+    g_fake_time = 10000;
+    cfg.persistent_max_log_delay_ms = 5000;
+    cfg.persistent_expired_log_policy = VE_TLS_PEXPIRED_DROP;
+    cfg.http_client.do_request = test_http_capture_rewritten_payload_do;
+    expected = ve_tls_log_builder_create("");
+    if (!expected || ve_tls_log_builder_add_kv_lens(
+            expected, 1, 1234, 0, 0, &kv, NULL, NULL, 1) != 0) {
+        failed = 1;
+        goto cleanup;
+    }
+    g_rewrite_expected_payload = expected->logs;
+    g_rewrite_expected_payload_size = expected->logs_len;
+    __atomic_store_n(&g_rewrite_http_calls, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_rewrite_payload_matched, 0, __ATOMIC_RELAXED);
+    producer = ve_tls_producer_create_versioned(
+        &cfg, sizeof(cfg), VE_TLS_CONFIG_VERSION_CURRENT);
+    if (!producer || ve_tls_producer_recover(producer) != VE_TLS_OK ||
+        ve_tls_producer_close(producer, 10000) != VE_TLS_OK ||
+        __atomic_load_n(&g_rewrite_http_calls, __ATOMIC_ACQUIRE) != 1 ||
+        !__atomic_load_n(&g_rewrite_payload_matched, __ATOMIC_ACQUIRE)) {
+        failed = 1;
+    }
+
+cleanup:
+    g_rewrite_expected_payload = NULL;
+    g_rewrite_expected_payload_size = 0;
+    ve_tls_producer_destroy(producer);
+    ve_tls_log_builder_free(expected);
+    cleanup_persistent_dir(rewrite_dir);
+    cleanup_persistent_dir(drop_dir);
+    cleanup_persistent_dir(unknown_dir);
+    return failed ? -1 : 0;
 }
 
 static int test_persistent_sender_ack_updates_checkpoint_and_reclaims_closed_segment(void) {
@@ -13653,14 +14892,14 @@ static int t_p2_update_creds_paths(void) {
         ve_tls_producer_destroy(p); return -7;
     }
     /* alloc fail in strdup endpoint */
-    ve_tls_alloc_fault_inject("update_creds", 0, 1);
+    ve_tls_alloc_fault_inject("update_endpoint", 0, 1);
     ve_tls_result rc = ve_tls_producer_update_endpoint(p, "https://yet-another.example.com", NULL, NULL);
     ve_tls_alloc_fault_inject(NULL, 0, 0);
     if (rc != VE_TLS_DROP_ERROR) {
         ve_tls_producer_destroy(p); return -8;
     }
     /* alloc fail in strdup access_key_id */
-    ve_tls_alloc_fault_inject("update_creds", 0, 1);
+    ve_tls_alloc_fault_inject("update_credentials", 0, 1);
     rc = ve_tls_producer_update_static_credentials(p, "ak4", "sk4", NULL);
     ve_tls_alloc_fault_inject(NULL, 0, 0);
     if (rc != VE_TLS_DROP_ERROR) {
@@ -15148,6 +16387,7 @@ int main(void) {
     RUN(60, test_sender_retries_429_then_ok());
     RUN(61, test_sender_http_400_no_retry());
     RUN(62, test_sender_transport_retryable_then_ok());
+    RUN(309, test_sender_retries_504_then_ok());
     RUN(66, test_sender_http_rc_minus1_defaults_error());
     RUN(67, test_sender_http_500_sets_badresponse());
     RUN(68, test_sender_unsupported_compress_type_drops_before_http());
@@ -15262,6 +16502,11 @@ int main(void) {
     RUN(25, test_runtime_config_update_effective_for_new_requests());
     RUN(148, test_update_endpoint_allows_inflight_old_request_and_converges_new_requests());
     RUN(109, test_runtime_snapshot_reflects_runtime_updates());
+    RUN(307, test_runtime_endpoint_update_snapshot_alloc_failure_is_atomic());
+    RUN(308, test_runtime_credentials_update_snapshot_alloc_failure_is_atomic());
+    RUN(313, test_runtime_updates_concurrent_with_senders());
+    RUN(314, test_runtime_update_inflight_blocks_destroy());
+    RUN(315, test_credentials_owned_copies_are_zeroed_before_free());
     RUN(110, test_obj_pool_reuses_recent_item());
     RUN(26, test_runtime_update_rejected_during_close());
     RUN(27, test_sender_builds_headers_and_http_options());
@@ -15318,6 +16563,9 @@ int main(void) {
     RUN(131, test_persistent_recover_requeues_hash_key_record());
     RUN(145, test_persistent_recover_batches_multiple_logs_into_single_request());
     RUN(160, test_persistent_recover_streams_single_segment_with_one_open());
+    RUN(310, test_log_payload_rewrite_time_updates_encoded_log());
+    RUN(311, test_persistent_auth_failure_retain_drop_policy());
+    RUN(312, test_persistent_max_age_rewrite_drop_and_unknown_time());
     RUN(132, test_persistent_sender_ack_updates_checkpoint_and_reclaims_closed_segment());
     RUN(182, test_persistent_retry_exhausted_retains_and_recovers());
     RUN(183, test_persistent_key_queue_failure_retains_and_recovers());

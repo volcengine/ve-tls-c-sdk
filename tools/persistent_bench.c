@@ -16,9 +16,10 @@ static int64_t now_ms(ve_tls_platform * platform) {
     return platform && platform->time_ms ? platform->time_ms() : 0;
 }
 
-static int on_recover_record(int64_t log_id, const char * hash_key, const unsigned char * payload, size_t payload_size, void * user) {
+static int on_recover_record(int64_t log_id, int64_t enqueue_time_ms, const char * hash_key, const unsigned char * payload, size_t payload_size, void * user) {
     recover_ctx * ctx = (recover_ctx *)user;
     (void)log_id;
+    (void)enqueue_time_ms;
     (void)hash_key;
     (void)payload;
     (void)payload_size;

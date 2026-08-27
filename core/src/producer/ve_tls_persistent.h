@@ -96,7 +96,18 @@ typedef struct ve_tls_persistent ve_tls_persistent;
 int ve_tls_persistent_open(ve_tls_persistent * persistent, const ve_tls_persistent_options * options);
 void ve_tls_persistent_close(ve_tls_persistent * persistent);
 int ve_tls_persistent_append(ve_tls_persistent * persistent, int64_t log_id, const char * hash_key, const unsigned char * payload, size_t payload_size);
-int ve_tls_persistent_recover(ve_tls_persistent * persistent, int (*on_record)(int64_t log_id, const char * hash_key, const unsigned char * payload, size_t payload_size, void * user), void * user);
+int ve_tls_persistent_recover(
+    ve_tls_persistent * persistent,
+    int (*on_record)(
+        int64_t log_id,
+        int64_t enqueue_time_ms,
+        const char * hash_key,
+        const unsigned char * payload,
+        size_t payload_size,
+        void * user
+    ),
+    void * user
+);
 int ve_tls_persistent_ack_range(ve_tls_persistent * persistent, int64_t start_id, int64_t end_id);
 int ve_tls_persistent_heartbeat_if_due(ve_tls_persistent * persistent, int force);
 int ve_tls_persistent_flush(ve_tls_persistent * persistent);

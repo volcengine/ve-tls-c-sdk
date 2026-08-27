@@ -25,6 +25,7 @@ HTTP 状态码：
 - `500`
 - `502`
 - `503`
+- `504`
 
 常见网络错误：
 
@@ -59,8 +60,9 @@ Memory 模式会在本轮结束后释放该批次。Persistent 模式不会 ACK 
 ## Persistent 下的处理边界
 
 - 批次最终成功后，SDK 会推进 checkpoint。
-- 所有发送失败都不推进 checkpoint，包括 retryable exhausted、不可重试响应和内部 queue/budget 失败。
-- 当前没有发送失败后的公共永久 drop/quarantine 策略。无法发送的毒丸记录会在 recover 时继续出现，接入方应监控失败 callback 并隔离错误配置或 payload。
+- 默认情况下发送失败不推进 checkpoint，包括 retryable exhausted、不可重试响应和内部 queue/budget 失败。
+- `401/403` 和凭证刷新失败会分类为 authentication failure。`VE_TLS_PAUTH_RETAIN` 是兼容默认，保留 WAL；只有用户显式选择 `VE_TLS_PAUTH_DROP` 时才把对应范围作为终态 drop 推进 checkpoint。发送 callback 仍报告本轮失败。
+- 除显式认证 drop 和 persistent max-age drop 外，当前没有发送失败后的通用永久 drop/quarantine 策略。无法发送的毒丸记录会在 recover 时继续出现，接入方应监控失败 callback 并隔离错误配置或 payload。
 - success callback 与 checkpoint 持久化之间存在窗口；进程在这个窗口崩溃时，recover 可能重放少量已经成功发送过的日志。
 - checkpoint 保存失败会保留 dirty 状态，并通过 `persistent_checkpoint_save_failed` metric 暴露对应 log id 范围。
 - 如果网络长期不可用，日志会继续占用 persistent 空间，直到触发 overflow policy。

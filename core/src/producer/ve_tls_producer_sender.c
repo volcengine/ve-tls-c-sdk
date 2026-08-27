@@ -146,7 +146,43 @@ static void ve_tls_key_breaker_on_final_result(ve_tls_producer * producer, ve_tl
 }
 
 static int ve_tls_is_retryable_http(int32_t code) {
-    return code == 429 || code == 500 || code == 502 || code == 503;
+    return code == 429 || code == 500 || code == 502 || code == 503 || code == 504;
+}
+
+static int ve_tls_is_authentication_failure(const ve_tls_error * error) {
+    if (!error) {
+        return 0;
+    }
+    if (error->http_code == 401 || error->http_code == 403) {
+        return 1;
+    }
+    return error->error_code &&
+        strcmp(error->error_code, "CredentialsRefreshFailed") == 0;
+}
+
+static void ve_tls_persistent_on_delivery_failure(
+    ve_tls_producer * producer,
+    const ve_tls_error * error,
+    int32_t log_count,
+    size_t log_bytes,
+    int64_t start_id,
+    int64_t end_id
+) {
+    if (!producer ||
+        producer->config.persistent_auth_failure_policy != VE_TLS_PAUTH_DROP ||
+        !ve_tls_is_authentication_failure(error)) {
+        return;
+    }
+    uint64_t dropped_logs = log_count > 0 ? (uint64_t)log_count : 1u;
+    ve_tls_metric_inc_u64(&producer->m_logs_dropped_total, dropped_logs);
+    ve_tls_metric_inc_u64(&producer->m_bytes_dropped_total, log_bytes);
+    ve_tls_metrics_emit(producer, "persistent_auth_failure_drop", start_id, end_id);
+    ve_tls_metrics_emit(
+        producer,
+        "log_dropped",
+        dropped_logs > (uint64_t)INT64_MAX ? INT64_MAX : (int64_t)dropped_logs,
+        log_bytes > (size_t)INT64_MAX ? INT64_MAX : (int64_t)log_bytes);
+    ve_tls_persistent_on_final_result(producer, VE_TLS_OK, start_id, end_id);
 }
 
 static char * ve_tls_strdup_n(const char * s, size_t n) {
@@ -277,9 +313,14 @@ static char * ve_tls_extract_host(const char * endpoint) {
 }
 
 static void ve_tls_header_buf_release(ve_tls_producer * producer, char * buf, int pooled) {
+    size_t clear_size;
     if (!buf) {
         return;
     }
+    clear_size = pooled && producer && producer->header_buf_pool.obj_size > 0
+        ? producer->header_buf_pool.obj_size
+        : strlen(buf);
+    ve_tls_secure_zero(buf, clear_size);
     if (pooled && producer && producer->header_buf_pool.obj_size > 0) {
         ve_tls_obj_pool_put(&producer->header_buf_pool, buf);
         return;
@@ -476,9 +517,9 @@ static void ve_tls_owned_credentials_free(ve_tls_owned_credentials * owned) {
     if (!owned) {
         return;
     }
-    ve_tls_free(owned->access_key_id);
-    ve_tls_free(owned->access_key_secret);
-    ve_tls_free(owned->security_token);
+    ve_tls_secure_free_str(&owned->access_key_id);
+    ve_tls_secure_free_str(&owned->access_key_secret);
+    ve_tls_secure_free_str(&owned->security_token);
     memset(owned, 0, sizeof(*owned));
 }
 
@@ -486,9 +527,9 @@ static void ve_tls_static_cred_cache_free(ve_tls_static_cred_cache * cache) {
     if (!cache) {
         return;
     }
-    ve_tls_free(cache->access_key_id);
-    ve_tls_free(cache->access_key_secret);
-    ve_tls_free(cache->security_token);
+    ve_tls_secure_free_str(&cache->access_key_id);
+    ve_tls_secure_free_str(&cache->access_key_secret);
+    ve_tls_secure_free_str(&cache->security_token);
     memset(cache, 0, sizeof(*cache));
 }
 
@@ -519,6 +560,7 @@ static int ve_tls_static_cred_cache_refresh(ve_tls_producer * producer, ve_tls_s
     char * sk = NULL;
     char * tok = NULL;
     int64_t version = 0;
+    int token_required = 0;
     const ve_tls_runtime_snapshot * snapshot = ve_tls_snapshot_acquire_static_cred(producer, &version);
     if (!snapshot) {
         return -2;
@@ -526,11 +568,12 @@ static int ve_tls_static_cred_cache_refresh(ve_tls_producer * producer, ve_tls_s
     ak = snapshot->access_key_id ? ve_tls_strdup(snapshot->access_key_id) : NULL;
     sk = snapshot->access_key_secret ? ve_tls_strdup(snapshot->access_key_secret) : NULL;
     tok = snapshot->security_token ? ve_tls_strdup(snapshot->security_token) : NULL;
+    token_required = snapshot->security_token != NULL;
     ve_tls_runtime_snapshot_release(snapshot);
-    if (!ak || !sk) {
-        ve_tls_free(ak);
-        ve_tls_free(sk);
-        ve_tls_free(tok);
+    if (!ak || !sk || (token_required && !tok)) {
+        ve_tls_secure_free_str(&ak);
+        ve_tls_secure_free_str(&sk);
+        ve_tls_secure_free_str(&tok);
         return -1;
     }
     ve_tls_static_cred_cache_free(cache);
@@ -576,11 +619,13 @@ static int ve_tls_get_dynamic_credentials_owned(
         }
 
         if (!need) {
+            int token_required = producer->cred_security_token != NULL;
             owned->access_key_id = producer->cred_access_key_id ? ve_tls_strdup(producer->cred_access_key_id) : NULL;
             owned->access_key_secret = producer->cred_access_key_secret ? ve_tls_strdup(producer->cred_access_key_secret) : NULL;
             owned->security_token = producer->cred_security_token ? ve_tls_strdup(producer->cred_security_token) : NULL;
             producer->config.platform.mutex_unlock(producer->mutex);
-            if (!owned->access_key_id || !owned->access_key_secret) {
+            if (!owned->access_key_id || !owned->access_key_secret ||
+                (token_required && !owned->security_token)) {
                 ve_tls_owned_credentials_free(owned);
                 return -1;
             }
@@ -592,11 +637,13 @@ static int ve_tls_get_dynamic_credentials_owned(
 
         if (min_int > 0 && producer->cred_last_refresh_ms > 0 && now_ms - producer->cred_last_refresh_ms < min_int) {
             if (have) {
+                int token_required = producer->cred_security_token != NULL;
                 owned->access_key_id = producer->cred_access_key_id ? ve_tls_strdup(producer->cred_access_key_id) : NULL;
                 owned->access_key_secret = producer->cred_access_key_secret ? ve_tls_strdup(producer->cred_access_key_secret) : NULL;
                 owned->security_token = producer->cred_security_token ? ve_tls_strdup(producer->cred_security_token) : NULL;
                 producer->config.platform.mutex_unlock(producer->mutex);
-                if (!owned->access_key_id || !owned->access_key_secret) {
+                if (!owned->access_key_id || !owned->access_key_secret ||
+                    (token_required && !owned->security_token)) {
                     ve_tls_owned_credentials_free(owned);
                     return -1;
                 }
@@ -620,14 +667,16 @@ static int ve_tls_get_dynamic_credentials_owned(
         producer->config.platform.mutex_lock(producer->mutex);
         producer->cred_last_refresh_ms = now_ms;
         if (prc == 0 && creds.access_key_id && creds.access_key_secret) {
+            int token_required = creds.security_token && creds.security_token[0] != 0;
             ve_tls_secure_free_str(&producer->cred_access_key_id);
             ve_tls_secure_free_str(&producer->cred_access_key_secret);
             ve_tls_secure_free_str(&producer->cred_security_token);
             producer->cred_access_key_id = ve_tls_strdup(creds.access_key_id);
             producer->cred_access_key_secret = ve_tls_strdup(creds.access_key_secret);
-            producer->cred_security_token = (creds.security_token && creds.security_token[0] != 0) ? ve_tls_strdup(creds.security_token) : NULL;
+            producer->cred_security_token = token_required ? ve_tls_strdup(creds.security_token) : NULL;
             producer->cred_expire_ms = creds.expire_time_ms;
-            if (!producer->cred_access_key_id || !producer->cred_access_key_secret) {
+            if (!producer->cred_access_key_id || !producer->cred_access_key_secret ||
+                (token_required && !producer->cred_security_token)) {
                 ve_tls_secure_free_str(&producer->cred_access_key_id);
                 ve_tls_secure_free_str(&producer->cred_access_key_secret);
                 ve_tls_secure_free_str(&producer->cred_security_token);
@@ -1103,7 +1152,10 @@ static int ve_tls_send_put_logs(ve_tls_producer * producer, const char * access_
         ve_tls_error_parse_body_fields(out_error, resp.body, resp.body_size);
         if (resp.status_code != 200) {
             if (!out_error->error_code) {
-                out_error->error_code = ve_tls_strdup("BadResponse");
+                out_error->error_code = ve_tls_strdup(
+                    (resp.status_code == 401 || resp.status_code == 403)
+                        ? "AuthenticationFailed"
+                        : "BadResponse");
             }
             if (!out_error->error_message) {
                 out_error->error_message = resp.body ? ve_tls_dup_body_limited(resp.body, resp.body_size) : ve_tls_strdup("non-200 response");
@@ -1333,6 +1385,8 @@ have_task: {
         ve_tls_metric_inc_u64(&producer->m_requests_failed_total, 1);
         ve_tls_metrics_emit(producer, "send_failed", total_ms, err.http_code);
         char * msg = ve_tls_error_build_message(&err);
+        ve_tls_persistent_on_delivery_failure(
+            producer, &err, task.log_count, task.batch_bytes, task.start_id, task.end_id);
         ve_tls_persistent_on_final_result(producer, VE_TLS_DROP_ERROR, task.start_id, task.end_id);
         ve_tls_send_callbacks cbs = ve_tls_capture_callbacks(producer);
         if (cbs.cb) {
@@ -1480,6 +1534,8 @@ static void * ve_tls_sender_main_fast(void * arg) {
             ve_tls_metric_inc_u64(&producer->m_requests_failed_total, 1);
             ve_tls_metrics_emit(producer, "send_failed", total_ms, err.http_code);
             char * msg = ve_tls_error_build_message(&err);
+            ve_tls_persistent_on_delivery_failure(
+                producer, &err, task.log_count, task.batch_bytes, task.start_id, task.end_id);
             ve_tls_persistent_on_final_result(producer, VE_TLS_DROP_ERROR, task.start_id, task.end_id);
             ve_tls_send_callbacks cbs = ve_tls_capture_callbacks(producer);
             if (cbs.cb) {
@@ -1795,6 +1851,8 @@ next_task:
             ve_tls_metric_inc_u64(&producer->m_requests_failed_total, 1);
             ve_tls_metrics_emit(producer, "send_failed", total_ms, err.http_code);
             char * msg = ve_tls_error_build_message(&err);
+            ve_tls_persistent_on_delivery_failure(
+                producer, &err, task.log_count, task.batch_bytes, task.start_id, task.end_id);
             ve_tls_persistent_on_final_result(producer, VE_TLS_DROP_ERROR, task.start_id, task.end_id);
             ve_tls_send_callbacks cbs = ve_tls_capture_callbacks(producer);
             if (cbs.cb) {
