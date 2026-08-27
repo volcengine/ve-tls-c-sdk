@@ -1,0 +1,83 @@
+name: C CI
+
+on:
+  pull_request:
+    branches:
+      - persistent
+  push:
+    branches:
+      - persistent
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: c-ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: static-release
+            build_dir: build/static-release
+            cc: gcc
+            cxx: g++
+            cmake_args: >-
+              -DCMAKE_BUILD_TYPE=Release
+              -DBUILD_SHARED_LIBS=OFF
+              -DVE_TLS_ENABLE_CURL=OFF
+              -DVE_TLS_ENABLE_ZLIB=OFF
+              -DVE_TLS_BUILD_TESTS=ON
+              -DVE_TLS_BUILD_TOOLS=ON
+          - name: shared-abi
+            build_dir: build/shared-abi
+            cc: gcc
+            cxx: g++
+            cmake_args: >-
+              -DCMAKE_BUILD_TYPE=Release
+              -DBUILD_SHARED_LIBS=ON
+              -DVE_TLS_ENABLE_CURL=OFF
+              -DVE_TLS_ENABLE_ZLIB=OFF
+              -DVE_TLS_BUILD_TESTS=ON
+              -DVE_TLS_BUILD_TOOLS=OFF
+          - name: asan-ubsan
+            build_dir: build/asan-ubsan
+            cc: clang
+            cxx: clang++
+            cmake_args: >-
+              -DCMAKE_BUILD_TYPE=Debug
+              -DBUILD_SHARED_LIBS=OFF
+              -DVE_TLS_ENABLE_CURL=OFF
+              -DVE_TLS_ENABLE_ZLIB=OFF
+              -DVE_TLS_BUILD_TESTS=ON
+              -DVE_TLS_BUILD_TOOLS=OFF
+              -DVE_TLS_ENABLE_ASAN=ON
+              -DVE_TLS_ENABLE_UBSAN=ON
+
+    env:
+      CC: ${{ matrix.cc }}
+      CXX: ${{ matrix.cxx }}
+      CMAKE_BUILD_PARALLEL_LEVEL: 2
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Configure
+        run: cmake -S . -B "${{ matrix.build_dir }}" ${{ matrix.cmake_args }}
+
+      - name: Build
+        run: cmake --build "${{ matrix.build_dir }}"
+
+      - name: Test
+        env:
+          ASAN_OPTIONS: abort_on_error=1:detect_leaks=0
+          UBSAN_OPTIONS: halt_on_error=1
+        run: ctest --test-dir "${{ matrix.build_dir }}" --output-on-failure --timeout 180
