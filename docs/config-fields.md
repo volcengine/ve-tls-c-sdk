@@ -109,12 +109,13 @@
 | `persistent_max_bytes` | 文件大小乘文件数 | 本地持久化总字节上限。 |
 | `persistent_max_records` | `max_persistent_log_count` | 本地持久化总记录上限。 |
 | `persistent_max_segments` | `max_persistent_file_count` | segment 总数上限。 |
-| `persistent_high_watermark_pct` | `85` | 超过软水位后优先尝试回收已 ack segment。 |
-| `persistent_low_watermark_pct` | `70` | 回收后的目标低水位。 |
+| `persistent_high_watermark_pct` | `85` | bytes、records、segments 任一已配置维度达到该比例时，触发已 ack closed segment 回收。 |
+| `persistent_low_watermark_pct` | `70` | 压力回收持续到所有已配置维度都不高于该比例，或没有可回收 segment。必须满足 `0 < low < high <= 100`。 |
 | `persistent_overflow_policy` | `VE_TLS_POVERFLOW_REJECT_NEW` | 空间不足时拒绝新日志、阻塞、丢最老未 ack segment 或采样丢弃新日志。 |
 | `persistent_sample_every_n` | `10` | `DROP_NEWEST_SAMPLE` 策略下的采样间隔。 |
 | `persistent_block_timeout_ms` | `1000` | `BLOCK` 策略下等待可用空间的最长时间。 |
 | `persistent_lease_timeout_ms` | `60000` | owner stale 判定时间。 |
 | `persistent_heartbeat_interval_ms` | `10000` | owner lease 心跳间隔。 |
 | `persistent_open_mode` | `VE_TLS_POPEN_TAKEOVER_IF_STALE` | `FAIL_IF_OWNED` 会在目录被占用时失败；`TAKEOVER_IF_STALE` 允许 stale 后接管。 |
-| `force_flush_disk` | `0` | 字段已暴露，但 C core 当前不把它作为每条日志 append 后强制 `fsync` 的语义。 |
+| `persistent_durability` | `VE_TLS_PDURABILITY_DEFAULT` | 默认解析为 `BUFFERED_WAL`；也可显式选择 `BUFFERED_WAL` 或 `SYNC_WAL`。 |
+| `force_flush_disk` | `0` | 兼容字段。durability 为 `DEFAULT` 且该值非零时映射为 `SYNC_WAL`；与显式 `BUFFERED_WAL` 同时设置会拒绝创建。 |

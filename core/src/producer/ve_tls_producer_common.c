@@ -185,10 +185,10 @@ void ve_tls_breaker_on_final_result(ve_tls_producer * producer, int ok) {
     producer->config.platform.mutex_unlock(producer->mutex);
 }
 
-void ve_tls_metric_inc_u64(uint64_t * p, uint64_t v) {
-    (void)__atomic_fetch_add(p, v, __ATOMIC_RELAXED);
+void ve_tls_metric_inc_u64(_Atomic(uint64_t) * p, uint64_t v) {
+    (void)atomic_fetch_add_explicit(p, v, memory_order_relaxed);
 }
 
-uint64_t ve_tls_metric_load_u64(uint64_t * p) {
-    return (uint64_t)__atomic_load_n(p, __ATOMIC_RELAXED);
+uint64_t ve_tls_metric_load_u64(_Atomic(uint64_t) * p) {
+    return atomic_load_explicit(p, memory_order_relaxed);
 }

@@ -47,6 +47,23 @@ static void ve_tls_android_config_view_copy_runtime_fields(const ve_tls_android_
     out->max_persistent_file_size = in->max_persistent_file_size;
     out->max_persistent_file_count = in->max_persistent_file_count;
     out->force_flush_disk = in->force_flush_disk;
+    out->persistent_durability = (ve_tls_persistent_durability)in->persistent_durability;
+    out->persistent_max_bytes = in->persistent_max_bytes;
+    out->persistent_max_records = in->persistent_max_records;
+    out->persistent_max_segments = in->persistent_max_segments;
+    if (in->persistent_high_watermark_pct > 0) {
+        out->persistent_high_watermark_pct = in->persistent_high_watermark_pct;
+    }
+    if (in->persistent_low_watermark_pct > 0) {
+        out->persistent_low_watermark_pct = in->persistent_low_watermark_pct;
+    }
+    out->persistent_overflow_policy = in->persistent_overflow_policy;
+    if (in->persistent_sample_every_n > 0) {
+        out->persistent_sample_every_n = in->persistent_sample_every_n;
+    }
+    if (in->persistent_block_timeout_ms > 0) {
+        out->persistent_block_timeout_ms = in->persistent_block_timeout_ms;
+    }
 }
 
 static int ve_tls_android_binding_sanitize_process_name(const char * in, char * out, size_t out_cap) {

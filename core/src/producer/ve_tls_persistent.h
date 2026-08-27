@@ -1,11 +1,20 @@
 #ifndef VE_TLS_PERSISTENT_H
 #define VE_TLS_PERSISTENT_H
 
+#include "ve_tls_producer.h"
 #include "ve_tls_checkpoint.h"
 #include "ve_tls_lease.h"
 #include "ve_tls_segment_store.h"
 
 #include <stdint.h>
+#include <stdatomic.h>
+
+enum {
+    VE_TLS_PERSISTENT_APPEND_REJECT_NEW = -2,
+    VE_TLS_PERSISTENT_APPEND_BLOCKED = -3,
+    VE_TLS_PERSISTENT_APPEND_SYNC_FAILED = -4,
+    VE_TLS_PERSISTENT_FLUSH_CHECKPOINT_FAILED = -5
+};
 
 typedef struct {
     ve_tls_platform * platform;
@@ -28,6 +37,7 @@ typedef struct {
     int64_t lease_timeout_ms;
     int64_t heartbeat_interval_ms;
     int open_mode;
+    ve_tls_persistent_durability durability;
 } ve_tls_persistent_options;
 
 typedef struct {
@@ -59,7 +69,9 @@ struct ve_tls_persistent {
     int64_t lease_timeout_ms;
     int64_t heartbeat_interval_ms;
     int32_t open_mode;
-    int64_t next_heartbeat_ms;
+    ve_tls_persistent_durability durability;
+    ve_tls_mutex * heartbeat_mutex;
+    _Atomic(int64_t) next_heartbeat_ms;
     uint64_t current_bytes;
     uint64_t current_records;
     uint32_t current_segments;
@@ -68,6 +80,8 @@ struct ve_tls_persistent {
     int64_t checkpoint_dirty_since_ms;
     uint32_t next_reclaim_segment_id;
     int64_t last_reclaim_acked_log_id;
+    uint64_t append_dropped_records;
+    uint64_t append_dropped_bytes;
     uint8_t checkpoint_dirty;
     uint8_t reclaim_pending;
     ve_tls_persistent_segment_meta * segment_meta;

@@ -4,7 +4,10 @@
 #include <stdint.h>
 #include <stddef.h>
 
+#include "ve_tls_export.h"
 #include "ve_tls_producer.h"
+
+VE_TLS_BEGIN_DECLS
 
 typedef ve_tls_result (*ve_tls_android_recover_fn)(ve_tls_producer * producer);
 typedef ve_tls_result (*ve_tls_android_close_fn)(ve_tls_producer * producer, int32_t timeout_ms);
@@ -56,6 +59,15 @@ typedef struct {
     int32_t max_persistent_file_size;
     int32_t max_persistent_file_count;
     int32_t force_flush_disk;
+    int32_t persistent_durability;
+    int32_t persistent_max_bytes;
+    int32_t persistent_max_records;
+    int32_t persistent_max_segments;
+    int32_t persistent_high_watermark_pct;
+    int32_t persistent_low_watermark_pct;
+    int32_t persistent_overflow_policy;
+    int32_t persistent_sample_every_n;
+    int32_t persistent_block_timeout_ms;
     int32_t destroy_wait_ms;
     int32_t destroy_flusher_wait_ms;
     int32_t destroy_sender_wait_ms;
@@ -75,27 +87,29 @@ typedef struct {
     ve_tls_android_destroy_fn destroy;
 } ve_tls_android_runtime_options;
 
-ve_tls_result ve_tls_android_binding_build_config(
+VE_TLS_API ve_tls_result ve_tls_android_binding_build_config(
     const ve_tls_android_config_view * in,
     ve_tls_config * out,
     ve_tls_android_runtime_options * runtime
 );
 
-ve_tls_result ve_tls_android_binding_build_persistent_path(
+VE_TLS_API ve_tls_result ve_tls_android_binding_build_persistent_path(
     const char * base_path,
     const char * process_name,
     char * rewritten_path,
     size_t rewritten_cap
 );
 
-ve_tls_result ve_tls_android_binding_after_create(
+VE_TLS_API ve_tls_result ve_tls_android_binding_after_create(
     ve_tls_producer * producer,
     const ve_tls_android_runtime_options * runtime
 );
 
-void ve_tls_android_binding_before_destroy(
+VE_TLS_API void ve_tls_android_binding_before_destroy(
     ve_tls_producer * producer,
     const ve_tls_android_runtime_options * runtime
 );
+
+VE_TLS_END_DECLS
 
 #endif

@@ -315,7 +315,10 @@ static void * ve_tls_env_sender_main(void * arg) {
             continue;
         }
         __atomic_store_n(&p->env_in_queue, 0, __ATOMIC_RELAXED);
-        if (p->stop) {
+        p->config.platform.mutex_lock(p->mutex);
+        int stopped = p->stop;
+        p->config.platform.mutex_unlock(p->mutex);
+        if (stopped) {
             (void)__atomic_fetch_sub(&p->env_inflight, 1, __ATOMIC_RELAXED);
             continue;
         }

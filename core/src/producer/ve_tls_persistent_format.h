@@ -8,10 +8,14 @@
 #define VE_TLS_PERSISTENT_RECORD_HEADER_SIZE 28u
 #define VE_TLS_PERSISTENT_RECORD_EXT_MAX 1024u
 #define VE_TLS_PERSISTENT_RECORD_HASH_KEY_MAX 256u
+#define VE_TLS_PERSISTENT_RECORD_VERSION_LEGACY 1u
+#define VE_TLS_PERSISTENT_RECORD_VERSION_CURRENT 2u
+#define VE_TLS_PERSISTENT_RECORD_UNSUPPORTED_VERSION (-2)
 
 #define VE_TLS_PERSISTENT_RECORD_FLAG_HAS_EXT 0x00000001u
 
 #define VE_TLS_PERSISTENT_EXT_TYPE_HASH_KEY 0x01u
+#define VE_TLS_PERSISTENT_EXT_TYPE_METADATA 0x02u
 
 typedef struct {
     int64_t log_id;
@@ -19,6 +23,8 @@ typedef struct {
     const char * hash_key;
     const unsigned char * payload;
     size_t payload_size;
+    uint32_t record_version;
+    int64_t enqueue_time_ms;
 } ve_tls_persistent_record_view;
 
 typedef struct {
@@ -27,6 +33,8 @@ typedef struct {
     char * hash_key;
     unsigned char * payload;
     size_t payload_size;
+    uint32_t record_version;
+    int64_t enqueue_time_ms;
 } ve_tls_persistent_record;
 
 size_t ve_tls_persistent_record_encoded_size(const ve_tls_persistent_record_view * view);

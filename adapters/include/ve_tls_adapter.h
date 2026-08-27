@@ -4,6 +4,10 @@
 #include <stdint.h>
 #include <stddef.h>
 
+#include "ve_tls_export.h"
+
+VE_TLS_BEGIN_DECLS
+
 typedef struct {
     int (*file_open)(const char * path, int flags, int mode);
     int (*file_close)(int fd);
@@ -17,5 +21,7 @@ typedef struct {
 } ve_tls_adapter;
 
 void ve_tls_adapter_init_default(ve_tls_adapter * adapter);
+
+VE_TLS_END_DECLS
 
 #endif

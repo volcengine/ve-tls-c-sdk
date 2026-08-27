@@ -150,7 +150,7 @@ Persistent 的可靠性边界需要说清楚：
 - SDK 提供 at-least-once。崩溃、重试和 checkpoint 持久化边界可能产生少量重复；如果业务不能接受重复，需要用业务主键或消费侧去重。
 - at-least-once 只覆盖已经成功进入 persistent 的日志。如果 `add_log` 因参数错误、内存背压或 persistent quota 返回失败，这条日志不在恢复范围内。
 - `success callback` 表示请求进入成功路径，不等于 checkpoint 已经 durable 落盘。崩溃发生在两者之间时，recover 可能重放边界内日志。
-- `force_flush_disk` 字段已经暴露，但 C core 当前不把它解释为每条日志 append 后都执行 `fsync`。
+- persistent 默认使用 buffered WAL，在 segment rotation、显式 flush 和正常 close 时同步；`force_flush_disk=1` 兼容映射为每条 append 同步的 sync WAL。新接入优先显式配置 `persistent_durability`。
 - lease 用于避免多个活跃 owner 同时写一个目录。`TAKEOVER_IF_STALE` 适合崩溃恢复，不适合多个活跃进程共享同一路径。
 - `DROP_OLDEST_UNACKED` 会牺牲完整性，只适合明确要保新丢旧的场景。
 
@@ -193,6 +193,8 @@ Persistent 相关配置：
 | `persistent_max_bytes` | 文件大小乘文件数 | persistent 总字节上限。 |
 | `persistent_max_records` | `max_persistent_log_count` | persistent 总记录上限。需要缓存更多日志时显式调大。 |
 | `persistent_max_segments` | `max_persistent_file_count` | segment 总数上限。 |
+| `persistent_high_watermark_pct` | `85` | bytes、records、segments 任一维度达到该比例时触发安全回收。 |
+| `persistent_low_watermark_pct` | `70` | 所有维度回落到该比例后停止压力回收；要求 `0 < low < high <= 100`。 |
 | `persistent_overflow_policy` | `VE_TLS_POVERFLOW_REJECT_NEW` | 空间不足时拒绝新日志、阻塞、丢最老未 ack segment 或采样丢弃新日志。 |
 | `persistent_block_timeout_ms` | `1000` | `BLOCK` 策略下等待可用空间的最长时间。 |
 | `persistent_lease_timeout_ms` | `60000` | owner stale 判定时间。 |
