@@ -115,6 +115,14 @@ static int test_android_binding_build_config_preserves_http_client_bridge(void) 
         fprintf(stderr, "user_agent was not preserved\n");
         return 1;
     }
+    if (out.persistent_high_watermark_pct != 85 ||
+        out.persistent_low_watermark_pct != 70 ||
+        out.persistent_overflow_policy != VE_TLS_POVERFLOW_REJECT_NEW ||
+        out.persistent_sample_every_n != 10 ||
+        out.persistent_block_timeout_ms != 1000) {
+        fprintf(stderr, "zero-valued Android fields should preserve C persistent defaults\n");
+        return 1;
+    }
 
     return 0;
 }
@@ -155,6 +163,14 @@ static int test_android_binding_build_persistent_path_and_clamps_sender(void) {
     in.max_persistent_file_count = 10;
     in.force_flush_disk = 1;
     in.persistent_durability = VE_TLS_PDURABILITY_SYNC_WAL;
+    in.persistent_max_bytes = 8 * 1024 * 1024;
+    in.persistent_max_records = 32768;
+    in.persistent_max_segments = 8;
+    in.persistent_high_watermark_pct = 80;
+    in.persistent_low_watermark_pct = 60;
+    in.persistent_overflow_policy = VE_TLS_POVERFLOW_BLOCK;
+    in.persistent_sample_every_n = 7;
+    in.persistent_block_timeout_ms = 2500;
 
     rc = ve_tls_android_binding_build_config(&in, &out, &runtime);
     if (rc != VE_TLS_OK) {
@@ -201,7 +217,15 @@ static int test_android_binding_build_persistent_path_and_clamps_sender(void) {
         out.max_persistent_file_size != 1048576 ||
         out.max_persistent_file_count != 10 ||
         out.force_flush_disk != 1 ||
-        out.persistent_durability != VE_TLS_PDURABILITY_SYNC_WAL) {
+        out.persistent_durability != VE_TLS_PDURABILITY_SYNC_WAL ||
+        out.persistent_max_bytes != 8 * 1024 * 1024 ||
+        out.persistent_max_records != 32768 ||
+        out.persistent_max_segments != 8 ||
+        out.persistent_high_watermark_pct != 80 ||
+        out.persistent_low_watermark_pct != 60 ||
+        out.persistent_overflow_policy != VE_TLS_POVERFLOW_BLOCK ||
+        out.persistent_sample_every_n != 7 ||
+        out.persistent_block_timeout_ms != 2500) {
         fprintf(stderr, "persistent limit fields were not copied\n");
         return 1;
     }

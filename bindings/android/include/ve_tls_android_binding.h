@@ -57,6 +57,14 @@ typedef struct {
     int32_t max_persistent_file_count;
     int32_t force_flush_disk;
     int32_t persistent_durability;
+    int32_t persistent_max_bytes;
+    int32_t persistent_max_records;
+    int32_t persistent_max_segments;
+    int32_t persistent_high_watermark_pct;
+    int32_t persistent_low_watermark_pct;
+    int32_t persistent_overflow_policy;
+    int32_t persistent_sample_every_n;
+    int32_t persistent_block_timeout_ms;
     int32_t destroy_wait_ms;
     int32_t destroy_flusher_wait_ms;
     int32_t destroy_sender_wait_ms;
