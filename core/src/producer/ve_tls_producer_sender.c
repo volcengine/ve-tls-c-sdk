@@ -1511,6 +1511,9 @@ next_task:
         producer->config.platform.mutex_lock(producer->mutex);
         for (;;) {
             int64_t now0 = producer->config.platform.time_ms ? producer->config.platform.time_ms() : 0;
+            int64_t next_heartbeat_ms = producer->persistent
+                ? atomic_load_explicit(&producer->persistent->next_heartbeat_ms, memory_order_relaxed)
+                : 0;
             int wait_sendq_ms = 0;
             ve_tls_delayed_promote_due(producer, now0);
             kq = ve_tls_ready_pop(producer);
@@ -1522,9 +1525,9 @@ next_task:
                 wait_sendq_ms = -1;
                 if (producer->persistent &&
                     producer->persistent->heartbeat_interval_ms > 0 &&
-                    producer->persistent->next_heartbeat_ms > 0 &&
+                    next_heartbeat_ms > 0 &&
                     now0 > 0) {
-                    wait_sendq_ms = (int)(producer->persistent->next_heartbeat_ms - now0);
+                    wait_sendq_ms = (int)(next_heartbeat_ms - now0);
                     if (wait_sendq_ms < 1) {
                         wait_sendq_ms = 1;
                     }

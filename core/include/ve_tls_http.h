@@ -4,6 +4,10 @@
 #include <stdint.h>
 #include <stddef.h>
 
+#include "ve_tls_export.h"
+
+VE_TLS_BEGIN_DECLS
+
 typedef enum {
     VE_TLS_TRANSPORT_NONE = 0,
     VE_TLS_TRANSPORT_CURL = 1,
@@ -60,6 +64,8 @@ struct ve_tls_http_client {
     void * user_data;
 };
 
-void ve_tls_http_response_init(ve_tls_http_response * resp);
+VE_TLS_API void ve_tls_http_response_init(ve_tls_http_response * resp);
+
+VE_TLS_END_DECLS
 
 #endif

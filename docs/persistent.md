@@ -28,14 +28,39 @@ Persistent 目录包含这些文件：
 
 每个 Producer 或进程建议使用独立目录。多个活跃进程写同一个目录会破坏语义，`lease` 只能降低误用概率，不能把它变成多写者队列。
 
+`manifest` 当前格式版本为 V2。V1 会在打开时兼容升级；未知版本或损坏内容会使打开失败，SDK 不会先覆盖原文件。WAL record V2 在扩展字段中保存 `enqueue_time_ms`，没有该字段的旧记录按 V1 读取且时间为 `0`。该时间目前只用于保留格式能力，不会自动触发过期删除。
+
+## 落盘模式
+
+| 模式 | `add_log` 成功边界 | 主动同步边界 |
+| --- | --- | --- |
+| `VE_TLS_PDURABILITY_BUFFERED_WAL` | segment `write` 成功，数据可能仍在 OS page cache | segment rotation、`ve_tls_producer_flush()` 和正常 close |
+| `VE_TLS_PDURABILITY_SYNC_WAL` | segment `write` 及该文件的 `fsync` 成功 | 每条 append；无 dirty 数据时 flush 不重复 `fsync` |
+
+`VE_TLS_PDURABILITY_DEFAULT` 当前解析为 buffered WAL。旧字段 `force_flush_disk=1` 在 durability 未显式设置时兼容映射为 sync WAL。
+
+## 容量与水位
+
+`persistent_max_bytes`、`persistent_max_records` 和 `persistent_max_segments` 是独立硬上限。预测 append 后任一维度超过硬上限时，SDK 先回收可安全删除的 durable ACK closed segment；仍无空间时才执行 overflow policy。
+
+软水位采用 hysteresis：bytes、records、segments 任一已配置维度达到 high 即触发压力回收；回收按 segment 从旧到新进行，直到所有已配置维度都不高于 low，或遇到最旧的不可回收 segment。配置必须满足 `0 < low < high <= 100`。
+
+active segment、未 durable ACK segment 和 replay cursor 对应 segment 不会被水位回收。replay cursor 形成顺序屏障，清除后后续压力回收会从该 segment 继续。
+
 ## 语义边界
 
 - SDK 提供 at-least-once。崩溃、重试和 checkpoint 持久化边界可能带来少量重复。
 - `success callback` 表示请求已经进入发送成功路径，不表示 checkpoint 已经 durable 落盘。
-- `add_log` 返回失败的日志不在恢复范围内。常见原因包括参数错误、内存背压、persistent quota 或目录错误。
-- 不可重试的终态失败会推进已处理范围，避免 recover 后无限重放毒丸日志。
+- 只有服务端请求成功才推进 checkpoint。重试预算耗尽、不可重试响应、凭证刷新失败和内部 queue/budget 暂时失败都不会隐式 ACK 已 append 的记录。
+- 发送失败 callback 描述的是本轮发送结果，不代表 persistent 记录已经永久丢弃。当前没有“发送失败后显式永久丢弃”的公共策略。
+- 本轮发送结束后，未 ACK 记录保留在 WAL 中；当前实现不会自动开启下一轮长期重试，需要进程重启或再次调用 `ve_tls_producer_recover()` 才会重新入队。
+- `add_log` 在 persistent append 之前失败时不在恢复范围内；如果 append 已成功、后续内存入队失败，接口可能返回失败但记录仍会被 recover，调用方需要用 log id 或业务主键处理潜在重复。
+- sync WAL 中，record `write` 成功但 `fsync` 失败时，`add_log` 返回 `VE_TLS_PERSISTENT_ERROR`，已写 record 仍保留并可在后续 flush/recover 中出现。调用方重试可能形成重复。
+- checkpoint 保存失败时保持 dirty，不回收对应记录，并发出 `persistent_checkpoint_save_failed` metric；metric 的两个值分别是本次完成范围的 `start_id` 和 `end_id`。
 - checkpoint 损坏时，SDK 会优先保证不漏发；代价是可能扩大重复范围。
-- 当前 C core 不对每条日志 append 执行 `fsync`。如果业务需要进程外掉电级保证，需要在上层设计额外的持久化策略。
+- WAL 中的 backlog 不绑定写入时的 endpoint、region 或 topic。调用 `ve_tls_producer_update_endpoint()` 后，尚未进入发送路径的旧 backlog 和后续 recover 记录都会使用当前 target；已经捕获发送快照的请求可能仍使用旧 target。
+- 如果业务不能接受旧 backlog 改投新 target，不要在同一个 persistent 目录上更新 target。当前 SDK 不提供 drain old target、target fingerprint 或自动拆分 store；调用更新接口表示接入方接受改投风险。
+- target 更新时若本地仍有 backlog，SDK 发出 `persistent_backlog_retarget(records, wal_bytes)` 事件用于告警，不阻止更新。
 
 如果业务不能接受重复，必须使用业务主键或消费侧去重。不要把 SDK 的 at-least-once 解释成 exactly-once。
 
@@ -43,10 +68,10 @@ Persistent 目录包含这些文件：
 
 | 策略 | 行为 | 适用场景 |
 | --- | --- | --- |
-| `VE_TLS_POVERFLOW_REJECT_NEW` | 空间不足时拒绝新日志，`add_log` 返回失败。 | 默认策略，适合不想静默丢弃的业务。 |
-| `VE_TLS_POVERFLOW_BLOCK` | 等待回收空间，超过 `persistent_block_timeout_ms` 后返回超时。 | 可以接受业务线程短暂等待的业务。 |
-| `VE_TLS_POVERFLOW_DROP_OLDEST_UNACKED` | 删除最老未 ack segment 换空间。 | 明确“保新不保旧”的场景。会牺牲 at-least-once 完整性。 |
-| `VE_TLS_POVERFLOW_DROP_NEWEST_SAMPLE` | 按 `persistent_sample_every_n` 采样丢弃新日志。 | 高峰期降采样。 |
+| `VE_TLS_POVERFLOW_REJECT_NEW` | 空间不足时拒绝新日志，旧 WAL 不变，`add_log` 返回失败。 | 默认策略，适合不想静默删除已接受日志的业务。 |
+| `VE_TLS_POVERFLOW_BLOCK` | 旧 WAL 不变；等待回收空间，超过 `persistent_block_timeout_ms` 后返回超时。 | 可以接受业务线程短暂等待的业务。 |
+| `VE_TLS_POVERFLOW_DROP_OLDEST_UNACKED` | 删除最老未 ack closed segment 换空间，并发出 `persistent_overflow_drop_oldest_unacked`。 | 明确“保新不保旧”的场景。会牺牲已接受日志的 at-least-once 完整性。 |
+| `VE_TLS_POVERFLOW_DROP_NEWEST_SAMPLE` | 按 `persistent_sample_every_n` 对新日志选择等待或拒绝；不会删除旧 WAL。 | 高峰期优先保留既有 backlog。 |
 
 ## lease 与 stale takeover
 

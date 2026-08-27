@@ -4,7 +4,10 @@
 #include <stdint.h>
 #include <stddef.h>
 
+#include "ve_tls_export.h"
 #include "ve_tls_producer.h"
+
+VE_TLS_BEGIN_DECLS
 
 typedef struct {
     unsigned char * data;
@@ -17,5 +20,7 @@ int ve_tls_proto_encode_log_group_list(const ve_tls_bytes * logs, size_t log_cou
 int ve_tls_proto_encode_log_group_list_ex(const ve_tls_bytes * logs, size_t log_count, const char * source, const char * file_name, const ve_tls_kv * log_tags, size_t log_tag_count, const char * context_flow, ve_tls_bytes * out);
 int ve_tls_proto_encode_log_group_list_ex2(const ve_tls_bytes * logs, size_t log_count, const char * source, const char * file_name, const ve_tls_kv * log_tags, size_t log_tag_count, const char * context_flow, size_t max_log_group_logs, ve_tls_bytes * out);
 void ve_tls_bytes_free(ve_tls_bytes * b);
+
+VE_TLS_END_DECLS
 
 #endif

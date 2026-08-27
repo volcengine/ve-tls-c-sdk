@@ -3,9 +3,9 @@
 
 #include <stddef.h>
 
-#ifdef __cplusplus
-extern "C" {
-#endif
+#include "ve_tls_export.h"
+
+VE_TLS_BEGIN_DECLS
 
 typedef void * (*ve_tls_malloc_fn)(size_t n, void * user_data);
 typedef void * (*ve_tls_calloc_fn)(size_t n, size_t size, void * user_data);
@@ -22,27 +22,27 @@ typedef struct {
     void * user_data;
 } ve_tls_alloc_hooks;
 
-void ve_tls_alloc_set_hooks(const ve_tls_alloc_hooks * hooks);
-void ve_tls_alloc_get_hooks(ve_tls_alloc_hooks * out_hooks);
+VE_TLS_API void ve_tls_alloc_set_hooks(const ve_tls_alloc_hooks * hooks);
+VE_TLS_API void ve_tls_alloc_get_hooks(ve_tls_alloc_hooks * out_hooks);
 
-void * ve_tls_malloc(size_t n);
-void * ve_tls_calloc(size_t n, size_t size);
-void * ve_tls_realloc(void * p, size_t n);
-void ve_tls_free(void * p);
-char * ve_tls_strdup(const char * s);
+VE_TLS_API void * ve_tls_malloc(size_t n);
+VE_TLS_API void * ve_tls_calloc(size_t n, size_t size);
+VE_TLS_API void * ve_tls_realloc(void * p, size_t n);
+VE_TLS_API void ve_tls_free(void * p);
+VE_TLS_API char * ve_tls_strdup(const char * s);
 
 /* Best-effort sensitive data cleanup helpers shared by producer/signing code. */
-void ve_tls_secure_zero(void * p, size_t n);
-void ve_tls_secure_free_str(char ** ps);
+VE_TLS_API void ve_tls_secure_zero(void * p, size_t n);
+VE_TLS_API void ve_tls_secure_free_str(char ** ps);
 
-/* === Fault injection (test-only, no-op in production) ===
- * Default state: tag == NULL, costs at most one branch in alloc paths.
- * tag == NULL clears injection. fail_after >= 0; fail_count <= 0 treated as 1. */
+#if defined(VE_TLS_ENABLE_ALLOC_FAULT_INJECT)
+/* Fault injection is a test-only interface and is not part of the public ABI. */
 void ve_tls_alloc_fault_inject(const char * tag, int fail_after, int fail_count);
 
 /* Set per-thread call-site tag for subsequent ve_tls_malloc/calloc/realloc/strdup.
  * Returns previous site (may be NULL). NULL site disables matching. */
 const char * ve_tls_alloc_set_site(const char * site);
+#endif
 
 /* VE_TLS_ALLOC_SITE 自动恢复宏（仅用于测试/调试）：
  * - 默认完全 no-op，不引入任何运行时开销，也不依赖编译器扩展，保持纯 C11 兼容；
@@ -70,8 +70,6 @@ static inline void ve_tls__site_cleanup(const char ** prev) {
 #  define VE_TLS_ALLOC_SITE(name) ((void)0)
 #endif
 
-#ifdef __cplusplus
-}
-#endif
+VE_TLS_END_DECLS
 
 #endif

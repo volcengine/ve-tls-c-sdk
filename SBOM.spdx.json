@@ -1,0 +1,47 @@
+{
+  "spdxVersion": "SPDX-2.3",
+  "dataLicense": "CC0-1.0",
+  "SPDXID": "SPDXRef-DOCUMENT",
+  "name": "ve-tls-c-sdk-0.3.0",
+  "documentNamespace": "https://github.com/volcengine/ve-tls-c-sdk/sbom/0.3.0",
+  "creationInfo": {
+    "created": "2026-08-27T00:00:00Z",
+    "creators": [
+      "Tool: ve-tls-c-sdk release process"
+    ]
+  },
+  "packages": [
+    {
+      "SPDXID": "SPDXRef-Package-ve-tls-c-sdk",
+      "name": "ve-tls-c-sdk",
+      "versionInfo": "0.3.0",
+      "downloadLocation": "https://github.com/volcengine/ve-tls-c-sdk",
+      "filesAnalyzed": false,
+      "licenseConcluded": "Apache-2.0",
+      "licenseDeclared": "Apache-2.0",
+      "copyrightText": "NOASSERTION"
+    },
+    {
+      "SPDXID": "SPDXRef-Package-lz4",
+      "name": "lz4",
+      "versionInfo": "1.7.1",
+      "downloadLocation": "https://github.com/lz4/lz4",
+      "filesAnalyzed": false,
+      "licenseConcluded": "BSD-2-Clause",
+      "licenseDeclared": "BSD-2-Clause",
+      "copyrightText": "Copyright (C) 2011-2015, Yann Collet."
+    }
+  ],
+  "relationships": [
+    {
+      "spdxElementId": "SPDXRef-DOCUMENT",
+      "relationshipType": "DESCRIBES",
+      "relatedSpdxElement": "SPDXRef-Package-ve-tls-c-sdk"
+    },
+    {
+      "spdxElementId": "SPDXRef-Package-ve-tls-c-sdk",
+      "relationshipType": "CONTAINS",
+      "relatedSpdxElement": "SPDXRef-Package-lz4"
+    }
+  ]
+}
