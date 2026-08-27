@@ -11915,6 +11915,223 @@ static int test_persistent_auth_failure_retain_drop_policy(void) {
     return 0;
 }
 
+static int g_auth_resume_http_calls;
+static int g_auth_resume_seen_old_ak;
+static int g_auth_resume_seen_new_ak;
+static int g_auth_resume_failed_callbacks;
+static int g_auth_resume_ok_callbacks;
+
+static int test_http_auth_resume_after_update_do(
+    ve_tls_http_client * client,
+    const ve_tls_http_request * req,
+    ve_tls_http_response * resp
+) {
+    (void)client;
+    if (!req || !resp || !req->headers) return -1;
+    (void)__atomic_fetch_add(&g_auth_resume_http_calls, 1, __ATOMIC_RELAXED);
+    if (strstr(req->headers, "Authorization: HMAC-SHA256 Credential=old-ak/")) {
+        __atomic_store_n(&g_auth_resume_seen_old_ak, 1, __ATOMIC_RELEASE);
+        resp->status_code = 403;
+        resp->request_id = strdup("rid-auth-old");
+        resp->body = (unsigned char *)strdup("authentication failed");
+        resp->body_size = resp->body ? strlen((const char *)resp->body) : 0;
+        return resp->request_id && resp->body ? 0 : -1;
+    }
+    if (strstr(req->headers, "Authorization: HMAC-SHA256 Credential=new-ak/")) {
+        __atomic_store_n(&g_auth_resume_seen_new_ak, 1, __ATOMIC_RELEASE);
+        resp->status_code = 200;
+        resp->request_id = strdup("rid-auth-new");
+        return resp->request_id ? 0 : -1;
+    }
+    return -1;
+}
+
+static void on_auth_resume_done_v2(
+    ve_tls_result result,
+    size_t log_bytes,
+    size_t compressed_bytes,
+    const ve_tls_error * error,
+    const unsigned char * raw_buffer,
+    void * user_param,
+    int64_t start_id,
+    int64_t end_id
+) {
+    (void)log_bytes;
+    (void)compressed_bytes;
+    (void)raw_buffer;
+    (void)user_param;
+    (void)start_id;
+    (void)end_id;
+    if (result == VE_TLS_DROP_ERROR && error && error->error_code &&
+        strcmp(error->error_code, "AuthenticationFailed") == 0) {
+        (void)__atomic_fetch_add(&g_auth_resume_failed_callbacks, 1, __ATOMIC_RELAXED);
+    } else if (result == VE_TLS_OK) {
+        (void)__atomic_fetch_add(&g_auth_resume_ok_callbacks, 1, __ATOMIC_RELAXED);
+    }
+}
+
+static int test_run_persistent_auth_retain_resume_after_update(
+    int32_t ordered_send,
+    int32_t use_global_env
+) {
+    char dir[PATH_MAX];
+    ve_tls_config cfg;
+    ve_tls_producer * producer = NULL;
+    ve_tls_metrics metrics;
+    int failed = 0;
+    __atomic_store_n(&g_auth_resume_http_calls, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_auth_resume_seen_old_ak, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_auth_resume_seen_new_ak, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_auth_resume_failed_callbacks, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_auth_resume_ok_callbacks, 0, __ATOMIC_RELAXED);
+    if (use_global_env && ve_tls_env_init(1) != VE_TLS_OK) {
+        return -1;
+    }
+    if (make_temp_dir(dir, sizeof(dir)) != 0 ||
+        test_init_persistent_v2_config(&cfg, dir) != 0) {
+        cleanup_persistent_dir(dir);
+        if (use_global_env) (void)ve_tls_env_destroy(1000);
+        return -1;
+    }
+    cfg.access_key_id = "old-ak";
+    cfg.access_key_secret = "old-sk";
+    cfg.ordered_send = ordered_send;
+    cfg.use_global_env = use_global_env;
+    cfg.persistent_auth_failure_policy = VE_TLS_PAUTH_RETAIN;
+    cfg.http_client.do_request = test_http_auth_resume_after_update_do;
+    if (ordered_send) {
+        cfg.breaker_fail_threshold = 1;
+        cfg.breaker_open_ms = 30000;
+        cfg.key_breaker_fail_threshold = 1;
+        cfg.key_breaker_open_ms = 30000;
+    }
+    producer = ve_tls_producer_create_versioned(
+        &cfg, sizeof(cfg), VE_TLS_CONFIG_VERSION_CURRENT);
+    if (producer) {
+        ve_tls_producer_set_send_done_v2(producer, on_auth_resume_done_v2, NULL);
+    }
+    if (!producer || ve_tls_producer_add_log_raw(
+            producer, "auth-resume", strlen("auth-resume"), 1) != VE_TLS_OK) {
+        failed = 1;
+        goto cleanup;
+    }
+    for (int i = 0; i < 500; i++) {
+        if (__atomic_load_n(&g_auth_resume_failed_callbacks, __ATOMIC_ACQUIRE) == 1) break;
+        cfg.platform.sleep_ms(10);
+    }
+    memset(&metrics, 0, sizeof(metrics));
+    ve_tls_producer_get_metrics(producer, &metrics);
+    if (__atomic_load_n(&g_auth_resume_seen_old_ak, __ATOMIC_ACQUIRE) != 1 ||
+        __atomic_load_n(&g_auth_resume_failed_callbacks, __ATOMIC_ACQUIRE) != 1 ||
+        __atomic_load_n(&g_auth_resume_http_calls, __ATOMIC_ACQUIRE) != 1 ||
+        metrics.requests_failed_total != 1 ||
+        test_producer_checkpoint_acked_log_id(producer) != 0) {
+        failed = 1;
+        goto cleanup;
+    }
+    cfg.platform.sleep_ms(50);
+    if (__atomic_load_n(&g_auth_resume_http_calls, __ATOMIC_ACQUIRE) != 1 ||
+        ve_tls_producer_update_static_credentials(
+            producer, "new-ak", "new-sk", NULL) != VE_TLS_OK) {
+        failed = 1;
+        goto cleanup;
+    }
+    for (int i = 0; i < 500; i++) {
+        if (__atomic_load_n(&g_auth_resume_ok_callbacks, __ATOMIC_ACQUIRE) == 1 &&
+            test_producer_checkpoint_acked_log_id(producer) >= 1) {
+            break;
+        }
+        cfg.platform.sleep_ms(10);
+    }
+    if (__atomic_load_n(&g_auth_resume_seen_new_ak, __ATOMIC_ACQUIRE) != 1 ||
+        __atomic_load_n(&g_auth_resume_ok_callbacks, __ATOMIC_ACQUIRE) != 1 ||
+        __atomic_load_n(&g_auth_resume_http_calls, __ATOMIC_ACQUIRE) != 2 ||
+        test_producer_checkpoint_acked_log_id(producer) < 1 ||
+        ve_tls_producer_close(producer, 10000) != VE_TLS_OK) {
+        failed = 1;
+    }
+
+cleanup:
+    ve_tls_producer_destroy(producer);
+    if (use_global_env && ve_tls_env_destroy(10000) != VE_TLS_OK) {
+        failed = 1;
+    }
+    cleanup_persistent_dir(dir);
+    return failed ? -1 : 0;
+}
+
+static int test_persistent_auth_retain_resumes_after_static_credentials_update(void) {
+    if (test_run_persistent_auth_retain_resume_after_update(0, 0) != 0) return -1;
+    if (test_run_persistent_auth_retain_resume_after_update(1, 0) != 0) return -2;
+    if (test_run_persistent_auth_retain_resume_after_update(1, 1) != 0) return -3;
+    return 0;
+}
+
+static int test_persistent_auth_retain_global_close_keeps_wal(void) {
+    char dir[PATH_MAX] = {0};
+    ve_tls_config cfg;
+    ve_tls_producer * producer = NULL;
+    int failed = 0;
+    __atomic_store_n(&g_auth_resume_http_calls, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_auth_resume_seen_old_ak, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_auth_resume_seen_new_ak, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_auth_resume_failed_callbacks, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_auth_resume_ok_callbacks, 0, __ATOMIC_RELAXED);
+    if (ve_tls_env_init(1) != VE_TLS_OK ||
+        make_temp_dir(dir, sizeof(dir)) != 0 ||
+        test_init_persistent_v2_config(&cfg, dir) != 0) {
+        failed = 1;
+        goto cleanup_env;
+    }
+    cfg.access_key_id = "old-ak";
+    cfg.access_key_secret = "old-sk";
+    cfg.ordered_send = 1;
+    cfg.use_global_env = 1;
+    cfg.persistent_auth_failure_policy = VE_TLS_PAUTH_RETAIN;
+    cfg.http_client.do_request = test_http_auth_resume_after_update_do;
+    producer = ve_tls_producer_create_versioned(
+        &cfg, sizeof(cfg), VE_TLS_CONFIG_VERSION_CURRENT);
+    if (producer) {
+        ve_tls_producer_set_send_done_v2(producer, on_auth_resume_done_v2, NULL);
+    }
+    if (!producer || ve_tls_producer_add_log_raw(
+            producer, "auth-close", strlen("auth-close"), 1) != VE_TLS_OK) {
+        failed = 1;
+        goto cleanup_producer;
+    }
+    for (int i = 0; i < 500; i++) {
+        if (__atomic_load_n(&g_auth_resume_failed_callbacks, __ATOMIC_ACQUIRE) == 1) break;
+        cfg.platform.sleep_ms(10);
+    }
+    if (__atomic_load_n(&g_auth_resume_http_calls, __ATOMIC_ACQUIRE) != 1 ||
+        test_producer_checkpoint_acked_log_id(producer) != 0 ||
+        ve_tls_producer_close(producer, 5000) != VE_TLS_OK) {
+        failed = 1;
+    }
+
+cleanup_producer:
+    ve_tls_producer_destroy(producer);
+cleanup_env:
+    if (ve_tls_env_destroy(5000) != VE_TLS_OK) {
+        failed = 1;
+    }
+    if (!failed && test_init_persistent_v2_config(&cfg, dir) == 0) {
+        cfg.access_key_id = "new-ak";
+        cfg.access_key_secret = "new-sk";
+        cfg.http_client.do_request = test_http_auth_resume_after_update_do;
+        producer = ve_tls_producer_create_versioned(
+            &cfg, sizeof(cfg), VE_TLS_CONFIG_VERSION_CURRENT);
+        if (!producer || ve_tls_producer_recover(producer) != VE_TLS_OK ||
+            ve_tls_producer_close(producer, 5000) != VE_TLS_OK ||
+            __atomic_load_n(&g_auth_resume_seen_new_ak, __ATOMIC_ACQUIRE) != 1) {
+            failed = 1;
+        }
+        ve_tls_producer_destroy(producer);
+    }
+    cleanup_persistent_dir(dir);
+    return failed ? -1 : 0;
+}
+
 static int test_persistent_max_age_rewrite_drop_and_unknown_time(void) {
     char rewrite_dir[PATH_MAX] = {0};
     char drop_dir[PATH_MAX] = {0};
@@ -16565,6 +16782,8 @@ int main(void) {
     RUN(160, test_persistent_recover_streams_single_segment_with_one_open());
     RUN(310, test_log_payload_rewrite_time_updates_encoded_log());
     RUN(311, test_persistent_auth_failure_retain_drop_policy());
+    RUN(316, test_persistent_auth_retain_resumes_after_static_credentials_update());
+    RUN(317, test_persistent_auth_retain_global_close_keeps_wal());
     RUN(312, test_persistent_max_age_rewrite_drop_and_unknown_time());
     RUN(132, test_persistent_sender_ack_updates_checkpoint_and_reclaims_closed_segment());
     RUN(182, test_persistent_retry_exhausted_retains_and_recovers());

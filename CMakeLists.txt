@@ -286,6 +286,7 @@ if(VE_TLS_BUILD_TESTS)
                 COMMAND ${CMAKE_COMMAND}
                     "-DVE_TLS_LIBRARY=$<TARGET_FILE:ve_tls_core>"
                     "-DVE_TLS_NM=${CMAKE_NM}"
+                    "-DVE_TLS_SYSTEM_NAME=${CMAKE_SYSTEM_NAME}"
                     -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_lz4_symbols.cmake
             )
         endif()

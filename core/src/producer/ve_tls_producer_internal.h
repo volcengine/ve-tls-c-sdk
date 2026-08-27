@@ -108,6 +108,7 @@ struct ve_tls_key_queue {
     int64_t empty_since_ms;
     int32_t delayed;
     int64_t next_ready_ms;
+    int64_t auth_wait_cred_version;
     ve_tls_key_queue * hnext;
     ve_tls_key_queue * rprev;
     ve_tls_key_queue * rnext;
@@ -320,6 +321,17 @@ void ve_tls_key_queue_unreserve(ve_tls_producer * producer, const char * norm_ke
 int ve_tls_key_queue_pop_task(ve_tls_key_queue * q, ve_tls_send_task * out);
 int ve_tls_key_queue_push_front_task(ve_tls_key_queue * q, const ve_tls_send_task * t);
 void ve_tls_key_queue_finish(ve_tls_producer * producer, ve_tls_key_queue * q);
+int ve_tls_key_queue_retain_auth_task_locked(
+    ve_tls_producer * producer,
+    ve_tls_key_queue * q,
+    const ve_tls_send_task * task,
+    int64_t failed_cred_version);
+void ve_tls_key_queue_resume_auth_waiters_locked(
+    ve_tls_producer * producer,
+    int64_t current_cred_version);
+int ve_tls_key_queue_take_auth_retained_locked(
+    ve_tls_producer * producer,
+    ve_tls_send_task * out);
 void ve_tls_delayed_promote_due(ve_tls_producer * producer, int64_t now_ms);
 void ve_tls_idle_cleanup(ve_tls_producer * producer);
 const char * ve_tls_normalize_hash_key(ve_tls_producer * producer, const char * hash_key);

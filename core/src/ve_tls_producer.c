@@ -1904,6 +1904,7 @@ ve_tls_result ve_tls_producer_update_static_credentials(ve_tls_producer * produc
         }
         ve_tls_runtime_snapshot_publish_locked(producer, next_snapshot);
         __atomic_store_n(&producer->static_cred_version, next_version, __ATOMIC_RELEASE);
+        ve_tls_key_queue_resume_auth_waiters_locked(producer, next_version);
     }
     producer->config.platform.mutex_unlock(producer->mutex);
     if (access_key_id) {
@@ -1914,6 +1915,9 @@ ve_tls_result ve_tls_producer_update_static_credentials(ve_tls_producer * produc
         ve_tls_secure_free_str(&old_tok);
     }
     ve_tls_metrics_emit(producer, "config_update_credentials", 1, 0);
+    if (changed && producer->use_global_env) {
+        ve_tls_env_notify(producer);
+    }
     ve_tls_runtime_update_finish(producer);
     return VE_TLS_OK;
 }
@@ -1926,6 +1930,11 @@ ve_tls_result ve_tls_producer_close(ve_tls_producer * producer, int32_t timeout_
     producer->config.platform.mutex_lock(producer->mutex);
     ve_tls_result rc = ve_tls_producer_begin_close_locked(producer);
     int join_threads = 0;
+    if (rc == VE_TLS_OK && producer->use_global_env) {
+        producer->config.platform.mutex_unlock(producer->mutex);
+        ve_tls_env_notify(producer);
+        producer->config.platform.mutex_lock(producer->mutex);
+    }
     if (rc == VE_TLS_OK) {
         rc = ve_tls_producer_wait_for_close_stage_locked(producer, timeout_ms, ve_tls_producer_is_drained_locked, "close_drain_ok", "close_timeout");
         if (rc == VE_TLS_OK) {
@@ -1977,6 +1986,11 @@ ve_tls_result ve_tls_producer_close_split(ve_tls_producer * producer, int32_t fl
     producer->config.platform.mutex_lock(producer->mutex);
     ve_tls_result rc = ve_tls_producer_begin_close_locked(producer);
     int join_threads = 0;
+    if (rc == VE_TLS_OK && producer->use_global_env) {
+        producer->config.platform.mutex_unlock(producer->mutex);
+        ve_tls_env_notify(producer);
+        producer->config.platform.mutex_lock(producer->mutex);
+    }
     if (rc == VE_TLS_OK) {
         rc = ve_tls_producer_wait_for_close_stage_locked(producer, flusher_timeout_ms, ve_tls_producer_is_flush_stage_drained_locked, "close_flusher_ok", "close_flusher_timeout");
         if (rc == VE_TLS_OK) {

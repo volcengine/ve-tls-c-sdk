@@ -833,11 +833,89 @@ int ve_tls_key_queue_pop_task(ve_tls_key_queue * q, ve_tls_send_task * out) {
     return 0;
 }
 
+int ve_tls_key_queue_retain_auth_task_locked(
+    ve_tls_producer * producer,
+    ve_tls_key_queue * q,
+    const ve_tls_send_task * task,
+    int64_t failed_cred_version
+) {
+    if (!producer || !q || !task || failed_cred_version <= 0 ||
+        producer->closing || producer->stop ||
+        ve_tls_key_queue_push_front_task(q, task) != 0) {
+        return -1;
+    }
+    q->inflight = 0;
+    q->auth_wait_cred_version = failed_cred_version;
+    if (__atomic_load_n(&producer->static_cred_version, __ATOMIC_ACQUIRE) !=
+        failed_cred_version) {
+        q->auth_wait_cred_version = 0;
+        ve_tls_ready_add(producer, q);
+    }
+    producer->config.platform.cond_broadcast(producer->send_cond);
+    return 0;
+}
+
+void ve_tls_key_queue_resume_auth_waiters_locked(
+    ve_tls_producer * producer,
+    int64_t current_cred_version
+) {
+    if (!producer || current_cred_version <= 0) {
+        return;
+    }
+    for (size_t i = 0; i < producer->key_bucket_count; i++) {
+        for (ve_tls_key_queue * q = producer->key_buckets[i]; q; q = q->hnext) {
+            if (q->auth_wait_cred_version <= 0 ||
+                q->auth_wait_cred_version == current_cred_version) {
+                continue;
+            }
+            q->auth_wait_cred_version = 0;
+            if (q->count > 0 && !q->inflight) {
+                ve_tls_ready_add(producer, q);
+            }
+        }
+    }
+    producer->config.platform.cond_broadcast(producer->send_cond);
+}
+
+int ve_tls_key_queue_take_auth_retained_locked(
+    ve_tls_producer * producer,
+    ve_tls_send_task * out
+) {
+    if (!producer || !out) {
+        return -1;
+    }
+    for (size_t i = 0; i < producer->key_bucket_count; i++) {
+        for (ve_tls_key_queue * q = producer->key_buckets[i]; q; q = q->hnext) {
+            if (q->auth_wait_cred_version <= 0 || q->count == 0) {
+                continue;
+            }
+            if (ve_tls_key_queue_pop_task(q, out) != 0) {
+                return -1;
+            }
+            if (q->count == 0) {
+                q->auth_wait_cred_version = 0;
+            }
+            producer->config.platform.cond_broadcast(producer->send_cond);
+            return 0;
+        }
+    }
+    return -1;
+}
+
 void ve_tls_key_queue_finish(ve_tls_producer * producer, ve_tls_key_queue * q) {
     if (!producer || !q) {
         return;
     }
     q->inflight = 0;
+    if (q->auth_wait_cred_version > 0) {
+        int64_t current_version = __atomic_load_n(
+            &producer->static_cred_version, __ATOMIC_ACQUIRE);
+        if (current_version == q->auth_wait_cred_version) {
+            producer->config.platform.cond_broadcast(producer->send_cond);
+            return;
+        }
+        q->auth_wait_cred_version = 0;
+    }
     if (q->count > 0) {
         int64_t now = producer->config.platform.time_ms ? producer->config.platform.time_ms() : 0;
         if (producer->config.key_breaker_fail_threshold > 0 && q->breaker_open_until_ms > now) {

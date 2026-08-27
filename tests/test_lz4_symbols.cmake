@@ -12,6 +12,18 @@ if(NOT VE_TLS_NM)
     message(FATAL_ERROR "nm was not found")
 endif()
 
+if(NOT DEFINED VE_TLS_SYSTEM_NAME OR VE_TLS_SYSTEM_NAME STREQUAL "")
+    set(VE_TLS_SYSTEM_NAME "${CMAKE_HOST_SYSTEM_NAME}")
+endif()
+
+if(VE_TLS_SYSTEM_NAME STREQUAL "Darwin")
+    # Darwin nm uses the compact -gU spelling for external defined symbols.
+    set(nm_arguments -gU)
+else()
+    # Keep the GNU/LLVM spelling used by Linux and Android toolchains.
+    set(nm_arguments -g --defined-only)
+endif()
+
 set(bundled_lz4_symbols
     LZ4_versionNumber
     LZ4_compressBound
@@ -65,7 +77,7 @@ foreach(symbol IN LISTS bundled_lz4_symbols)
 endforeach()
 
 execute_process(
-    COMMAND "${VE_TLS_NM}" -g --defined-only "${VE_TLS_LIBRARY}"
+    COMMAND "${VE_TLS_NM}" ${nm_arguments} "${VE_TLS_LIBRARY}"
     RESULT_VARIABLE nm_result
     OUTPUT_VARIABLE nm_output
     ERROR_VARIABLE nm_error
