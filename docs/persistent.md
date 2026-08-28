@@ -64,9 +64,10 @@ active segment、未 durable ACK segment 和 replay cursor 对应 segment 不会
 - SDK 提供 at-least-once。崩溃、重试和 checkpoint 持久化边界可能带来少量重复。
 - `success callback` 表示请求已经进入发送成功路径，不表示 checkpoint 已经 durable 落盘。
 - 服务端请求成功会推进 checkpoint。重试预算耗尽、普通不可重试响应和内部 queue/budget 暂时失败不会隐式 ACK 已 append 的记录。
-- `401/403` 与凭证刷新失败属于 authentication failure。默认 `VE_TLS_PAUTH_RETAIN` 保留 WAL；用户显式选择 `VE_TLS_PAUTH_DROP` 时，才作为终态 drop 推进 checkpoint。发送失败 callback 仍描述本轮失败。
+- `401/403` 与凭证刷新失败属于 authentication failure。默认 `VE_TLS_PAUTH_RETAIN` 保留 WAL 并等待凭证版本更新；本轮认证失败只记失败指标，不发送终态 callback，更新凭证后发送成功只回调一次成功。用户显式选择 `VE_TLS_PAUTH_DROP` 时，才作为终态 drop 推进 checkpoint 并发送失败 callback。
 - recover 发现超龄记录且配置 `VE_TLS_PEXPIRED_DROP` 时，也会作为显式终态 drop 推进 checkpoint。除这些明确策略外，发送失败不代表 persistent 记录永久丢弃。
-- 本轮发送结束后，未 ACK 记录保留在 WAL 中；当前实现不会自动开启下一轮长期重试，需要进程重启或再次调用 `ve_tls_producer_recover()` 才会重新入队。
+- 请求级预算耗尽且最后一次错误仍可重试时，未 ACK 记录保留在 WAL 中，live Producer 会按带抖动的指数退避自动开始下一轮，跨轮退避最长 5 分钟。不可重试失败仍需要修正配置或 payload 后重启/recover。
+- close/destroy 会立即提升延迟队列并释放跨轮重试的内存任务，WAL 保持未 ACK，停机不等待跨轮退避计时器；下一次启动会继续 recover。
 - `add_log` 在 persistent append 之前失败时不在恢复范围内；如果 append 已成功、后续内存入队失败，接口可能返回失败但记录仍会被 recover，调用方需要用 log id 或业务主键处理潜在重复。
 - sync WAL 中，record `write` 成功但 `fsync` 失败时，`add_log` 返回 `VE_TLS_PERSISTENT_ERROR`，已写 record 仍保留并可在后续 flush/recover 中出现。调用方重试可能形成重复。
 - checkpoint 保存失败时保持 dirty，不回收对应记录，并发出 `persistent_checkpoint_save_failed` metric；metric 的两个值分别是本次完成范围的 `start_id` 和 `end_id`。

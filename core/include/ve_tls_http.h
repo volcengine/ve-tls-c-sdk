@@ -42,6 +42,10 @@ typedef struct {
     char * error_message;
     ve_tls_transport_kind transport_kind;
     int32_t transport_code;
+    /* Adapter-owned retry decision for transport failures returned by
+     * do_request. Set to non-zero only when replaying this request is safe and
+     * likely to succeed; zero is terminal. The producer honors this field for
+     * every transport_kind, including VE_TLS_TRANSPORT_GENERIC. */
     int32_t transport_retryable;
 } ve_tls_http_response;
 

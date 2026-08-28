@@ -87,7 +87,7 @@
 | `user_agent` | 空 | 自定义客户端标识。通常不需要配置。 |
 | `http_debug` | `0` | HTTP 调试开关。生产环境不要开启。 |
 | `tcp_keepalive` / `tcp_keepidle` / `tcp_keepintvl` | 关闭 / `60` / `30` | curl adapter 的 TCP keepalive 参数。 |
-| `http_client` | 由构建选项决定 | 自定义 HTTP client。真实网络发送通常使用 curl adapter。 |
+| `http_client` | 由构建选项决定 | 自定义 HTTP client。`do_request` 返回 transport failure 时必须显式设置 `response.transport_retryable`；`0` 表示终态不可重试，非零表示允许重放。该合同对 generic/curl transport 一致。真实网络发送通常使用 curl adapter。 |
 
 ## 回调与重试
 

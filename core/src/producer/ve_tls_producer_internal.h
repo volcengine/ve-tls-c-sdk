@@ -59,6 +59,10 @@ typedef struct {
     size_t precompressed_size;
     ve_tls_obj_pool * body_pool;
     ve_tls_obj_pool * precompressed_pool;
+    /* Number of completed, bounded retry cycles for a durable batch. This is
+     * process-local scheduling state only; the WAL remains the source of
+     * truth across producer restarts. */
+    int32_t persistent_retry_cycle;
     /* scratch 预算的"中转持有"：从 prepare 阶段的 scratch_bytes 占位，
      * 直到 push 阶段把它原子迁移到 send_queue_bytes 为止。任何分支
      * 在 task 销毁前未完成迁移时，必须由 send_task_free 兜底归还。 */

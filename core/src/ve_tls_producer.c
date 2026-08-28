@@ -1576,6 +1576,7 @@ static ve_tls_producer * ve_tls_producer_create_current(const ve_tls_config * co
     producer->use_global_env = producer->config.use_global_env ? 1 : 0;
     producer->fast_send = 0;
     if (!producer->use_global_env &&
+        !producer->persistent &&
         producer->config.ordered_send == 0 &&
         producer->config.rate_limit_rps <= 0 &&
         producer->config.rate_limit_bps <= 0 &&

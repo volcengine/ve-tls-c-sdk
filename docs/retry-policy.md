@@ -53,15 +53,15 @@ HTTP 状态码：
 
 发送失败但仍可重试时，批次会进入延迟队列。延迟队列按下一次重试时间排序，到期后重新交给 sender。
 
-达到最大重试次数、命中不可重试状态码或 Producer 关闭时，本轮批次不会再入队。最终结果通过发送回调返回。
+达到最大重试次数或总超时后，Memory 模式会结束该批次并返回终态回调。Persistent 模式若最后一次错误仍标记为 retryable，则不会把这次“请求级预算耗尽”当成日志终态：对应 WAL 保持未 ACK，live Producer 会按带抖动的指数退避自动调度下一轮请求级重试。跨轮退避上限固定为 5 分钟。
 
-Memory 模式会在本轮结束后释放该批次。Persistent 模式不会 ACK 对应 WAL 记录，但当前也不会自动启动下一轮长期重试；需要进程重启或再次调用 `ve_tls_producer_recover()`。
+命中不可重试状态码时不会进入下一轮自动重试，WAL 仍保持未 ACK；接入方必须修正配置或 payload，再通过重启/recover 重新处理。Producer close/destroy 时，已进入跨轮退避的任务会释放内存态、保留 WAL，避免停机被最长 5 分钟的延迟队列阻塞。
 
 ## Persistent 下的处理边界
 
 - 批次最终成功后，SDK 会推进 checkpoint。
-- 默认情况下发送失败不推进 checkpoint，包括 retryable exhausted、不可重试响应和内部 queue/budget 失败。
-- `401/403` 和凭证刷新失败会分类为 authentication failure。`VE_TLS_PAUTH_RETAIN` 是兼容默认，保留 WAL；只有用户显式选择 `VE_TLS_PAUTH_DROP` 时才把对应范围作为终态 drop 推进 checkpoint。发送 callback 仍报告本轮失败。
+- 默认情况下发送失败不推进 checkpoint，包括 retryable exhausted、不可重试响应和内部 queue/budget 失败。Retryable exhausted 会在 live Producer 内自动开启下一轮；不可重试失败需要显式修正后 recover。
+- `401/403` 和凭证刷新失败会分类为 authentication failure。`VE_TLS_PAUTH_RETAIN` 是兼容默认：保留 WAL 并等待凭证版本更新，本轮认证失败只计入失败指标，不发终态 callback；凭证更新后成功发送时只发一次成功 callback。只有用户显式选择 `VE_TLS_PAUTH_DROP` 时才把对应范围作为终态 drop 推进 checkpoint 并报告失败 callback。
 - 除显式认证 drop 和 persistent max-age drop 外，当前没有发送失败后的通用永久 drop/quarantine 策略。无法发送的毒丸记录会在 recover 时继续出现，接入方应监控失败 callback 并隔离错误配置或 payload。
 - success callback 与 checkpoint 持久化之间存在窗口；进程在这个窗口崩溃时，recover 可能重放少量已经成功发送过的日志。
 - checkpoint 保存失败会保留 dirty 状态，并通过 `persistent_checkpoint_save_failed` metric 暴露对应 log id 范围。

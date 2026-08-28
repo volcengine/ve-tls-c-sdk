@@ -195,6 +195,14 @@ static int ve_tls_posix_open_flags(int flags) {
     if (flags & VE_TLS_FILE_OPEN_EXCL) {
         oflags |= O_EXCL;
     }
+#ifdef O_NOFOLLOW
+    /* Persistent manifests/checkpoints/segments are SDK-owned files. Never
+     * follow a caller-planted final-component symlink into another file. */
+    oflags |= O_NOFOLLOW;
+#endif
+#ifdef O_CLOEXEC
+    oflags |= O_CLOEXEC;
+#endif
     return oflags;
 }
 
