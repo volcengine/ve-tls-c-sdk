@@ -568,8 +568,12 @@ static ve_tls_result ve_tls_producer_add_log_kv_persistent_locked(
 ) {
     const char * norm_key;
     ve_tls_log_group_builder * builder;
-    unsigned char * raw_log = NULL;
-    size_t raw_log_size = 0;
+    ve_tls_ingress_task ingress_task;
+    size_t raw_log_size;
+    int wait_ms = 0;
+    int merge_rc;
+    int qrc;
+    int wrc;
     int64_t id;
     ve_tls_result rc = VE_TLS_DROP_ERROR;
     if (!producer || !kvs || !key_lens || !val_lens || kv_count == 0) {
@@ -590,32 +594,59 @@ static ve_tls_result ve_tls_producer_add_log_kv_persistent_locked(
     if (ve_tls_log_builder_add_kv_lens(builder, id, time_ms, time_ns, has_time_ns ? 1 : 0, kvs, key_lens, val_lens, kv_count) != 0) {
         goto end;
     }
-    raw_log = builder->logs;
     raw_log_size = builder->logs_len;
-    builder->logs = NULL;
-    builder->logs_len = 0;
-    builder->logs_cap = 0;
-    if (!raw_log || raw_log_size == 0) {
+    if (!builder->logs || raw_log_size == 0) {
         goto end;
     }
-    rc = ve_tls_persistent_append_with_retry_locked(producer, id, norm_key, raw_log, raw_log_size);
+    rc = ve_tls_persistent_append_with_retry_locked(
+        producer, id, norm_key, builder->logs, raw_log_size);
     if (rc != VE_TLS_OK) {
         goto end;
     }
-    rc = ve_tls_enqueue_ingress_raw_owned_locked(
-        producer,
-        norm_key,
-        raw_log,
-        raw_log_size,
-        id,
-        time_ms,
-        time_ns,
-        has_time_ns ? 1 : 0,
-        flush,
-        1);
-    raw_log = NULL;
+
+    /* The WAL append intentionally releases producer->mutex so disk stalls do
+     * not block lifecycle operations. Once it completes, merge this already
+     * encoded single-log builder directly while the caller again owns the
+     * mutex. This mirrors the ordered in-memory path and avoids allocating a
+     * second builder, queueing it, waking the worker for every log, and then
+     * copying it into the aggregate builder on that worker.
+     *
+     * If direct merge cannot allocate its destination (or hits the key-queue
+     * limit), fall back to the original ingress queue. The worker then retains
+     * the established asynchronous terminal-drop behavior instead of turning
+     * an accepted durable record into a new synchronous error contract. */
+    wrc = ve_tls_wait_buffer_space_locked(producer, raw_log_size, 0);
+    if (wrc != 0) {
+        rc = ve_tls_map_wait_error_to_result(producer, wrc, raw_log_size);
+        goto end;
+    }
+    memset(&ingress_task, 0, sizeof(ingress_task));
+    ingress_task.norm_key = norm_key;
+    ingress_task.batch = builder;
+    ingress_task.force_flush = flush ? 1 : 0;
+    merge_rc = ve_tls_ingress_task_merge_locked(producer, &ingress_task);
+    if (merge_rc != 0) {
+        if (producer->config.buffer_full_policy == VE_TLS_BUFFER_FULL_BLOCK) {
+            wait_ms = producer->config.buffer_full_block_timeout_ms;
+            if (wait_ms == 0) {
+                wait_ms = -1;
+            }
+        }
+        qrc = ve_tls_ingress_queue_push_locked(
+            producer, builder->norm_key, builder, flush, wait_ms);
+        if (qrc != 0) {
+            rc = qrc == -2 ? VE_TLS_CLOSED
+                : qrc == -3 ? VE_TLS_TIMEOUT
+                : VE_TLS_DROP_ERROR;
+            goto end;
+        }
+        builder = NULL;
+    }
+    ve_tls_metric_inc_u64(&producer->m_logs_enqueued_total, 1);
+    ve_tls_metric_inc_u64(&producer->m_bytes_enqueued_total, raw_log_size);
+    ve_tls_metrics_emit(producer, "log_enqueued", 1, (int64_t)raw_log_size);
+    rc = VE_TLS_OK;
 end:
-    ve_tls_free(raw_log);
     ve_tls_log_builder_free(builder);
     if (rc != VE_TLS_OK) {
         ve_tls_metric_inc_u64(&producer->m_logs_dropped_total, 1);
@@ -906,6 +937,7 @@ int ve_tls_ingress_task_merge_locked(ve_tls_producer * producer, const ve_tls_in
     ve_tls_key_queue * q = NULL;
     ve_tls_log_group_builder * b = NULL;
     int is_default_builder = 0;
+    int wake_worker = 0;
     if (producer->fast_builder && producer->default_norm_key == norm_key) {
         if (!producer->default_builder) {
             producer->default_builder = ve_tls_log_builder_create(norm_key);
@@ -934,6 +966,42 @@ int ve_tls_ingress_task_merge_locked(ve_tls_producer * producer, const ve_tls_in
         }
         b = q->builder;
     }
+    /* Persistent acknowledgement stores completed ID ranges. Never create a
+     * range that contains an ID belonging to another hash-key builder (or an
+     * append that has not reached ingress yet), otherwise a successful send
+     * could advance the WAL checkpoint past an unsent record. Memory-only
+     * producers do not have this constraint. */
+    if (ve_tls_persistent_enabled(producer) &&
+        b->log_count > 0 &&
+        (b->end_id <= 0 || b->end_id == INT64_MAX ||
+         tb->start_id != b->end_id + 1)) {
+        ve_tls_log_group_builder * sealed = b;
+        if (is_default_builder) {
+            producer->default_builder = NULL;
+        } else {
+            q->builder = NULL;
+        }
+        sealed->next = NULL;
+        if (producer->sealed_tail) {
+            producer->sealed_tail->next = sealed;
+        } else {
+            producer->sealed_head = sealed;
+        }
+        producer->sealed_tail = sealed;
+        producer->flush_requested = 1;
+        producer->config.platform.cond_signal(producer->cond);
+        wake_worker = 1;
+
+        b = ve_tls_log_builder_create(is_default_builder ? norm_key : q->key);
+        if (!b) {
+            return -1;
+        }
+        if (is_default_builder) {
+            producer->default_builder = b;
+        } else {
+            q->builder = b;
+        }
+    }
     if (b->first_append_ms == 0) {
         b->first_append_ms = tb->first_append_ms > 0 ? tb->first_append_ms : (producer->config.platform.time_ms ? producer->config.platform.time_ms() : 0);
     }
@@ -944,7 +1012,6 @@ int ve_tls_ingress_task_merge_locked(ve_tls_producer * producer, const ve_tls_in
     size_t delta = b->logs_len - prev;
     producer->queue_bytes += delta;
 
-    int wake_worker = 0;
     if (task->force_flush) {
         ve_tls_log_group_builder * sealed = b;
         if (is_default_builder) {

@@ -14368,6 +14368,143 @@ static int test_persistent_append_releases_producer_mutex_for_disk_write(void) {
     return 0;
 }
 
+static int test_persistent_ordered_add_avoids_secondary_ingress_allocation(void) {
+    char dir[PATH_MAX];
+    ve_tls_config cfg;
+    ve_tls_producer * p = NULL;
+    ve_tls_kv kv = {"message", "persistent-direct-merge"};
+    ve_tls_result rc;
+    if (make_temp_dir(dir, sizeof(dir)) != 0) {
+        return -1;
+    }
+    ve_tls_config_init(&cfg);
+    cfg.endpoint = "https://example.com";
+    cfg.region = "cn-beijing";
+    cfg.topic_id = "t";
+    cfg.access_key_id = "ak";
+    cfg.access_key_secret = "sk";
+    cfg.retry_policy.max_attempts = 1;
+    cfg.flush_interval_ms = 100000;
+    cfg.compress_type = "none";
+    cfg.http_client.do_request = test_http_ok_do;
+    cfg.http_client.free_response = test_http_ok_free;
+    cfg.use_persistent = 1;
+    cfg.persistent_file_path = dir;
+    cfg.max_persistent_log_count = 128;
+    cfg.max_persistent_file_size = 4096;
+    cfg.max_persistent_file_count = 4;
+    cfg.ordered_send = 1;
+    p = ve_tls_producer_create(&cfg);
+    if (!p || !p->persistent) {
+        ve_tls_producer_destroy(p);
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+
+    /* The old persistent path allocated a second single-log builder under
+     * this site after the WAL write. Direct merge must not touch that site. */
+    ve_tls_alloc_fault_inject("ingress_owned", 0, 1);
+    rc = ve_tls_producer_add_log_kv_hashkey(p, 0, NULL, &kv, 1, 0);
+    ve_tls_alloc_fault_inject(NULL, 0, 0);
+
+    ve_tls_producer_destroy(p);
+    cleanup_persistent_dir(dir);
+    return rc == VE_TLS_OK ? 0 : -1;
+}
+
+static ve_tls_log_group_builder * test_make_single_log_ingress_batch(
+    const char * norm_key,
+    int64_t log_id
+) {
+    ve_tls_log_group_builder * batch = ve_tls_log_builder_create(norm_key);
+    if (!batch) {
+        return NULL;
+    }
+    batch->logs = (unsigned char *)ve_tls_malloc(1);
+    if (!batch->logs) {
+        ve_tls_log_builder_free(batch);
+        return NULL;
+    }
+    batch->logs[0] = (unsigned char)log_id;
+    batch->logs_len = 1;
+    batch->logs_cap = 1;
+    batch->log_count = 1;
+    batch->start_id = log_id;
+    batch->end_id = log_id;
+    batch->first_append_ms = 1;
+    return batch;
+}
+
+static int test_persistent_ingress_keeps_ack_ranges_contiguous_across_hash_keys(void) {
+    ve_tls_config cfg;
+    ve_tls_producer producer;
+    const char * keys[] = {"key-a", "key-b", "key-a"};
+    int failed = 0;
+
+    ve_tls_config_init(&cfg);
+    cfg.endpoint = "https://example.com";
+    cfg.region = "cn-beijing";
+    cfg.topic_id = "t";
+    cfg.access_key_id = "ak";
+    cfg.access_key_secret = "sk";
+    cfg.use_persistent = 1;
+    cfg.ordered_send = 1;
+    if (init_fake_sender_producer(&producer, &cfg) != 0) {
+        return -1;
+    }
+    /* ve_tls_ingress_task_merge_locked only checks persistence availability;
+     * this deterministic fake needs no WAL operations. */
+    producer.persistent = (ve_tls_persistent *)&producer;
+
+    for (int64_t id = 1; id <= 3; id++) {
+        ve_tls_log_group_builder * batch =
+            test_make_single_log_ingress_batch(keys[id - 1], id);
+        ve_tls_ingress_task task;
+        if (!batch) {
+            failed = 1;
+            break;
+        }
+        memset(&task, 0, sizeof(task));
+        task.norm_key = batch->norm_key;
+        task.batch = batch;
+        if (ve_tls_ingress_task_merge_locked(&producer, &task) != 0) {
+            failed = 1;
+        }
+        ve_tls_log_builder_free(batch);
+        if (failed) {
+            break;
+        }
+    }
+
+    if (!failed) {
+        ve_tls_key_queue * key_a = find_key_queue(&producer, "key-a");
+        ve_tls_key_queue * key_b = find_key_queue(&producer, "key-b");
+        failed = !producer.sealed_head ||
+            producer.sealed_head != producer.sealed_tail ||
+            producer.sealed_head->start_id != 1 ||
+            producer.sealed_head->end_id != 1 ||
+            producer.sealed_head->log_count != 1 ||
+            !key_a || !key_a->builder ||
+            key_a->builder->start_id != 3 ||
+            key_a->builder->end_id != 3 ||
+            key_a->builder->log_count != 1 ||
+            !key_b || !key_b->builder ||
+            key_b->builder->start_id != 2 ||
+            key_b->builder->end_id != 2 ||
+            key_b->builder->log_count != 1;
+    }
+
+    while (producer.sealed_head) {
+        ve_tls_log_group_builder * next = producer.sealed_head->next;
+        ve_tls_log_builder_free(producer.sealed_head);
+        producer.sealed_head = next;
+    }
+    producer.sealed_tail = NULL;
+    producer.persistent = NULL;
+    destroy_fake_sender_producer(&producer);
+    return failed ? -1 : 0;
+}
+
 static int test_persistent_out_of_order_ack_waits_for_contiguous_prefix(void) {
     char dir[PATH_MAX];
     ve_tls_config cfg;
@@ -17129,6 +17266,8 @@ int main(void) {
     RUN(143, test_persistent_overflow_reject_new_kv_does_not_double_free());
     RUN(144, test_persistent_kv_path_batches_multiple_logs_into_single_request());
     RUN(150, test_persistent_append_releases_producer_mutex_for_disk_write());
+    RUN(322, test_persistent_ordered_add_avoids_secondary_ingress_allocation());
+    RUN(323, test_persistent_ingress_keeps_ack_ranges_contiguous_across_hash_keys());
     RUN(151, test_persistent_out_of_order_ack_waits_for_contiguous_prefix());
     RUN(184, test_persistent_checkpoint_fsync_failure_stays_dirty_and_emits_metric());
     RUN(152, test_persistent_allows_multiple_sender_threads());
