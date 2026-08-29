@@ -261,10 +261,20 @@ void ve_tls_log_builder_shrink_if_needed(ve_tls_log_group_builder * b, size_t sh
         b->logs_cap = 0;
         return;
     }
-    unsigned char * p = (unsigned char *)ve_tls_realloc(b->logs, shrink_to);
+    /* Do not shrink a reusable large builder with realloc. Darwin allocators
+     * may keep the original large region resident, while the next batch then
+     * grows it again and raises the process RSS high-water mark on every
+     * flush. Allocate the bounded reusable block first, copy the live prefix,
+     * and only then release the large allocation. Allocation failure is a
+     * best-effort no-op, preserving the original builder and its data. */
+    unsigned char * p = (unsigned char *)ve_tls_malloc(shrink_to);
     if (!p) {
         return;
     }
+    if (b->logs_len > 0) {
+        memcpy(p, b->logs, b->logs_len);
+    }
+    ve_tls_free(b->logs);
     b->logs = p;
     b->logs_cap = shrink_to;
 }

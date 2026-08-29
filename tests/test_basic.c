@@ -1902,6 +1902,66 @@ static int test_builder_to_send_task_strdupfail_does_not_double_free_body(void) 
     return (rc != 0 && st.strdup_calls == 1 && st.double_free == 0 && out.body == NULL) ? 0 : -1;
 }
 
+static int test_log_builder_shrink_releases_large_allocation_safely(void) {
+    const size_t large_cap = 2 * 1024 * 1024;
+    const size_t small_cap = 64 * 1024;
+    ve_tls_log_group_builder * b = ve_tls_log_builder_create("");
+    if (!b) return -1;
+    b->logs = (unsigned char *)ve_tls_malloc(large_cap);
+    if (!b->logs) {
+        ve_tls_log_builder_free(b);
+        return -1;
+    }
+    b->logs_cap = large_cap;
+    b->logs_len = 16;
+    memset(b->logs, 0x5a, b->logs_len);
+    unsigned char * old_logs = b->logs;
+    ve_tls_log_builder_shrink_if_needed(b, 1024 * 1024, small_cap);
+    if (b->logs == old_logs || b->logs_cap != small_cap || b->logs_len != 16) {
+        ve_tls_log_builder_free(b);
+        return -1;
+    }
+    for (size_t i = 0; i < b->logs_len; i++) {
+        if (b->logs[i] != 0x5a) {
+            ve_tls_log_builder_free(b);
+            return -1;
+        }
+    }
+
+    ve_tls_free(b->logs);
+    b->logs = (unsigned char *)ve_tls_malloc(large_cap);
+    if (!b->logs) {
+        b->logs_cap = 0;
+        b->logs_len = 0;
+        ve_tls_log_builder_free(b);
+        return -1;
+    }
+    b->logs_cap = large_cap;
+    b->logs_len = 16;
+    memset(b->logs, 0xa5, b->logs_len);
+    old_logs = b->logs;
+
+    ve_tls_alloc_hooks saved;
+    memset(&saved, 0, sizeof(saved));
+    ve_tls_alloc_get_hooks(&saved);
+    alloc_select_fail_state st;
+    set_alloc_select_fail(&st, 1, 0, 0, 0);
+    ve_tls_log_builder_shrink_if_needed(b, 1024 * 1024, small_cap);
+    ve_tls_alloc_set_hooks(&saved);
+    if (b->logs != old_logs || b->logs_cap != large_cap || b->logs_len != 16) {
+        ve_tls_log_builder_free(b);
+        return -1;
+    }
+    for (size_t i = 0; i < b->logs_len; i++) {
+        if (b->logs[i] != 0xa5) {
+            ve_tls_log_builder_free(b);
+            return -1;
+        }
+    }
+    ve_tls_log_builder_free(b);
+    return 0;
+}
+
 static int test_tls_batch_flush_interval_visible_to_worker(void) {
     memset(g_sender_time_t, 0, sizeof(g_sender_time_t));
     __atomic_store_n(&g_sender_time_n, 0, __ATOMIC_RELAXED);
@@ -17357,6 +17417,7 @@ int main(void) {
     RUN(150, test_persistent_append_releases_producer_mutex_for_disk_write());
     RUN(322, test_persistent_ordered_add_avoids_secondary_ingress_allocation());
     RUN(324, test_persistent_ordered_add_reuses_single_log_builder());
+    RUN(325, test_log_builder_shrink_releases_large_allocation_safely());
     RUN(323, test_persistent_ingress_keeps_ack_ranges_contiguous_across_hash_keys());
     RUN(151, test_persistent_out_of_order_ack_waits_for_contiguous_prefix());
     RUN(184, test_persistent_checkpoint_fsync_failure_stays_dirty_and_emits_metric());
