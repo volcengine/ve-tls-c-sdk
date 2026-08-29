@@ -471,7 +471,7 @@ static void * ve_tls_worker_main_builder(void * arg) {
             sealed = sealed->next;
             size_t bytes_in_builder = b->logs_len;
             ve_tls_send_task t;
-            if (ve_tls_builder_to_send_task(producer, b, &t) != 0) {
+            if (ve_tls_builder_move_to_send_task(producer, b, &t) != 0) {
                 ve_tls_manager_drop_range(producer, bytes_in_builder, b->start_id, b->end_id, "MemoryAllocFailed", "build body failed");
             } else {
                 const char * err_code = NULL;

@@ -1902,6 +1902,118 @@ static int test_builder_to_send_task_strdupfail_does_not_double_free_body(void) 
     return (rc != 0 && st.strdup_calls == 1 && st.double_free == 0 && out.body == NULL) ? 0 : -1;
 }
 
+static int test_builder_move_to_send_task_matches_copy_and_detaches(void) {
+    ve_tls_log_group_builder * copy_builder = NULL;
+    ve_tls_log_group_builder * move_builder = NULL;
+    ve_tls_send_task copy_task;
+    ve_tls_send_task move_task;
+    ve_tls_producer p;
+    ve_tls_kv kvs[2] = {{"alpha", "one"}, {"beta", "two"}};
+    ve_tls_kv tags[1] = {{"tag-key", "tag-value"}};
+    size_t key_lens[2] = {5, 4};
+    size_t val_lens[2] = {3, 3};
+    unsigned char * original_move_logs;
+    int failed = 0;
+
+    memset(&p, 0, sizeof(p));
+    memset(&copy_task, 0, sizeof(copy_task));
+    memset(&move_task, 0, sizeof(move_task));
+    p.config.source = "ios-source";
+    p.config.file_name = "ios-file";
+    p.config.context_flow = "ios-context";
+    p.config.log_tags = tags;
+    p.config.log_tag_count = 1;
+    if (ve_tls_producer_build_group_suffix(&p) != 0) {
+        return -1;
+    }
+    copy_builder = ve_tls_log_builder_create("0123456789abcdef0123456789abcdef");
+    move_builder = ve_tls_log_builder_create("0123456789abcdef0123456789abcdef");
+    if (!copy_builder || !move_builder ||
+        ve_tls_log_builder_add_kv_lens(copy_builder, 7, 1700000000123LL, 456789u, 1, kvs, key_lens, val_lens, 2) != 0 ||
+        ve_tls_log_builder_add_kv_lens(move_builder, 7, 1700000000123LL, 456789u, 1, kvs, key_lens, val_lens, 2) != 0) {
+        failed = 1;
+        goto cleanup;
+    }
+    original_move_logs = move_builder->logs;
+    if (ve_tls_builder_to_send_task(&p, copy_builder, &copy_task) != 0 ||
+        ve_tls_builder_move_to_send_task(&p, move_builder, &move_task) != 0) {
+        failed = 1;
+        goto cleanup;
+    }
+    if (!copy_builder->logs || copy_builder->logs_len == 0 ||
+        move_builder->logs != NULL || move_builder->logs_len != 0 || move_builder->logs_cap != 0 ||
+        move_task.body != original_move_logs ||
+        copy_task.body_size != move_task.body_size ||
+        copy_task.raw_body_size != move_task.raw_body_size ||
+        copy_task.batch_bytes != move_task.batch_bytes ||
+        copy_task.log_count != move_task.log_count ||
+        copy_task.earliest != move_task.earliest || copy_task.latest != move_task.latest ||
+        copy_task.start_id != move_task.start_id || copy_task.end_id != move_task.end_id ||
+        !copy_task.hash_key || !move_task.hash_key || strcmp(copy_task.hash_key, move_task.hash_key) != 0 ||
+        memcmp(copy_task.body, move_task.body, copy_task.body_size) != 0) {
+        failed = 1;
+    }
+
+cleanup:
+    ve_tls_send_task_free(&copy_task);
+    ve_tls_send_task_free(&move_task);
+    ve_tls_log_builder_free(copy_builder);
+    ve_tls_log_builder_free(move_builder);
+    ve_tls_free(p.cfg_group_suffix);
+    return failed ? -1 : 0;
+}
+
+static int test_builder_move_to_send_task_allocation_failures_are_atomic(void) {
+    ve_tls_log_group_builder * b = ve_tls_log_builder_create("hk");
+    ve_tls_kv kv = {"k", "v"};
+    ve_tls_alloc_hooks saved;
+    alloc_select_fail_state st;
+    ve_tls_producer p;
+    ve_tls_send_task out;
+    unsigned char snapshot[64];
+    unsigned char * original_logs;
+    size_t original_len;
+    int rc;
+    if (!b || ve_tls_log_builder_add_kv_lens(b, 1, 1, 0, 0, &kv, NULL, NULL, 1) != 0 ||
+        b->logs_len > sizeof(snapshot)) {
+        ve_tls_log_builder_free(b);
+        return -1;
+    }
+    memset(&p, 0, sizeof(p));
+    memset(&out, 0, sizeof(out));
+    original_logs = b->logs;
+    original_len = b->logs_len;
+    memcpy(snapshot, b->logs, b->logs_len);
+    /* Force the consuming path to request growth, then fail that realloc. */
+    b->logs_cap = b->logs_len;
+    memset(&saved, 0, sizeof(saved));
+    ve_tls_alloc_get_hooks(&saved);
+    set_alloc_select_fail(&st, 0, 0, 1, 0);
+    rc = ve_tls_builder_move_to_send_task(&p, b, &out);
+    ve_tls_alloc_set_hooks(&saved);
+    if (rc == 0 || out.body || out.hash_key || b->logs != original_logs ||
+        b->logs_len != original_len || memcmp(b->logs, snapshot, original_len) != 0) {
+        ve_tls_send_task_free(&out);
+        ve_tls_log_builder_free(b);
+        return -1;
+    }
+
+    memset(&out, 0, sizeof(out));
+    alloc_double_free_state double_free_state;
+    set_alloc_double_free_detector(&double_free_state, 1);
+    rc = ve_tls_builder_move_to_send_task(&p, b, &out);
+    ve_tls_alloc_set_hooks(&saved);
+    if (rc == 0 || double_free_state.double_free || out.body || out.hash_key ||
+        b->logs != original_logs || b->logs_len != original_len ||
+        memcmp(b->logs, snapshot, original_len) != 0) {
+        ve_tls_send_task_free(&out);
+        ve_tls_log_builder_free(b);
+        return -1;
+    }
+    ve_tls_log_builder_free(b);
+    return 0;
+}
+
 static int test_log_builder_shrink_releases_large_allocation_safely(void) {
     const size_t large_cap = 2 * 1024 * 1024;
     const size_t small_cap = 64 * 1024;
@@ -17286,6 +17398,8 @@ int main(void) {
     RUN(171, test_sign_preserves_encoded_query_escapes());
     RUN(146, test_builder_flush_interval_respects_configured_deadline());
     RUN(181, test_builder_to_send_task_strdupfail_does_not_double_free_body());
+    RUN(326, test_builder_move_to_send_task_matches_copy_and_detaches());
+    RUN(327, test_builder_move_to_send_task_allocation_failures_are_atomic());
     RUN(172, test_tls_batch_flush_interval_visible_to_worker());
     RUN(147, test_sender_idle_wait_without_delayed_does_not_spin_timedwait());
     RUN(118, test_sign_cache_secret_change_same_pointer_effective());

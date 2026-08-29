@@ -307,6 +307,7 @@ int ve_tls_log_builder_append(ve_tls_log_group_builder * b, const unsigned char 
 void ve_tls_log_builder_shrink_if_needed(ve_tls_log_group_builder * b, size_t shrink_threshold, size_t shrink_to);
 int ve_tls_producer_build_group_suffix(ve_tls_producer * producer);
 int ve_tls_builder_to_send_task(ve_tls_producer * producer, ve_tls_log_group_builder * b, ve_tls_send_task * out);
+int ve_tls_builder_move_to_send_task(ve_tls_producer * producer, ve_tls_log_group_builder * b, ve_tls_send_task * out);
 
 int ve_tls_send_queue_init(ve_tls_send_queue * q, ve_tls_platform * platform, size_t cap, ve_tls_obj_pool * task_pool);
 int ve_tls_send_queue_push(ve_tls_send_queue * q, const ve_tls_send_task * t, int wait_ms);
