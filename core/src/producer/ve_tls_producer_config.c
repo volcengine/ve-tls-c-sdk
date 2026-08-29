@@ -32,8 +32,11 @@ static void ve_tls_http_client_init_noop(ve_tls_http_client * client) {
 #endif
 
 enum {
-    VE_TLS_DEFAULT_SEND_THREAD_COUNT = 1,
-    VE_TLS_DEFAULT_PACK_THREAD_COUNT = 1,
+    /* Zero is the auto-tune sentinel. Positive values are exact caller
+     * overrides, including one; do not conflate an explicit single-thread
+     * configuration with the runtime-derived default. */
+    VE_TLS_DEFAULT_SEND_THREAD_COUNT = 0,
+    VE_TLS_DEFAULT_PACK_THREAD_COUNT = 0,
     VE_TLS_DEFAULT_MAX_BUFFER_BYTES = 64 * 1024 * 1024,
     VE_TLS_DEFAULT_LOG_BYTES_PER_PACKAGE = 10 * 1024 * 1024,
     VE_TLS_DEFAULT_LOG_COUNT_PER_PACKAGE = 2048,

@@ -6199,6 +6199,27 @@ static int test_producer_derived_defaults_preserve_explicit_overrides(void) {
               p->config.pack_thread_count == 5 &&
               p->config.send_queue_size == 33);
     ve_tls_producer_destroy(p);
+    if (!ok) return -1;
+
+    /* One used to collide with the auto-tune sentinel and silently expand to
+     * two threads for a 64 MiB buffer. It is a public exact override. */
+    ve_tls_config_init(&cfg);
+    cfg.endpoint = "https://example.com";
+    cfg.region = "cn-beijing";
+    cfg.topic_id = "t";
+    cfg.access_key_id = "ak";
+    cfg.access_key_secret = "sk";
+    cfg.max_buffer_bytes = 64 * 1024 * 1024;
+    cfg.send_thread_count = 1;
+    cfg.pack_thread_count = 1;
+
+    p = ve_tls_producer_create(&cfg);
+    if (!p) return -1;
+    ok = p->config.send_thread_count == 1 &&
+         p->config.pack_thread_count == 1 &&
+         p->sender_count == 1 &&
+         p->worker_count == 1;
+    ve_tls_producer_destroy(p);
     return ok ? 0 : -1;
 }
 

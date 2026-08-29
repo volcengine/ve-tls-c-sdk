@@ -111,6 +111,7 @@ typedef struct {
     int64_t credentials_refresh_min_interval_ms;
     const char * api_version;
     const char * compress_type;
+    /* 0 selects a runtime-derived default; positive values are exact. */
     int32_t send_thread_count;
     int32_t pack_thread_count;
     int32_t use_global_env;
