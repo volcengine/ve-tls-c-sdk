@@ -140,6 +140,7 @@ struct ve_tls_producer {
     int32_t fast_builder;
     const char * default_norm_key;
     ve_tls_log_group_builder * default_builder;
+    ve_tls_log_group_builder * persistent_builder_cache;
     ve_tls_mutex * mutex;
     ve_tls_cond * cond;
     ve_tls_cond * send_cond;

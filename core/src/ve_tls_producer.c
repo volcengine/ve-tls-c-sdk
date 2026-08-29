@@ -46,6 +46,92 @@ static int ve_tls_count_fits_array(size_t count, size_t elem_size) {
 
 static int ve_tls_wait_buffer_space_locked(ve_tls_producer * producer, size_t need_bytes, int reserve_for_send);
 
+static const size_t VE_TLS_REUSABLE_BUILDER_SHRINK_THRESHOLD = 1024 * 1024;
+static const size_t VE_TLS_REUSABLE_BUILDER_SHRINK_TO = 64 * 1024;
+
+static void ve_tls_log_builder_reset_reusable(ve_tls_log_group_builder * builder) {
+    if (!builder) {
+        return;
+    }
+    builder->logs_len = 0;
+    builder->log_count = 0;
+    builder->earliest = 0;
+    builder->latest = 0;
+    builder->start_id = 0;
+    builder->end_id = 0;
+    builder->last_time_ms = 0;
+    builder->last_time_ns = 0;
+    builder->last_has_time_ns = 0;
+    builder->first_append_ms = 0;
+    builder->next = NULL;
+    ve_tls_log_builder_shrink_if_needed(
+        builder,
+        VE_TLS_REUSABLE_BUILDER_SHRINK_THRESHOLD,
+        VE_TLS_REUSABLE_BUILDER_SHRINK_TO);
+}
+
+static int ve_tls_log_builder_set_norm_key(
+    ve_tls_log_group_builder * builder,
+    const char * norm_key
+) {
+    const char * desired = norm_key ? norm_key : "";
+    const char * current;
+    char * copy = NULL;
+    if (!builder) {
+        return -1;
+    }
+    current = builder->norm_key ? builder->norm_key : "";
+    if (strcmp(current, desired) == 0) {
+        return 0;
+    }
+    if (desired[0] != 0) {
+        copy = ve_tls_strdup(desired);
+        if (!copy) {
+            return -1;
+        }
+    }
+    ve_tls_free(builder->norm_key);
+    builder->norm_key = copy;
+    return 0;
+}
+
+static ve_tls_log_group_builder * ve_tls_persistent_builder_take_locked(
+    ve_tls_producer * producer,
+    const char * norm_key
+) {
+    ve_tls_log_group_builder * builder;
+    if (!producer) {
+        return NULL;
+    }
+    builder = producer->persistent_builder_cache;
+    producer->persistent_builder_cache = NULL;
+    VE_TLS_ALLOC_SITE("persistent_scratch_builder");
+    if (!builder) {
+        return ve_tls_log_builder_create(norm_key);
+    }
+    ve_tls_log_builder_reset_reusable(builder);
+    if (ve_tls_log_builder_set_norm_key(builder, norm_key) != 0) {
+        producer->persistent_builder_cache = builder;
+        return NULL;
+    }
+    return builder;
+}
+
+static void ve_tls_persistent_builder_return_locked(
+    ve_tls_producer * producer,
+    ve_tls_log_group_builder * builder
+) {
+    if (!builder) {
+        return;
+    }
+    ve_tls_log_builder_reset_reusable(builder);
+    if (producer && !producer->persistent_builder_cache) {
+        producer->persistent_builder_cache = builder;
+        return;
+    }
+    ve_tls_log_builder_free(builder);
+}
+
 static int ve_tls_copy_log_tags(const ve_tls_kv * tags, size_t count, ve_tls_kv ** out_tags, size_t * out_count) {
     VE_TLS_ALLOC_SITE("copy_log_tags");
     *out_tags = NULL;
@@ -587,7 +673,7 @@ static ve_tls_result ve_tls_producer_add_log_kv_persistent_locked(
     if (out_log_id) {
         *out_log_id = id;
     }
-    builder = ve_tls_log_builder_create(norm_key);
+    builder = ve_tls_persistent_builder_take_locked(producer, norm_key);
     if (!builder) {
         return VE_TLS_DROP_ERROR;
     }
@@ -647,7 +733,7 @@ static ve_tls_result ve_tls_producer_add_log_kv_persistent_locked(
     ve_tls_metrics_emit(producer, "log_enqueued", 1, (int64_t)raw_log_size);
     rc = VE_TLS_OK;
 end:
-    ve_tls_log_builder_free(builder);
+    ve_tls_persistent_builder_return_locked(producer, builder);
     if (rc != VE_TLS_OK) {
         ve_tls_metric_inc_u64(&producer->m_logs_dropped_total, 1);
         ve_tls_metric_inc_u64(&producer->m_bytes_dropped_total, 0);
@@ -907,24 +993,8 @@ struct ve_tls_log_template {
 static __thread ve_tls_tls_batch g_tls_batch;
 static int64_t g_send_cfg_version_seed = 1;
 static int64_t g_static_cred_version_seed = 1;
-static const size_t VE_TLS_TLS_BATCH_SHRINK_THRESHOLD = 1024 * 1024;
-static const size_t VE_TLS_TLS_BATCH_SHRINK_TO = 64 * 1024;
-
 static void ve_tls_tls_batch_reset(ve_tls_log_group_builder * b) {
-    if (!b) {
-        return;
-    }
-    b->logs_len = 0;
-    b->log_count = 0;
-    b->earliest = 0;
-    b->latest = 0;
-    b->start_id = 0;
-    b->end_id = 0;
-    b->last_time_ms = 0;
-    b->last_time_ns = 0;
-    b->last_has_time_ns = 0;
-    b->first_append_ms = 0;
-    ve_tls_log_builder_shrink_if_needed(b, VE_TLS_TLS_BATCH_SHRINK_THRESHOLD, VE_TLS_TLS_BATCH_SHRINK_TO);
+    ve_tls_log_builder_reset_reusable(b);
 }
 
 static int ve_tls_wait_buffer_space_locked(ve_tls_producer * producer, size_t need_bytes, int reserve_for_send);
@@ -2164,6 +2234,10 @@ void ve_tls_producer_destroy(ve_tls_producer * producer) {
     if (producer->default_builder) {
         ve_tls_log_builder_free(producer->default_builder);
         producer->default_builder = NULL;
+    }
+    if (producer->persistent_builder_cache) {
+        ve_tls_log_builder_free(producer->persistent_builder_cache);
+        producer->persistent_builder_cache = NULL;
     }
     ve_tls_queue_free_all(producer);
     ve_tls_ingress_queue_destroy(producer);

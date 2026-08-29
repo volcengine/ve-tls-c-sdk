@@ -14412,6 +14412,74 @@ static int test_persistent_ordered_add_avoids_secondary_ingress_allocation(void)
     return rc == VE_TLS_OK ? 0 : -1;
 }
 
+static int test_persistent_ordered_add_reuses_single_log_builder(void) {
+    char dir[PATH_MAX];
+    ve_tls_config cfg;
+    ve_tls_producer * p = NULL;
+    ve_tls_kv kv = {"message", "persistent-builder-reuse"};
+    ve_tls_log_group_builder * cached_builder;
+    unsigned char * cached_logs;
+    int failed = 0;
+    if (make_temp_dir(dir, sizeof(dir)) != 0) {
+        return -1;
+    }
+    ve_tls_config_init(&cfg);
+    cfg.endpoint = "https://example.com";
+    cfg.region = "cn-beijing";
+    cfg.topic_id = "t";
+    cfg.access_key_id = "ak";
+    cfg.access_key_secret = "sk";
+    cfg.retry_policy.max_attempts = 1;
+    cfg.flush_interval_ms = 100000;
+    cfg.compress_type = "none";
+    cfg.http_client.do_request = test_http_ok_do;
+    cfg.http_client.free_response = test_http_ok_free;
+    cfg.use_persistent = 1;
+    cfg.persistent_file_path = dir;
+    cfg.max_persistent_log_count = 128;
+    cfg.max_persistent_file_size = 4096;
+    cfg.max_persistent_file_count = 4;
+    cfg.ordered_send = 1;
+    p = ve_tls_producer_create(&cfg);
+    if (!p || !p->persistent) {
+        ve_tls_producer_destroy(p);
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+
+    if (ve_tls_producer_add_log_kv_hashkey(p, 0, "reuse-key", &kv, 1, 0) != VE_TLS_OK ||
+        !p->persistent_builder_cache ||
+        p->persistent_builder_cache->logs_len != 0 ||
+        p->persistent_builder_cache->log_count != 0) {
+        failed = 1;
+    }
+    cached_builder = p->persistent_builder_cache;
+    cached_logs = cached_builder ? cached_builder->logs : NULL;
+
+    if (!failed &&
+        (ve_tls_producer_add_log_kv_hashkey(p, 0, "reuse-key", &kv, 1, 0) != VE_TLS_OK ||
+         p->persistent_builder_cache != cached_builder ||
+         p->persistent_builder_cache->logs != cached_logs ||
+         p->persistent_builder_cache->logs_len != 0 ||
+         p->persistent_builder_cache->log_count != 0 ||
+         !p->persistent_builder_cache->norm_key ||
+         strcmp(p->persistent_builder_cache->norm_key, "reuse-key") != 0)) {
+        failed = 1;
+    }
+    if (!failed &&
+        (ve_tls_producer_add_log_kv_hashkey(p, 0, "next-key", &kv, 1, 0) != VE_TLS_OK ||
+         p->persistent_builder_cache != cached_builder ||
+         p->persistent_builder_cache->logs != cached_logs ||
+         !p->persistent_builder_cache->norm_key ||
+         strcmp(p->persistent_builder_cache->norm_key, "next-key") != 0)) {
+        failed = 1;
+    }
+
+    ve_tls_producer_destroy(p);
+    cleanup_persistent_dir(dir);
+    return failed ? -1 : 0;
+}
+
 static ve_tls_log_group_builder * test_make_single_log_ingress_batch(
     const char * norm_key,
     int64_t log_id
@@ -17267,6 +17335,7 @@ int main(void) {
     RUN(144, test_persistent_kv_path_batches_multiple_logs_into_single_request());
     RUN(150, test_persistent_append_releases_producer_mutex_for_disk_write());
     RUN(322, test_persistent_ordered_add_avoids_secondary_ingress_allocation());
+    RUN(324, test_persistent_ordered_add_reuses_single_log_builder());
     RUN(323, test_persistent_ingress_keeps_ack_ranges_contiguous_across_hash_keys());
     RUN(151, test_persistent_out_of_order_ack_waits_for_contiguous_prefix());
     RUN(184, test_persistent_checkpoint_fsync_failure_stays_dirty_and_emits_metric());
