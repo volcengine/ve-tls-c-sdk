@@ -3732,6 +3732,46 @@ static int test_queue_push_front_pop_order(void) {
     return (id0 == 0 && id1 == 1 && id2 == 2) ? 0 : -1;
 }
 
+static int test_queue_finish_preserves_pending_builder(void) {
+    const int32_t idle_ttls[] = {0, 10};
+    for (size_t i = 0; i < sizeof(idle_ttls) / sizeof(idle_ttls[0]); i++) {
+        ve_tls_config cfg;
+        ve_tls_producer p;
+        ve_tls_kv kv = {"k", "v"};
+        ve_tls_config_init(&cfg);
+        g_real_platform = cfg.platform;
+        g_fake_time = 1000;
+        cfg.platform.time_ms = test_fake_time_ms;
+        cfg.key_queue_idle_ttl_ms = idle_ttls[i];
+        if (init_fake_sender_producer(&p, &cfg) != 0) return -1;
+
+        ve_tls_key_queue * q = ve_tls_key_queue_get_or_create(&p, "k1");
+        if (!q) {
+            destroy_fake_sender_producer(&p);
+            return -1;
+        }
+        q->builder = ve_tls_log_builder_create(q->key);
+        if (!q->builder ||
+            ve_tls_log_builder_add_kv_lens(
+                q->builder, 2, 1710000000000LL, 0, 0,
+                &kv, NULL, NULL, 1) != 0) {
+            destroy_fake_sender_producer(&p);
+            return -1;
+        }
+        q->inflight = 1;
+        ve_tls_key_queue_finish(&p, q);
+        g_fake_time += 20;
+        ve_tls_idle_cleanup(&p);
+
+        ve_tls_key_queue * retained = find_key_queue(&p, "k1");
+        int failed = retained != q || !retained->builder ||
+            retained->builder->log_count != 1 || retained->idle;
+        destroy_fake_sender_producer(&p);
+        if (failed) return -1;
+    }
+    return 0;
+}
+
 static int test_queue_idle_cleanup_removes_expired(void) {
     ve_tls_config cfg;
     ve_tls_config_init(&cfg);
@@ -14125,6 +14165,103 @@ static int test_persistent_concurrent_append_ack_and_reclaim(void) {
     return failed ? -1 : 0;
 }
 
+static int test_persistent_streaming_reclaims_below_total_record_limit(void) {
+    char dir[PATH_MAX];
+    char value[900];
+    ve_tls_config cfg;
+    ve_tls_producer * producer = NULL;
+    ve_tls_kv kv = {"payload", value};
+    int accepted = 0;
+    int first_failure = 0;
+    int first_assigned_id_mismatch = 0;
+    int64_t acked = 0;
+    uint64_t current_records = 0;
+    uint32_t current_segments = 0;
+    ve_tls_metrics metrics;
+    ve_tls_result close_rc;
+    int failed = 0;
+    if (make_temp_dir(dir, sizeof(dir)) != 0) {
+        return -1;
+    }
+    memset(value, 'x', sizeof(value) - 1);
+    value[sizeof(value) - 1] = 0;
+    ve_tls_config_init(&cfg);
+    cfg.endpoint = "https://example.com";
+    cfg.region = "cn-beijing";
+    cfg.topic_id = "persistent-streaming-capacity";
+    cfg.access_key_id = "ak";
+    cfg.access_key_secret = "sk";
+    cfg.http_client.do_request = test_http_ok_do;
+    cfg.http_client.free_response = test_http_ok_free;
+    cfg.flush_interval_ms = 30;
+    cfg.log_count_per_package = 1024;
+    cfg.log_bytes_per_package = 4 * 1024;
+    cfg.send_thread_count = 1;
+    cfg.ordered_send = 1;
+    cfg.compress_type = "none";
+    cfg.use_persistent = 1;
+    cfg.persistent_file_path = dir;
+    cfg.max_persistent_log_count = 200;
+    cfg.max_persistent_file_size = 8 * 1024;
+    cfg.max_persistent_file_count = 32;
+    cfg.persistent_max_bytes = 256 * 1024;
+    cfg.persistent_max_records = 0;
+    cfg.persistent_max_segments = 0;
+    cfg.persistent_overflow_policy = VE_TLS_POVERFLOW_REJECT_NEW;
+    producer = ve_tls_producer_create(&cfg);
+    if (!producer || !producer->persistent) {
+        ve_tls_producer_destroy(producer);
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    for (int i = 0; i < 260; i++) {
+        int64_t assigned_id = 0;
+        ve_tls_result rc = ve_tls_producer_add_log_kv_with_id(
+            producer, 1710000000000LL + i, &kv, 1, i == 259, &assigned_id);
+        if (assigned_id != i + 1 && first_assigned_id_mismatch == 0) {
+            first_assigned_id_mismatch = i + 1;
+        }
+        if (rc == VE_TLS_OK) {
+            accepted++;
+        } else if (first_failure == 0) {
+            first_failure = i + 1;
+        }
+        cfg.platform.sleep_ms(10);
+    }
+    for (int i = 0; i < 1000; i++) {
+        acked = test_producer_checkpoint_acked_log_id(producer);
+        if (acked >= accepted) {
+            break;
+        }
+        cfg.platform.sleep_ms(10);
+    }
+    memset(&metrics, 0, sizeof(metrics));
+    ve_tls_producer_get_metrics(producer, &metrics);
+    close_rc = ve_tls_producer_close(producer, 10000);
+    acked = test_producer_checkpoint_acked_log_id(producer);
+    current_records = producer->persistent->current_records;
+    current_segments = producer->persistent->current_segments;
+    if (accepted != 260 || first_failure != 0 ||
+        first_assigned_id_mismatch != 0 || acked != accepted ||
+        current_records >= 200 || current_segments >= 32 ||
+        close_rc != VE_TLS_OK) {
+        fprintf(stderr,
+            "persistent streaming capacity debug accepted=%d first_failure=%d first_id_mismatch=%d acked=%lld records=%llu segments=%u requests=%llu close=%d\n",
+            accepted,
+            first_failure,
+            first_assigned_id_mismatch,
+            (long long)acked,
+            (unsigned long long)current_records,
+            current_segments,
+            (unsigned long long)metrics.requests_total,
+            (int)close_rc);
+        failed = 1;
+    }
+    ve_tls_producer_destroy(producer);
+    cleanup_persistent_dir(dir);
+    return failed ? -1 : 0;
+}
+
 static int test_persistent_overflow_drop_newest_sample_uses_sample_rate(void) {
     char dir[PATH_MAX];
     ve_tls_config cfg;
@@ -17368,6 +17505,7 @@ int main(void) {
     RUN(101, test_sender_main_stop_empty_returns());
     RUN(102, test_sender_main_stop_drains_send_queue_and_sends());
     RUN(104, test_queue_push_front_pop_order());
+    RUN(329, test_queue_finish_preserves_pending_builder());
     RUN(105, test_queue_idle_cleanup_removes_expired());
     RUN(106, test_queue_delayed_promote_due_moves_to_ready());
     RUN(119, test_ingress_queue_push_pop_order_and_drain_state());
@@ -17520,6 +17658,7 @@ int main(void) {
     RUN(194, test_persistent_drop_newest_sample_never_deletes_old_wal());
     RUN(195, test_persistent_ack_range_rejects_hole());
     RUN(197, test_persistent_concurrent_append_ack_and_reclaim());
+    RUN(328, test_persistent_streaming_reclaims_below_total_record_limit());
     RUN(138, test_persistent_overflow_drop_newest_sample_uses_sample_rate());
     RUN(196, test_persistent_overflow_drop_oldest_emits_loss_metric());
     RUN(139, test_add_log_with_id_returns_monotonic_ids());

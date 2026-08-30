@@ -644,7 +644,8 @@ void ve_tls_delayed_promote_due(ve_tls_producer * producer, int64_t now_ms) {
 }
 
 static void ve_tls_idle_add(ve_tls_producer * producer, ve_tls_key_queue * q, int64_t now_ms) {
-    if (!producer || !q || q->idle || q->count != 0 || q->inflight) {
+    if (!producer || !q || q->idle || q->count != 0 || q->inflight ||
+        (q->builder && q->builder->log_count > 0)) {
         return;
     }
     q->idle = 1;
@@ -671,7 +672,9 @@ void ve_tls_idle_cleanup(ve_tls_producer * producer) {
     ve_tls_key_queue * q = producer->idle_head;
     while (q) {
         ve_tls_key_queue * next = q->inext;
-        if (q->idle && q->count == 0 && !q->inflight && now - q->empty_since_ms >= ttl) {
+        if (q->idle && q->count == 0 && !q->inflight &&
+            (!q->builder || q->builder->log_count == 0) &&
+            now - q->empty_since_ms >= ttl) {
             ve_tls_idle_remove(producer, q);
             ve_tls_key_queue_remove_and_free(producer, q);
         }
@@ -923,6 +926,16 @@ void ve_tls_key_queue_finish(ve_tls_producer * producer, ve_tls_key_queue * q) {
         } else {
             ve_tls_ready_add(producer, q);
         }
+        producer->config.platform.cond_broadcast(producer->send_cond);
+        return;
+    }
+    /* A persistent add can merge into this key's aggregate builder while the
+     * previous send task is still in flight. The builder is not represented by
+     * q->count until the manager seals it. Removing the queue here would free
+     * accepted, durable records before they are sent and leave a permanent WAL
+     * acknowledgement hole. */
+    if (q->builder && q->builder->log_count > 0) {
+        producer->config.platform.cond_signal(producer->cond);
         producer->config.platform.cond_broadcast(producer->send_cond);
         return;
     }
