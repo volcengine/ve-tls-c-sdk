@@ -40,7 +40,10 @@ enum {
     VE_TLS_DEFAULT_MAX_BUFFER_BYTES = 64 * 1024 * 1024,
     VE_TLS_DEFAULT_LOG_BYTES_PER_PACKAGE = 10 * 1024 * 1024,
     VE_TLS_DEFAULT_LOG_COUNT_PER_PACKAGE = 2048,
-    VE_TLS_DEFAULT_SEND_QUEUE_SIZE = 1024
+    /* Zero is the auto-tune sentinel. Keep positive values available as exact
+     * caller overrides; 1024 is also a useful real capacity for high-cardinality
+     * ordered/hash routing and must not be mistaken for "use defaults". */
+    VE_TLS_AUTO_SEND_QUEUE_SIZE = 0
 };
 
 static int32_t ve_tls_runtime_default_package_bytes(int32_t max_buffer_bytes) {
@@ -102,7 +105,7 @@ void ve_tls_producer_config_init(ve_tls_config * config) {
     config->log_bytes_per_package = VE_TLS_DEFAULT_LOG_BYTES_PER_PACKAGE;
     config->log_count_per_package = VE_TLS_DEFAULT_LOG_COUNT_PER_PACKAGE;
     config->flush_interval_ms = 1000;
-    config->send_queue_size = VE_TLS_DEFAULT_SEND_QUEUE_SIZE;
+    config->send_queue_size = VE_TLS_AUTO_SEND_QUEUE_SIZE;
     config->send_queue_full_policy = VE_TLS_SEND_QUEUE_FULL_DROP;
     config->send_queue_block_timeout_ms = 100;
     config->send_queue_sample_every_n = 10;
@@ -176,7 +179,7 @@ void ve_tls_producer_config_apply_runtime_defaults(ve_tls_config * config) {
     if (config->pack_thread_count == VE_TLS_DEFAULT_PACK_THREAD_COUNT) {
         config->pack_thread_count = config->send_thread_count;
     }
-    if (config->send_queue_size == VE_TLS_DEFAULT_SEND_QUEUE_SIZE) {
+    if (config->send_queue_size == VE_TLS_AUTO_SEND_QUEUE_SIZE) {
         config->send_queue_size = ve_tls_runtime_default_send_queue_size(
             config->max_buffer_bytes,
             config->log_bytes_per_package > 0 ? config->log_bytes_per_package : derived_log_bytes);

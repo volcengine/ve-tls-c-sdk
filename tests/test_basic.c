@@ -40,6 +40,12 @@ static double fixed_rand01(void * p);
 static int init_fake_sender_producer(ve_tls_producer * p, ve_tls_config * cfg);
 static void destroy_fake_sender_producer(ve_tls_producer * p);
 
+#define TEST_HASH_KEY_ZERO "00000000000000000000000000000000"
+#define TEST_HASH_KEY_A "00000000000000000000000000000001"
+#define TEST_HASH_KEY_B "00000000000000000000000000000002"
+#define TEST_HASH_KEY_MAX "fffffffffffffffffffffffffffffffe"
+#define TEST_HASH_KEY_UPPER_BOUND "ffffffffffffffffffffffffffffffff"
+
 static int g_http_done = 0;
 static int g_http_ok = 0;
 
@@ -1578,11 +1584,11 @@ static int test_sender_key_rate_limit_delays_same_key(void) {
     ve_tls_kv kvs[1];
     kvs[0].key = "k";
     kvs[0].value = "v";
-    if (ve_tls_producer_add_log_kv_hashkey(p, 0, "hk", kvs, 1, 1) != VE_TLS_OK) {
+    if (ve_tls_producer_add_log_kv_hashkey(p, 0, TEST_HASH_KEY_A, kvs, 1, 1) != VE_TLS_OK) {
         ve_tls_producer_destroy(p);
         return -1;
     }
-    if (ve_tls_producer_add_log_kv_hashkey(p, 0, "hk", kvs, 1, 1) != VE_TLS_OK) {
+    if (ve_tls_producer_add_log_kv_hashkey(p, 0, TEST_HASH_KEY_A, kvs, 1, 1) != VE_TLS_OK) {
         ve_tls_producer_destroy(p);
         return -1;
     }
@@ -1644,11 +1650,11 @@ static int test_sender_key_breaker_delays_same_key(void) {
     ve_tls_kv kvs[1];
     kvs[0].key = "k";
     kvs[0].value = "v";
-    if (ve_tls_producer_add_log_kv_hashkey(p, 0, "hk", kvs, 1, 1) != VE_TLS_OK) {
+    if (ve_tls_producer_add_log_kv_hashkey(p, 0, TEST_HASH_KEY_A, kvs, 1, 1) != VE_TLS_OK) {
         ve_tls_producer_destroy(p);
         return -1;
     }
-    if (ve_tls_producer_add_log_kv_hashkey(p, 0, "hk", kvs, 1, 1) != VE_TLS_OK) {
+    if (ve_tls_producer_add_log_kv_hashkey(p, 0, TEST_HASH_KEY_A, kvs, 1, 1) != VE_TLS_OK) {
         ve_tls_producer_destroy(p);
         return -1;
     }
@@ -2180,7 +2186,7 @@ static int g_func_matrix_seen_new_ak = 0;
 static int test_http_sender_check_default_hashkey_do(ve_tls_http_client * client, const ve_tls_http_request * req, ve_tls_http_response * resp) {
     (void)client;
     if (!req || !resp) return -1;
-    if (req->headers && strstr(req->headers, "x-tls-hashkey: def-hk")) {
+    if (req->headers && strstr(req->headers, "x-tls-hashkey: " TEST_HASH_KEY_A)) {
         __atomic_store_n(&g_sender_hdr_ok, 1, __ATOMIC_RELEASE);
     }
     resp->status_code = 200;
@@ -2396,7 +2402,7 @@ static int test_sender_default_hash_key_header_set(void) {
     cfg.topic_id = "t";
     cfg.access_key_id = "ak";
     cfg.access_key_secret = "sk";
-    cfg.hash_key = "def-hk";
+    cfg.hash_key = TEST_HASH_KEY_A;
     cfg.log_count_per_package = 1;
     cfg.flush_interval_ms = 10;
     cfg.retry_policy.max_attempts = 1;
@@ -3221,6 +3227,18 @@ static int test_http_step_status_401_plain_do(ve_tls_http_client * client, const
     resp->status_code = 401;
     resp->request_id = strdup("rid-401");
     resp->body = (unsigned char *)strdup("plain");
+    resp->body_size = strlen((const char *)resp->body);
+    return 0;
+}
+
+static int test_http_step_status_expired_token_do(ve_tls_http_client * client, const ve_tls_http_request * req, ve_tls_http_response * resp) {
+    (void)client;
+    (void)req;
+    if (!resp) return -1;
+    g_step_http_calls++;
+    resp->status_code = 400;
+    resp->request_id = strdup("rid-expired-token");
+    resp->body = (unsigned char *)strdup("{\"ErrorCode\":\"ExpiredToken\",\"ErrorMessage\":\"expired\"}");
     resp->body_size = strlen((const char *)resp->body);
     return 0;
 }
@@ -4748,7 +4766,7 @@ static int test_manager_key_queue_limit_exceeded_drops(void) {
     ve_tls_kv kvs[1];
     kvs[0].key = "k1";
     kvs[0].value = "v1";
-    if (ve_tls_producer_add_log_kv_hashkey(p, 0, "hk1", kvs, 1, 1) != VE_TLS_OK) {
+    if (ve_tls_producer_add_log_kv_hashkey(p, 0, TEST_HASH_KEY_A, kvs, 1, 1) != VE_TLS_OK) {
         ve_tls_producer_destroy(p);
         return -1;
     }
@@ -4761,7 +4779,7 @@ static int test_manager_key_queue_limit_exceeded_drops(void) {
     __atomic_store_n(&g_mgr_p2l_done, 0, __ATOMIC_RELAXED);
     g_mgr_p2l_ok = 0;
     ve_tls_producer_set_send_done_v2(p, on_send_done_mgr_p2l_v2, NULL);
-    if (ve_tls_producer_add_log_kv_hashkey(p, 0, "hk2", kvs, 1, 1) != VE_TLS_OK) {
+    if (ve_tls_producer_add_log_kv_hashkey(p, 0, TEST_HASH_KEY_B, kvs, 1, 1) != VE_TLS_OK) {
         ve_tls_producer_destroy(p);
         return -1;
     }
@@ -5250,7 +5268,7 @@ static int test_add_log_with_id_returns_monotonic_ids(void) {
         ve_tls_producer_destroy(p);
         return -1;
     }
-    if (ve_tls_producer_add_log_kv_hashkey_with_id(p, 0, "hk", kvs, 1, 1, &kv_id) != VE_TLS_OK || kv_id <= raw_id) {
+    if (ve_tls_producer_add_log_kv_hashkey_with_id(p, 0, TEST_HASH_KEY_A, kvs, 1, 1, &kv_id) != VE_TLS_OK || kv_id <= raw_id) {
         ve_tls_producer_destroy(p);
         return -1;
     }
@@ -6432,7 +6450,86 @@ static int test_producer_derived_defaults_preserve_explicit_overrides(void) {
          p->sender_count == 1 &&
          p->worker_count == 1;
     ve_tls_producer_destroy(p);
+    if (!ok) return -1;
+
+    /* 1024 was the legacy auto-tune sentinel. Positive queue capacities are
+     * exact public overrides; only zero requests runtime auto-tuning. */
+    ve_tls_config_init(&cfg);
+    cfg.endpoint = "https://example.com";
+    cfg.region = "cn-beijing";
+    cfg.topic_id = "t";
+    cfg.access_key_id = "ak";
+    cfg.access_key_secret = "sk";
+    cfg.max_buffer_bytes = 64 * 1024 * 1024;
+    cfg.send_queue_size = 1024;
+
+    p = ve_tls_producer_create(&cfg);
+    if (!p) return -1;
+    ok = p->config.send_queue_size == 1024;
+    ve_tls_producer_destroy(p);
     return ok ? 0 : -1;
+}
+
+static int test_hash_key_and_time_ns_public_contract(void) {
+    ve_tls_config cfg;
+    ve_tls_kv kv = {"k", "v"};
+    const char * keys[1] = {"k"};
+    size_t key_lens[1] = {1};
+    ve_tls_log_template * tpl;
+    ve_tls_producer * p;
+
+    ve_tls_config_init(&cfg);
+    cfg.endpoint = "https://example.com";
+    cfg.region = "cn-beijing";
+    cfg.topic_id = "t";
+    cfg.access_key_id = "ak";
+    cfg.access_key_secret = "sk";
+    cfg.hash_key = TEST_HASH_KEY_UPPER_BOUND;
+    p = ve_tls_producer_create(&cfg);
+    if (p) {
+        ve_tls_producer_destroy(p);
+        return -1;
+    }
+
+    cfg.hash_key = TEST_HASH_KEY_ZERO;
+    cfg.flush_interval_ms = 100000;
+    cfg.http_client.do_request = test_http_ok_do;
+    cfg.http_client.free_response = test_http_ok_free;
+    p = ve_tls_producer_create(&cfg);
+    if (!p) return -2;
+
+    if (ve_tls_producer_add_log_kv_hashkey(p, 1710000000000LL, TEST_HASH_KEY_ZERO, &kv, 1, 0) != VE_TLS_OK ||
+        ve_tls_producer_add_log_kv_hashkey(p, 1710000000001LL, TEST_HASH_KEY_MAX, &kv, 1, 0) != VE_TLS_OK ||
+        ve_tls_producer_add_log_kv_hashkey(p, 1710000000002LL, TEST_HASH_KEY_UPPER_BOUND, &kv, 1, 0) != VE_TLS_INVALID ||
+        ve_tls_producer_add_log_kv_hashkey(p, 1710000000003LL, "0000000000000000000000000000000A", &kv, 1, 0) != VE_TLS_INVALID ||
+        ve_tls_producer_add_log_kv_hashkey(p, 1710000000004LL, "01", &kv, 1, 0) != VE_TLS_INVALID) {
+        ve_tls_producer_destroy(p);
+        return -3;
+    }
+
+    if (ve_tls_producer_add_log_kv_time_parts_hashkey(
+            p, 1710000000005LL, 1, 999999U, TEST_HASH_KEY_A, &kv, 1, 0) != VE_TLS_OK ||
+        ve_tls_producer_add_log_kv_time_parts_hashkey(
+            p, 1710000000006LL, 1, 1000000U, TEST_HASH_KEY_A, &kv, 1, 0) != VE_TLS_INVALID ||
+        ve_tls_producer_add_log_raw_time_parts(
+            p, 1710000000007LL, 1, 1000000U, "raw", 3, 0) != VE_TLS_INVALID) {
+        ve_tls_producer_destroy(p);
+        return -4;
+    }
+
+    tpl = ve_tls_template_create(p, keys, key_lens, 1, TEST_HASH_KEY_MAX);
+    if (!tpl) {
+        ve_tls_producer_destroy(p);
+        return -5;
+    }
+    ve_tls_template_destroy(tpl);
+    if (ve_tls_template_create(p, keys, key_lens, 1, TEST_HASH_KEY_UPPER_BOUND) != NULL) {
+        ve_tls_producer_destroy(p);
+        return -6;
+    }
+
+    ve_tls_producer_destroy(p);
+    return 0;
 }
 
 static int test_producer_create_rejects_block_without_timeout(void) {
@@ -6978,7 +7075,7 @@ static int test_template_high_rate_submit_metrics(void) {
     if (!p) return -1;
     const char * keys[2] = {"k1", "k2"};
     size_t key_lens[2] = {2, 2};
-    ve_tls_log_template * tpl = ve_tls_template_create(p, keys, key_lens, 2, "hk_tpl");
+    ve_tls_log_template * tpl = ve_tls_template_create(p, keys, key_lens, 2, TEST_HASH_KEY_A);
     if (!tpl) {
         ve_tls_producer_destroy(p);
         return -1;
@@ -7171,7 +7268,7 @@ static int test_import_raw_buffer_hash_key_ok(void) {
     ve_tls_kv kvs[1];
     kvs[0].key = "k1";
     kvs[0].value = "v1";
-    if (ve_tls_producer_add_log_kv_hashkey(p, 1710000000000LL, "hk1", kvs, 1, 0) != VE_TLS_OK) {
+    if (ve_tls_producer_add_log_kv_hashkey(p, 1710000000000LL, TEST_HASH_KEY_A, kvs, 1, 0) != VE_TLS_OK) {
         ve_tls_producer_destroy(p);
         return -1;
     }
@@ -9311,7 +9408,12 @@ static int test_ordered_send_max_concurrency_one(void) {
     return g_order_max == 1 ? 0 : -1;
 }
 
-static const char * g_hk_keys[4] = {"key_a", "key_b", "key_c", "key_d"};
+static const char * g_hk_keys[4] = {
+    TEST_HASH_KEY_ZERO,
+    TEST_HASH_KEY_A,
+    TEST_HASH_KEY_B,
+    TEST_HASH_KEY_MAX
+};
 static int g_hk_cur[4] = {0};
 static int g_hk_max[4] = {0};
 static int g_hk_total_cur = 0;
@@ -9514,7 +9616,7 @@ static int test_agg_strategy_split_by_compressed_limit(void) {
     kvs[0].value = big;
     for (int i = 0; i < 80; i++) {
         int flush = (i == 79) ? 1 : 0;
-        if (ve_tls_producer_add_log_kv_hashkey(p, 0, "key_a", kvs, 1, flush) != VE_TLS_OK) {
+        if (ve_tls_producer_add_log_kv_hashkey(p, 0, TEST_HASH_KEY_ZERO, kvs, 1, flush) != VE_TLS_OK) {
             ve_tls_producer_destroy(p);
             return -1;
         }
@@ -9582,11 +9684,11 @@ static int test_key_queue_max_active_drops(void) {
     ve_tls_kv kvs[1];
     kvs[0].key = "k";
     kvs[0].value = "v";
-    if (ve_tls_producer_add_log_kv_hashkey(p, 0, "k1", kvs, 1, 1) != VE_TLS_OK) {
+    if (ve_tls_producer_add_log_kv_hashkey(p, 0, TEST_HASH_KEY_A, kvs, 1, 1) != VE_TLS_OK) {
         ve_tls_producer_destroy(p);
         return -1;
     }
-    if (ve_tls_producer_add_log_kv_hashkey(p, 0, "k2", kvs, 1, 1) != VE_TLS_OK) {
+    if (ve_tls_producer_add_log_kv_hashkey(p, 0, TEST_HASH_KEY_B, kvs, 1, 1) != VE_TLS_OK) {
         ve_tls_producer_destroy(p);
         return -1;
     }
@@ -9615,8 +9717,8 @@ static int test_key_rate_limit_do(ve_tls_http_client * client, const ve_tls_http
     if (p) {
         p += strlen("x-tls-hashkey:");
         while (*p == ' ') p++;
-        if (strncmp(p, "k1", 2) == 0) idx = 0;
-        if (strncmp(p, "k2", 2) == 0) idx = 1;
+        if (strncmp(p, TEST_HASH_KEY_A, 32) == 0) idx = 0;
+        if (strncmp(p, TEST_HASH_KEY_B, 32) == 0) idx = 1;
     }
     if (idx < 0) {
         return -1;
@@ -9667,19 +9769,19 @@ static int test_key_rate_limit_is_per_key(void) {
     ve_tls_kv kvs[1];
     kvs[0].key = "k";
     kvs[0].value = "v";
-    if (ve_tls_producer_add_log_kv_hashkey(p, 0, "k1", kvs, 1, 1) != VE_TLS_OK) {
+    if (ve_tls_producer_add_log_kv_hashkey(p, 0, TEST_HASH_KEY_A, kvs, 1, 1) != VE_TLS_OK) {
         ve_tls_producer_destroy(p);
         return -1;
     }
-    if (ve_tls_producer_add_log_kv_hashkey(p, 0, "k2", kvs, 1, 1) != VE_TLS_OK) {
+    if (ve_tls_producer_add_log_kv_hashkey(p, 0, TEST_HASH_KEY_B, kvs, 1, 1) != VE_TLS_OK) {
         ve_tls_producer_destroy(p);
         return -1;
     }
-    if (ve_tls_producer_add_log_kv_hashkey(p, 0, "k1", kvs, 1, 1) != VE_TLS_OK) {
+    if (ve_tls_producer_add_log_kv_hashkey(p, 0, TEST_HASH_KEY_A, kvs, 1, 1) != VE_TLS_OK) {
         ve_tls_producer_destroy(p);
         return -1;
     }
-    if (ve_tls_producer_add_log_kv_hashkey(p, 0, "k2", kvs, 1, 1) != VE_TLS_OK) {
+    if (ve_tls_producer_add_log_kv_hashkey(p, 0, TEST_HASH_KEY_B, kvs, 1, 1) != VE_TLS_OK) {
         ve_tls_producer_destroy(p);
         return -1;
     }
@@ -9891,7 +9993,10 @@ static int test_proto_time_ns(void) {
         }
     }
     ve_tls_bytes_free(&log);
-    return ok ? 0 : -1;
+    if (!ok) return -1;
+    return ve_tls_proto_encode_log_ex(1710000000000LL, 1000000U, 1, kvs, 1, &log) != 0
+        ? 0
+        : -1;
 }
 
 static int test_proto_log_tags_and_context_flow(void) {
@@ -12170,6 +12275,8 @@ static int test_run_persistent_auth_policy(
         cfg.http_client.do_request = test_http_step_status_401_plain_do;
     } else if (failure_kind == 403) {
         cfg.http_client.do_request = test_http_step_status_403_plain_do;
+    } else if (failure_kind == 400) {
+        cfg.http_client.do_request = test_http_step_status_expired_token_do;
     } else {
         cfg.access_key_id = NULL;
         cfg.access_key_secret = NULL;
@@ -12231,6 +12338,8 @@ static int test_persistent_auth_failure_retain_drop_policy(void) {
     if (test_run_persistent_auth_policy(VE_TLS_PAUTH_DROP, 0, 401) != 0) return -4;
     if (test_run_persistent_auth_policy(VE_TLS_PAUTH_RETAIN, 1, 0) != 0) return -5;
     if (test_run_persistent_auth_policy(VE_TLS_PAUTH_DROP, 0, 0) != 0) return -6;
+    if (test_run_persistent_auth_policy(VE_TLS_PAUTH_RETAIN, 1, 400) != 0) return -7;
+    if (test_run_persistent_auth_policy(VE_TLS_PAUTH_DROP, 0, 400) != 0) return -8;
     return 0;
 }
 
@@ -12993,7 +13102,7 @@ static int test_persistent_key_queue_failure_retains_and_recovers(void) {
         cleanup_persistent_dir(dir);
         return -2;
     }
-    if (ve_tls_producer_add_log_kv_hashkey(p1, 0, "hk1", &kv, 1, 1) != VE_TLS_OK) {
+    if (ve_tls_producer_add_log_kv_hashkey(p1, 0, TEST_HASH_KEY_A, &kv, 1, 1) != VE_TLS_OK) {
         ve_tls_producer_destroy(p1);
         cleanup_persistent_dir(dir);
         return -3;
@@ -13011,7 +13120,7 @@ static int test_persistent_key_queue_failure_retains_and_recovers(void) {
     }
 
     ve_tls_producer_set_send_done_v2(p1, on_send_done_mgr_p2l_v2, NULL);
-    if (ve_tls_producer_add_log_kv_hashkey(p1, 0, "hk2", &kv, 1, 1) != VE_TLS_OK) {
+    if (ve_tls_producer_add_log_kv_hashkey(p1, 0, TEST_HASH_KEY_B, &kv, 1, 1) != VE_TLS_OK) {
         ve_tls_producer_destroy(p1);
         cleanup_persistent_dir(dir);
         return -5;
@@ -14777,7 +14886,7 @@ static int test_persistent_ordered_add_reuses_single_log_builder(void) {
         return -1;
     }
 
-    if (ve_tls_producer_add_log_kv_hashkey(p, 0, "reuse-key", &kv, 1, 0) != VE_TLS_OK ||
+    if (ve_tls_producer_add_log_kv_hashkey(p, 0, TEST_HASH_KEY_A, &kv, 1, 0) != VE_TLS_OK ||
         !p->persistent_builder_cache ||
         p->persistent_builder_cache->logs_len != 0 ||
         p->persistent_builder_cache->log_count != 0) {
@@ -14787,21 +14896,21 @@ static int test_persistent_ordered_add_reuses_single_log_builder(void) {
     cached_logs = cached_builder ? cached_builder->logs : NULL;
 
     if (!failed &&
-        (ve_tls_producer_add_log_kv_hashkey(p, 0, "reuse-key", &kv, 1, 0) != VE_TLS_OK ||
+        (ve_tls_producer_add_log_kv_hashkey(p, 0, TEST_HASH_KEY_A, &kv, 1, 0) != VE_TLS_OK ||
          p->persistent_builder_cache != cached_builder ||
          p->persistent_builder_cache->logs != cached_logs ||
          p->persistent_builder_cache->logs_len != 0 ||
          p->persistent_builder_cache->log_count != 0 ||
          !p->persistent_builder_cache->norm_key ||
-         strcmp(p->persistent_builder_cache->norm_key, "reuse-key") != 0)) {
+         strcmp(p->persistent_builder_cache->norm_key, TEST_HASH_KEY_A) != 0)) {
         failed = 1;
     }
     if (!failed &&
-        (ve_tls_producer_add_log_kv_hashkey(p, 0, "next-key", &kv, 1, 0) != VE_TLS_OK ||
+        (ve_tls_producer_add_log_kv_hashkey(p, 0, TEST_HASH_KEY_B, &kv, 1, 0) != VE_TLS_OK ||
          p->persistent_builder_cache != cached_builder ||
          p->persistent_builder_cache->logs != cached_logs ||
          !p->persistent_builder_cache->norm_key ||
-         strcmp(p->persistent_builder_cache->norm_key, "next-key") != 0)) {
+         strcmp(p->persistent_builder_cache->norm_key, TEST_HASH_KEY_B) != 0)) {
         failed = 1;
     }
 
@@ -15646,7 +15755,7 @@ static int t_p0_export_import_with_hash_key(void) {
     cfg.flush_interval_ms = 100000;
     cfg.log_count_per_package = 1000;
     cfg.log_bytes_per_package = 100000;
-    cfg.hash_key = "k-prod";
+    cfg.hash_key = TEST_HASH_KEY_A;
     ve_tls_producer * p = ve_tls_producer_create(&cfg);
     if (!p) return -1;
     ve_tls_kv kvs[1] = {{"a", "b"}};
@@ -15721,7 +15830,7 @@ static int t_p0_import_raw_buffer_hk_malloc_fail(void) {
     cfg.flush_interval_ms = 100000;
     cfg.log_count_per_package = 1000;
     cfg.log_bytes_per_package = 100000;
-    cfg.hash_key = "hkey";
+    cfg.hash_key = TEST_HASH_KEY_A;
     ve_tls_producer * p = ve_tls_producer_create(&cfg);
     if (!p) return -1;
     ve_tls_kv kvs[1] = {{"a", "b"}};
@@ -15776,7 +15885,7 @@ static int t_p0_add_log_kv_hk_strdup_fail_drops(void) {
     ve_tls_config cfg;
     cov2_make_min_cfg(&cfg);
     cfg.flush_interval_ms = 100000;
-    cfg.hash_key = "topic-hk";
+    cfg.hash_key = TEST_HASH_KEY_A;
     ve_tls_producer * p = ve_tls_producer_create(&cfg);
     if (!p) return -1;
     ve_tls_kv kvs[1] = {{"a", "b"}};
@@ -15868,7 +15977,7 @@ static int t_p2_template_full(void) {
     /* main path with hash_key + multiple keys */
     const char * keys[3] = {"k1", "k2", "k3"};
     size_t key_lens[3] = {2, 2, 2};
-    ve_tls_log_template * tpl = ve_tls_template_create(p, keys, key_lens, 3, "hk-tpl");
+    ve_tls_log_template * tpl = ve_tls_template_create(p, keys, key_lens, 3, TEST_HASH_KEY_A);
     if (!tpl) { ve_tls_producer_destroy(p); return -2; }
     /* add_values OK */
     const char * vals[3] = {"a", "b", "c"};
@@ -15906,7 +16015,7 @@ static int t_p2_template_full(void) {
     /* alloc-fail fuzz across template_create */
     for (int i = 0; i < 8; i++) {
         ve_tls_alloc_fault_inject("template_create", i, 1);
-        ve_tls_log_template * t = ve_tls_template_create(p, keys, key_lens, 3, "hk");
+        ve_tls_log_template * t = ve_tls_template_create(p, keys, key_lens, 3, TEST_HASH_KEY_A);
         ve_tls_alloc_fault_inject(NULL, 0, 0);
         if (t) ve_tls_template_destroy(t);
     }
@@ -16021,7 +16130,7 @@ static int t_p2_export_import_fuzz(void) {
     cfg.flush_interval_ms = 100000;
     cfg.log_count_per_package = 1000;
     cfg.log_bytes_per_package = 100000;
-    cfg.hash_key = "hk";
+    cfg.hash_key = TEST_HASH_KEY_A;
 
     /* fuzz export with isolated producer per iteration to avoid mid-failure state pollution */
     for (int i = 0; i < 5; i++) {
@@ -16271,7 +16380,7 @@ static int t_p3_add_log_api_surface(void) {
     cfg.flush_interval_ms = 100000;
     cfg.log_count_per_package = 1000;
     cfg.log_bytes_per_package = 100000;
-    cfg.hash_key = "hk";
+    cfg.hash_key = TEST_HASH_KEY_A;
     ve_tls_producer * p = ve_tls_producer_create(&cfg);
     if (!p) return -1;
 
@@ -16284,7 +16393,7 @@ static int t_p3_add_log_api_surface(void) {
     if (r != VE_TLS_OK) { ve_tls_producer_destroy(p); return -2; }
 
     /* kv_hashkey_with_id */
-    r = ve_tls_producer_add_log_kv_hashkey_with_id(p, 1710000000001LL, "hk2", kvs, 2, 0, &out_id);
+    r = ve_tls_producer_add_log_kv_hashkey_with_id(p, 1710000000001LL, TEST_HASH_KEY_B, kvs, 2, 0, &out_id);
     if (r != VE_TLS_OK) { ve_tls_producer_destroy(p); return -3; }
 
     /* kv_time_parts_with_id */
@@ -16292,7 +16401,7 @@ static int t_p3_add_log_api_surface(void) {
     if (r != VE_TLS_OK) { ve_tls_producer_destroy(p); return -4; }
 
     /* kv_time_parts_hashkey_with_id */
-    r = ve_tls_producer_add_log_kv_time_parts_hashkey_with_id(p, 1710000000003LL, 1, 456u, "hk3", kvs, 2, 0, &out_id);
+    r = ve_tls_producer_add_log_kv_time_parts_hashkey_with_id(p, 1710000000003LL, 1, 456u, TEST_HASH_KEY_MAX, kvs, 2, 0, &out_id);
     if (r != VE_TLS_OK) { ve_tls_producer_destroy(p); return -5; }
 
     /* with_len family */
@@ -16302,11 +16411,11 @@ static int t_p3_add_log_api_surface(void) {
     size_t vlens[2] = {2, 2};
     r = ve_tls_producer_add_log_with_len(p, 1710000000004LL, keys, klens, vals, vlens, 2, 0);
     if (r != VE_TLS_OK) { ve_tls_producer_destroy(p); return -6; }
-    r = ve_tls_producer_add_log_with_len_hashkey(p, 1710000000005LL, "hk4", keys, klens, vals, vlens, 2, 0);
+    r = ve_tls_producer_add_log_with_len_hashkey(p, 1710000000005LL, TEST_HASH_KEY_A, keys, klens, vals, vlens, 2, 0);
     if (r != VE_TLS_OK) { ve_tls_producer_destroy(p); return -7; }
     r = ve_tls_producer_add_log_with_len_time_parts(p, 1710000000006LL, 1, 789u, keys, klens, vals, vlens, 2, 0);
     if (r != VE_TLS_OK) { ve_tls_producer_destroy(p); return -8; }
-    r = ve_tls_producer_add_log_with_len_time_parts_hashkey(p, 1710000000007LL, 1, 321u, "hk5", keys, klens, vals, vlens, 2, 0);
+    r = ve_tls_producer_add_log_with_len_time_parts_hashkey(p, 1710000000007LL, 1, 321u, TEST_HASH_KEY_B, keys, klens, vals, vlens, 2, 0);
     if (r != VE_TLS_OK) { ve_tls_producer_destroy(p); return -9; }
 
     /* raw family */
@@ -16333,7 +16442,7 @@ static int t_p3_add_log_api_surface(void) {
             big_kvs[i].key = "kk";
             big_kvs[i].value = "vv";
         }
-        r = ve_tls_producer_add_log_kv_hashkey_with_id(p, 1710000000010LL, "hk_big", big_kvs, 20, 0, &out_id);
+        r = ve_tls_producer_add_log_kv_hashkey_with_id(p, 1710000000010LL, TEST_HASH_KEY_A, big_kvs, 20, 0, &out_id);
         if (r != VE_TLS_OK) { ve_tls_producer_destroy(p); return -16; }
         /* with_len family with large pair_count */
         const char * bigk[20];
@@ -16344,16 +16453,16 @@ static int t_p3_add_log_api_surface(void) {
             bigk[i] = "kk"; bigkl[i] = 2;
             bigv[i] = "vv"; bigvl[i] = 2;
         }
-        r = ve_tls_producer_add_log_with_len_time_parts_hashkey(p, 1710000000011LL, 1, 111u, "hk_big2", bigk, bigkl, bigv, bigvl, 20, 0);
+        r = ve_tls_producer_add_log_with_len_time_parts_hashkey(p, 1710000000011LL, 1, 111u, TEST_HASH_KEY_MAX, bigk, bigkl, bigv, bigvl, 20, 0);
         if (r != VE_TLS_OK) { ve_tls_producer_destroy(p); return -17; }
     }
 
     /* time_ms<=0 path: lib should auto-fill from platform.time_ms */
     r = ve_tls_producer_add_log_kv_with_id(p, 0, kvs, 2, 0, &out_id);
     if (r != VE_TLS_OK) { ve_tls_producer_destroy(p); return -18; }
-    r = ve_tls_producer_add_log_kv_hashkey_with_id(p, -1, "hk_neg", kvs, 2, 0, &out_id);
+    r = ve_tls_producer_add_log_kv_hashkey_with_id(p, -1, TEST_HASH_KEY_B, kvs, 2, 0, &out_id);
     if (r != VE_TLS_OK) { ve_tls_producer_destroy(p); return -19; }
-    r = ve_tls_producer_add_log_with_len_hashkey(p, 0, "hk_zero", keys, klens, vals, vlens, 2, 0);
+    r = ve_tls_producer_add_log_with_len_hashkey(p, 0, TEST_HASH_KEY_ZERO, keys, klens, vals, vlens, 2, 0);
     if (r != VE_TLS_OK) { ve_tls_producer_destroy(p); return -20; }
 
     ve_tls_producer_destroy(p);
@@ -16397,7 +16506,7 @@ static int t_p3_tls_batch_flush_paths(void) {
     cfg.flush_interval_ms = 100000;
     cfg.log_count_per_package = 4;        /* small to trigger flush */
     cfg.log_bytes_per_package = 100000;
-    cfg.hash_key = "hk";
+    cfg.hash_key = TEST_HASH_KEY_A;
     ve_tls_producer * p = ve_tls_producer_create(&cfg);
     if (!p) return -1;
 
@@ -16421,7 +16530,7 @@ static int t_p3_export_import_roundtrip(void) {
     cfg.flush_interval_ms = 100000;
     cfg.log_count_per_package = 1000;
     cfg.log_bytes_per_package = 100000;
-    cfg.hash_key = "hk";
+    cfg.hash_key = TEST_HASH_KEY_A;
     ve_tls_producer * p = ve_tls_producer_create(&cfg);
     if (!p) return -1;
     ve_tls_kv kv = {"k", "v"};
@@ -16529,7 +16638,7 @@ static int t_p4_tls_batch_aggregation(void) {
         (void)ve_tls_producer_add_log_kv_hashkey(p, 1710000000000LL + (int64_t)i, hks[i], &kv, 1, 0);
     }
     /* explicit flush */
-    (void)ve_tls_producer_add_log_kv_hashkey(p, 1710000000099LL, "a", &kv, 1, 1);
+    (void)ve_tls_producer_add_log_kv_hashkey(p, 1710000000099LL, TEST_HASH_KEY_A, &kv, 1, 1);
     ve_tls_producer_destroy(p);
     ve_tls_alloc_fault_inject(NULL, 0, 0);
     return 0;
@@ -16976,9 +17085,9 @@ static int t_p8_add_log_with_len_apis(void) {
     const size_t vlens[] = {2, 2, 2};
     int ok = 0;
     if (ve_tls_producer_add_log_with_len(p, 1710000000000LL, keys, klens, vals, vlens, 3, 0) == VE_TLS_OK) ok |= 1;
-    if (ve_tls_producer_add_log_with_len_hashkey(p, 1710000000000LL, "hk", keys, klens, vals, vlens, 3, 0) == VE_TLS_OK) ok |= 2;
+    if (ve_tls_producer_add_log_with_len_hashkey(p, 1710000000000LL, TEST_HASH_KEY_A, keys, klens, vals, vlens, 3, 0) == VE_TLS_OK) ok |= 2;
     if (ve_tls_producer_add_log_with_len_time_parts(p, 1710000000000LL, 1, 123, keys, klens, vals, vlens, 3, 0) == VE_TLS_OK) ok |= 4;
-    if (ve_tls_producer_add_log_with_len_time_parts_hashkey(p, 1710000000000LL, 1, 123, "hk2", keys, klens, vals, vlens, 3, 0) == VE_TLS_OK) ok |= 8;
+    if (ve_tls_producer_add_log_with_len_time_parts_hashkey(p, 1710000000000LL, 1, 123, TEST_HASH_KEY_B, keys, klens, vals, vlens, 3, 0) == VE_TLS_OK) ok |= 8;
     /* big kv_count > 16 to drive heap path. */
     const char * bkeys[20]; const char * bvals[20]; size_t bklens[20]; size_t bvlens[20];
     for (int i = 0; i < 20; i++) { bkeys[i] = "k"; bklens[i] = 1; bvals[i] = "v"; bvlens[i] = 1; }
@@ -16988,9 +17097,9 @@ static int t_p8_add_log_with_len_apis(void) {
     int64_t lid = 0;
     ve_tls_kv kv = {"k", "v"};
     (void)ve_tls_producer_add_log_kv_with_id(p, 1710000000000LL, &kv, 1, 0, &lid);
-    (void)ve_tls_producer_add_log_kv_hashkey_with_id(p, 1710000000000LL, "hk", &kv, 1, 0, &lid);
+    (void)ve_tls_producer_add_log_kv_hashkey_with_id(p, 1710000000000LL, TEST_HASH_KEY_A, &kv, 1, 0, &lid);
     (void)ve_tls_producer_add_log_kv_time_parts_with_id(p, 1710000000000LL, 1, 7, &kv, 1, 0, &lid);
-    (void)ve_tls_producer_add_log_kv_time_parts_hashkey_with_id(p, 1710000000000LL, 1, 7, "hk", &kv, 1, 0, &lid);
+    (void)ve_tls_producer_add_log_kv_time_parts_hashkey_with_id(p, 1710000000000LL, 1, 7, TEST_HASH_KEY_A, &kv, 1, 0, &lid);
     (void)ve_tls_producer_add_log_raw_with_id(p, "{\"x\":1}", 7, 0, &lid);
     (void)ve_tls_producer_add_log_raw_time_parts_with_id(p, 1710000000000LL, 1, 7, "{\"x\":2}", 7, 0, &lid);
     (void)ve_tls_producer_add_log_raw_time_parts(p, 1710000000000LL, 0, 0, "{\"x\":3}", 7, 0);
@@ -17381,9 +17490,9 @@ static int t_p9_add_log_with_id_apis(void) {
     ve_tls_kv kv = {"k", "v"};
     int64_t id1 = 0, id2 = 0, id3 = 0, id4 = 0;
     if (ve_tls_producer_add_log_kv_with_id(p, 0, &kv, 1, 0, &id1) != VE_TLS_OK) goto fail;
-    if (ve_tls_producer_add_log_kv_hashkey_with_id(p, 1710000000000LL, "hk", &kv, 1, 0, &id2) != VE_TLS_OK) goto fail;
+    if (ve_tls_producer_add_log_kv_hashkey_with_id(p, 1710000000000LL, TEST_HASH_KEY_A, &kv, 1, 0, &id2) != VE_TLS_OK) goto fail;
     if (ve_tls_producer_add_log_kv_time_parts_with_id(p, 1710000000000LL, 1, 100, &kv, 1, 0, &id3) != VE_TLS_OK) goto fail;
-    if (ve_tls_producer_add_log_kv_time_parts_hashkey_with_id(p, 1710000000000LL, 1, 200, "hk", &kv, 1, 0, &id4) != VE_TLS_OK) goto fail;
+    if (ve_tls_producer_add_log_kv_time_parts_hashkey_with_id(p, 1710000000000LL, 1, 200, TEST_HASH_KEY_A, &kv, 1, 0, &id4) != VE_TLS_OK) goto fail;
     if (id1 <= 0 || id2 <= 0 || id3 <= 0 || id4 <= 0) goto fail;
     ve_tls_producer_destroy(p);
     ve_tls_alloc_fault_inject(NULL, 0, 0);
@@ -17482,6 +17591,7 @@ int main(void) {
     RUN(86, test_manager_key_queue_limit_exceeded_drops());
     RUN(132, test_producer_derived_defaults_follow_memory_budget());
     RUN(133, test_producer_derived_defaults_preserve_explicit_overrides());
+    RUN(330, test_hash_key_and_time_ns_public_contract());
     RUN(134, test_producer_create_rejects_block_without_timeout());
     RUN(135, test_producer_create_rejects_block_when_buffer_smaller_than_two_packages());
     RUN(136, test_producer_create_allows_low_resource_block_config_and_derives_send_reserve());

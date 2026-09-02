@@ -13,6 +13,30 @@ static int ve_tls_str_empty(const char * s) {
     return !s || s[0] == 0;
 }
 
+/* SLS freezes the hash-key range as
+ * [00000000000000000000000000000000, ffffffffffffffffffffffffffffffff).
+ * Keep this check at the C boundary because callers can use the C API without
+ * going through a language binding. */
+static int ve_tls_valid_hash_key(const char * hash_key) {
+    int is_exclusive_upper_bound = 1;
+    size_t i;
+    if (!hash_key) {
+        return 1;
+    }
+    for (i = 0; i < 32; i++) {
+        unsigned char byte = (unsigned char)hash_key[i];
+        if (byte == 0 ||
+            !((byte >= '0' && byte <= '9') ||
+              (byte >= 'a' && byte <= 'f'))) {
+            return 0;
+        }
+        if (byte != 'f') {
+            is_exclusive_upper_bound = 0;
+        }
+    }
+    return hash_key[32] == 0 && !is_exclusive_upper_bound;
+}
+
 typedef struct {
     const char * p;
     size_t n;
@@ -272,6 +296,7 @@ static int ve_tls_config_is_valid_for_create(const ve_tls_config * cfg) {
     if (!ve_tls_is_http_url(cfg->endpoint)) return 0;
     if (ve_tls_str_empty(cfg->region)) return 0;
     if (ve_tls_str_empty(cfg->topic_id)) return 0;
+    if (!ve_tls_valid_hash_key(cfg->hash_key)) return 0;
     if (!cfg->credentials_provider) {
         if (ve_tls_str_empty(cfg->access_key_id) || ve_tls_str_empty(cfg->access_key_secret)) return 0;
     }
@@ -663,6 +688,9 @@ static ve_tls_result ve_tls_producer_add_log_kv_persistent_locked(
     int64_t id;
     ve_tls_result rc = VE_TLS_DROP_ERROR;
     if (!producer || !kvs || !key_lens || !val_lens || kv_count == 0) {
+        return VE_TLS_INVALID;
+    }
+    if (!ve_tls_valid_hash_key(hash_key)) {
         return VE_TLS_INVALID;
     }
     if (producer->stop || !producer->accepting) {
@@ -2658,6 +2686,9 @@ ve_tls_result ve_tls_producer_add_log_raw_time_parts_with_id(ve_tls_producer * p
     if (!producer || !log_buf || log_size == 0) {
         return VE_TLS_INVALID;
     }
+    if (has_time_ns && time_ns >= 1000000U) {
+        return VE_TLS_INVALID;
+    }
     producer->config.platform.mutex_lock(producer->mutex);
     if (producer->stop || !producer->accepting) {
         producer->config.platform.mutex_unlock(producer->mutex);
@@ -2703,6 +2734,12 @@ static ve_tls_result ve_tls_producer_add_log_kv_lens_time_parts_hashkey(
     int flush,
     int64_t * out_log_id) {
     if (!producer || !kvs || kv_count == 0) {
+        return VE_TLS_INVALID;
+    }
+    if (has_time_ns && time_ns >= 1000000U) {
+        return VE_TLS_INVALID;
+    }
+    if (!ve_tls_valid_hash_key(hash_key)) {
         return VE_TLS_INVALID;
     }
     if (producer->config.use_persistent) {
@@ -3018,6 +3055,9 @@ static char * ve_tls_memdup0(const char * s, size_t n) {
 
 ve_tls_log_template * ve_tls_template_create(ve_tls_producer * producer, const char * const * keys, const size_t * key_lens, size_t key_count, const char * hash_key) {
     if (!producer || !keys || !key_lens || key_count == 0) {
+        return NULL;
+    }
+    if (!ve_tls_valid_hash_key(hash_key)) {
         return NULL;
     }
     if (!ve_tls_count_fits_array(key_count, sizeof(char *)) || !ve_tls_count_fits_array(key_count, sizeof(size_t))) {

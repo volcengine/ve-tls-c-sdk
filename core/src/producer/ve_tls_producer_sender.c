@@ -163,6 +163,18 @@ static int ve_tls_is_retryable_http(int32_t code) {
     return code == 429 || code == 500 || code == 502 || code == 503 || code == 504;
 }
 
+static int ve_tls_is_authentication_error_code(const char * error_code) {
+    if (!error_code) {
+        return 0;
+    }
+    return strcmp(error_code, "CredentialsRefreshFailed") == 0 ||
+        strcmp(error_code, "ExpiredToken") == 0 ||
+        strcmp(error_code, "InvalidSecurityToken") == 0 ||
+        strcmp(error_code, "AuthFailed") == 0 ||
+        strcmp(error_code, "SignatureDoesNotMatch") == 0 ||
+        strcmp(error_code, "AccessDenied") == 0;
+}
+
 static int ve_tls_is_authentication_failure(const ve_tls_error * error) {
     if (!error) {
         return 0;
@@ -170,8 +182,7 @@ static int ve_tls_is_authentication_failure(const ve_tls_error * error) {
     if (error->http_code == 401 || error->http_code == 403) {
         return 1;
     }
-    return error->error_code &&
-        strcmp(error->error_code, "CredentialsRefreshFailed") == 0;
+    return ve_tls_is_authentication_error_code(error->error_code);
 }
 
 static void ve_tls_persistent_on_delivery_failure(
@@ -466,9 +477,15 @@ static void ve_tls_error_parse_body_fields(ve_tls_error * out, const unsigned ch
     }
     if (!out->error_code) {
         out->error_code = ve_tls_json_get_string(body, body_size, "errorCode");
+        if (!out->error_code) {
+            out->error_code = ve_tls_json_get_string(body, body_size, "ErrorCode");
+        }
     }
     if (!out->error_message) {
         out->error_message = ve_tls_json_get_string(body, body_size, "errorMessage");
+        if (!out->error_message) {
+            out->error_message = ve_tls_json_get_string(body, body_size, "ErrorMessage");
+        }
     }
     if (!out->request_id) {
         out->request_id = ve_tls_json_get_string(body, body_size, "requestID");

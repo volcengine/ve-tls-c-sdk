@@ -14,7 +14,7 @@
 | `file_name` | 写入到 LogGroup 的 file name。 |
 | `context_flow` | 写入到 LogGroup 的 context flow。 |
 | `log_tags` / `log_tag_count` | LogGroup 级别 tags。 |
-| `hash_key` | 默认 hashKey。单次写入传入 hashKey 时会覆盖该默认值。 |
+| `hash_key` | 默认 hashKey。允许为空；非空时必须是 32 位小写十六进制，范围为 `[00000000000000000000000000000000, ffffffffffffffffffffffffffffffff)`。单次写入传入 hashKey 时会覆盖该默认值。 |
 | `access_key_id` / `access_key_secret` | 静态 AK/SK。 |
 | `security_token` | 临时凭证 token。 |
 | `credentials_provider` | 临时凭证刷新回调。 |
@@ -38,14 +38,14 @@
 | `agg_max_log_group_logs` | 单个 LogGroup 的日志条数上限。 |
 | `agg_max_raw_bytes_per_request` | 单个请求的原始日志字节上限。 |
 | `agg_max_compressed_bytes_per_request` | 单个请求的压缩后字节上限。 |
-| `enable_time_ns` | 是否写入纳秒时间字段。 |
+| `enable_time_ns` | 是否写入 protobuf `TimeNs` 字段。`time_ms` 保留毫秒时间戳，`TimeNs` 是该毫秒之后 `0..999999` 的纳秒余数。 |
 
 默认派生规则：
 
 - `log_bytes_per_package` 未配置时，`max_buffer_bytes <= 64 MiB` 派生为 `2 MiB`，否则派生为 `4 MiB`。
 - `send_thread_count` 未配置时，`max_buffer_bytes <= 64 MiB` 派生为 `2`，`<= 256 MiB` 派生为 `4`，更大派生为 `8`。
 - `pack_thread_count` 未配置时跟随 `send_thread_count`。
-- `send_queue_size` 未配置时派生为 `8 + max_buffer_bytes / log_bytes_per_package`，范围限制在 `8..128`。
+- `send_queue_size=0` 时派生为 `8 + max_buffer_bytes / log_bytes_per_package`，范围限制在 `8..128`；任意正值都是精确配置，不会被派生逻辑覆盖。
 - 显式配置过的字段不会被派生值覆盖。
 
 ## 资源与背压

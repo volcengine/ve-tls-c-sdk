@@ -8,7 +8,7 @@ ve-tls-c-sdk 是纯 C 的 TLS 日志 Producer。它适合 Linux 服务器、嵌�
 - 批量聚合：按日志条数、日志字节数和 flush 时间窗口打包，减少请求数。`log_count_per_package`、`log_bytes_per_package`、`flush_interval_ms` 都可以配置。
 - 压缩发送：支持 `lz4`、`zlib` 和 `none`，默认使用 `lz4`。如果部署环境不需要 zlib，可以在构建时关闭。
 - 失败重试：可配置最大重试次数、退避策略、全局限流、key 级限流和熔断。
-- HashKey：调用级 hashKey 优先于 `cfg.hash_key`。需要同一 hashKey 在客户端侧串行发送时，建议显式设置 `send_thread_count=1`；多 sender 配置优先资源利用，不承诺严格串行。
+- HashKey：调用级 hashKey 优先于 `cfg.hash_key`。非空值必须是 32 位小写十六进制，范围为 `[00000000000000000000000000000000, ffffffffffffffffffffffffffffffff)`。需要同一 hashKey 在客户端侧串行发送时，建议显式设置 `send_thread_count=1`；多 sender 配置优先资源利用，不承诺严格串行。
 - 动态凭证：支持静态 AK/SK，也支持 `credentials_provider` 动态刷新临时凭证。
 - 运行期更新：支持更新 endpoint、region、topic 和静态凭证。已经进入发送路径的请求可能仍使用旧快照，后续请求会切到新配置。
 - 多 Producer 资源共享：同一进程内多个 Producer 可以通过 `ve_tls_env_init()` 和 `cfg.use_global_env=1` 共享 sender 线程。
@@ -77,7 +77,7 @@ int main(void) {
 }
 ```
 
-`time_ms=0` 时由 SDK 使用当前时间。需要纳秒字段时，设置 `enable_time_ns=1`，并使用 `*_time_parts` 或 template API 写入 `timeNs`。
+`time_ms=0` 时由 SDK 使用当前时间。需要亚毫秒精度时，设置 `enable_time_ns=1`，并使用 `*_time_parts` 或 template API 写入 `timeNs`；它是当前毫秒之后 `0..999999` 的纳秒余数，不是完整纳秒时间戳。
 
 ## 真实发送 demo
 

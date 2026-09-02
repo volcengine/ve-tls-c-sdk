@@ -100,7 +100,9 @@ typedef struct {
     const char * context_flow;
     const ve_tls_kv * log_tags;
     size_t log_tag_count;
+    /* NULL or exactly 32 lowercase hex characters in [0, ff..ff). */
     const char * hash_key;
+    /* Enables the protobuf TimeNs field, the 0..999999 ns remainder after time_ms. */
     int32_t enable_time_ns;
     const char * access_key_id;
     const char * access_key_secret;
@@ -127,6 +129,7 @@ typedef struct {
     int32_t log_bytes_per_package;
     int32_t log_count_per_package;
     int32_t flush_interval_ms;
+    /* 0 selects a runtime-derived capacity; positive values are exact. */
     int32_t send_queue_size;
     ve_tls_send_queue_full_policy send_queue_full_policy;
     int32_t send_queue_block_timeout_ms;

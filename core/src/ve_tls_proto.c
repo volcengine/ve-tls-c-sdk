@@ -152,6 +152,9 @@ int ve_tls_proto_encode_log_ex(int64_t time_ms, uint32_t time_ns, int32_t has_ti
     if (!out) {
         return -1;
     }
+    if (has_time_ns && time_ns >= 1000000U) {
+        return -1;
+    }
     memset(out, 0, sizeof(ve_tls_bytes));
     ve_tls_buf b = {0};
     if (time_ms <= 0) {
