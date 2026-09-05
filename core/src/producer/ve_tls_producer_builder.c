@@ -97,13 +97,13 @@ static size_t ve_tls_bytes_field_size(uint32_t field_number, size_t n) {
 }
 
 static int ve_tls_wire_reserve(ve_tls_wire_buf * b, size_t n) {
-    if (b->len + n <= b->cap) {
-        return 0;
-    }
-    if (b->len > (size_t)-1 - n) {
+    if (!b || n > (size_t)-1 - b->len) {
         return -1;
     }
     size_t target = b->len + n;
+    if (target <= b->cap) {
+        return 0;
+    }
     size_t next = b->cap ? b->cap : 128;
     while (next < target) {
         if (next > (size_t)-1 / 2) {
@@ -261,16 +261,30 @@ void ve_tls_log_builder_shrink_if_needed(ve_tls_log_group_builder * b, size_t sh
         b->logs_cap = 0;
         return;
     }
-    unsigned char * p = (unsigned char *)ve_tls_realloc(b->logs, shrink_to);
+    /* Do not shrink a reusable large builder with realloc. Darwin allocators
+     * may keep the original large region resident, while the next batch then
+     * grows it again and raises the process RSS high-water mark on every
+     * flush. Allocate the bounded reusable block first, copy the live prefix,
+     * and only then release the large allocation. Allocation failure is a
+     * best-effort no-op, preserving the original builder and its data. */
+    unsigned char * p = (unsigned char *)ve_tls_malloc(shrink_to);
     if (!p) {
         return;
     }
+    if (b->logs_len > 0) {
+        memcpy(p, b->logs, b->logs_len);
+    }
+    ve_tls_free(b->logs);
     b->logs = p;
     b->logs_cap = shrink_to;
 }
 
 int ve_tls_log_builder_append(ve_tls_log_group_builder * b, const unsigned char * logs, size_t logs_len, int32_t log_count, int64_t earliest, int64_t latest, int64_t start_id, int64_t end_id, int64_t last_time_ms, uint32_t last_time_ns, int32_t last_has_time_ns) {
     if (!b || !logs || logs_len == 0 || log_count <= 0) {
+        return -1;
+    }
+    if ((b->logs_len > b->logs_cap) || ((b->logs == NULL) != (b->logs_cap == 0)) || b->log_count < 0 ||
+        logs_len > (size_t)-1 - b->logs_len || log_count > INT32_MAX - b->log_count) {
         return -1;
     }
     size_t need = b->logs_len + logs_len;
@@ -610,13 +624,75 @@ fail:
     return -1;
 }
 
+static int ve_tls_builder_group_sizes(
+    const ve_tls_producer * producer,
+    const ve_tls_log_group_builder * b,
+    size_t * group_len,
+    size_t * prefix_len,
+    size_t * total_len
+) {
+    size_t group;
+    size_t prefix;
+    if (!producer || !b || !group_len || !prefix_len || !total_len) {
+        return -1;
+    }
+    if (b->logs_len > 0 && !b->logs) {
+        return -1;
+    }
+    group = ve_tls_size_add_safe(b->logs_len, producer->cfg_group_suffix_len);
+    if (group == (size_t)-1) {
+        return -1;
+    }
+    prefix = ve_tls_size_add_safe(
+        ve_tls_key_u32_size(1, 2),
+        ve_tls_varint_u64_size((uint64_t)group));
+    if (prefix == (size_t)-1) {
+        return -1;
+    }
+    *total_len = ve_tls_size_add_safe(prefix, group);
+    if (*total_len == (size_t)-1) {
+        return -1;
+    }
+    *group_len = group;
+    *prefix_len = prefix;
+    return 0;
+}
+
+static int ve_tls_builder_fill_task_metadata(
+    const ve_tls_log_group_builder * b,
+    size_t group_len,
+    ve_tls_send_task * out
+) {
+    out->log_count = b->log_count;
+    out->earliest = b->earliest;
+    out->latest = b->latest;
+    out->batch_bytes = group_len;
+    out->start_id = b->start_id;
+    out->end_id = b->end_id;
+    if (b->norm_key && b->norm_key[0] != 0) {
+        out->hash_key = ve_tls_strdup(b->norm_key);
+        if (!out->hash_key) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
 int ve_tls_builder_to_send_task(ve_tls_producer * producer, ve_tls_log_group_builder * b, ve_tls_send_task * out) {
+    size_t group_len;
+    size_t prefix_len;
+    size_t total_len;
+    ve_tls_wire_buf wb = {0};
     if (!producer || !b || !out) {
         return -1;
     }
     memset(out, 0, sizeof(*out));
-    size_t group_len = b->logs_len + producer->cfg_group_suffix_len;
-    ve_tls_wire_buf wb = {0};
+    if (ve_tls_builder_group_sizes(producer, b, &group_len, &prefix_len, &total_len) != 0) {
+        return -1;
+    }
+    (void)prefix_len;
+    (void)total_len;
+    if (ve_tls_builder_fill_task_metadata(b, group_len, out) != 0) goto fail;
     if (ve_tls_wire_put_key(&wb, 1, 2) != 0) goto fail;
     if (ve_tls_wire_put_varint_u64(&wb, (uint64_t)group_len) != 0) goto fail;
     if (ve_tls_wire_put_bytes(&wb, b->logs, b->logs_len) != 0) goto fail;
@@ -629,19 +705,69 @@ int ve_tls_builder_to_send_task(ve_tls_producer * producer, ve_tls_log_group_bui
     wb.data = NULL;
     wb.len = 0;
     wb.cap = 0;
-    out->log_count = b->log_count;
-    out->earliest = b->earliest;
-    out->latest = b->latest;
-    out->batch_bytes = group_len;
-    out->start_id = b->start_id;
-    out->end_id = b->end_id;
-    if (b->norm_key && b->norm_key[0] != 0) {
-        out->hash_key = ve_tls_strdup(b->norm_key);
-        if (!out->hash_key) goto fail;
-    }
     return 0;
 fail:
     ve_tls_free(wb.data);
     ve_tls_send_task_free(out);
     return -1;
+}
+
+int ve_tls_builder_move_to_send_task(
+    ve_tls_producer * producer,
+    ve_tls_log_group_builder * b,
+    ve_tls_send_task * out
+) {
+    size_t group_len;
+    size_t prefix_len;
+    size_t total_len;
+    unsigned char * body;
+    unsigned char * cursor;
+    if (!producer || !b || !out) {
+        return -1;
+    }
+    memset(out, 0, sizeof(*out));
+    if (ve_tls_builder_group_sizes(producer, b, &group_len, &prefix_len, &total_len) != 0) {
+        return -1;
+    }
+    /* Allocate all fallible metadata before mutating the builder. A failed
+     * conversion therefore leaves the sealed batch available to the caller
+     * for deterministic drop accounting and cleanup. */
+    if (ve_tls_builder_fill_task_metadata(b, group_len, out) != 0) {
+        ve_tls_send_task_free(out);
+        return -1;
+    }
+    body = b->logs;
+    if (b->logs_cap < total_len) {
+        /* Grow only to the exact envelope size. The generic wire builder
+         * doubles capacity and creates a second roughly 2 MiB allocation for
+         * a 1 MiB batch, which raises Darwin allocator RSS high-water. */
+        body = (unsigned char *)ve_tls_realloc(body, total_len);
+        if (!body) {
+            ve_tls_send_task_free(out);
+            return -1;
+        }
+        b->logs = body;
+        b->logs_cap = total_len;
+    }
+    if (b->logs_len > 0) {
+        memmove(body + prefix_len, body, b->logs_len);
+    }
+    cursor = body;
+    cursor = ve_tls_varint_u64_pack(((uint64_t)1 << 3) | 2u, cursor);
+    cursor = ve_tls_varint_u64_pack((uint64_t)group_len, cursor);
+    (void)cursor;
+    if (producer->cfg_group_suffix_len > 0) {
+        memcpy(
+            body + prefix_len + b->logs_len,
+            producer->cfg_group_suffix,
+            producer->cfg_group_suffix_len);
+    }
+
+    out->body = body;
+    out->body_size = total_len;
+    out->raw_body_size = total_len;
+    b->logs = NULL;
+    b->logs_len = 0;
+    b->logs_cap = 0;
+    return 0;
 }

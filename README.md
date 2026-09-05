@@ -8,7 +8,7 @@ ve-tls-c-sdk 是纯 C 的 TLS 日志 Producer。它适合 Linux 服务器、嵌�
 - 批量聚合：按日志条数、日志字节数和 flush 时间窗口打包，减少请求数。`log_count_per_package`、`log_bytes_per_package`、`flush_interval_ms` 都可以配置。
 - 压缩发送：支持 `lz4`、`zlib` 和 `none`，默认使用 `lz4`。如果部署环境不需要 zlib，可以在构建时关闭。
 - 失败重试：可配置最大重试次数、退避策略、全局限流、key 级限流和熔断。
-- HashKey：调用级 hashKey 优先于 `cfg.hash_key`。需要同一 hashKey 在客户端侧串行发送时，建议显式设置 `send_thread_count=1`；多 sender 配置优先资源利用，不承诺严格串行。
+- HashKey：调用级 hashKey 优先于 `cfg.hash_key`。非空值必须是 32 位小写十六进制，范围为 `[00000000000000000000000000000000, ffffffffffffffffffffffffffffffff)`。需要同一 hashKey 在客户端侧串行发送时，建议显式设置 `send_thread_count=1`；多 sender 配置优先资源利用，不承诺严格串行。
 - 动态凭证：支持静态 AK/SK，也支持 `credentials_provider` 动态刷新临时凭证。
 - 运行期更新：支持更新 endpoint、region、topic 和静态凭证。已经进入发送路径的请求可能仍使用旧快照，后续请求会切到新配置。
 - 多 Producer 资源共享：同一进程内多个 Producer 可以通过 `ve_tls_env_init()` 和 `cfg.use_global_env=1` 共享 sender 线程。
@@ -77,7 +77,7 @@ int main(void) {
 }
 ```
 
-`time_ms=0` 时由 SDK 使用当前时间。需要纳秒字段时，设置 `enable_time_ns=1`，并使用 `*_time_parts` 或 template API 写入 `timeNs`。
+`time_ms=0` 时由 SDK 使用当前时间。需要亚毫秒精度时，设置 `enable_time_ns=1`，并使用 `*_time_parts` 或 template API 写入 `timeNs`；它是当前毫秒之后 `0..999999` 的纳秒余数，不是完整纳秒时间戳。
 
 ## 真实发送 demo
 
@@ -148,10 +148,10 @@ if (ve_tls_producer_recover(producer) != VE_TLS_OK) {
 Persistent 的可靠性边界需要说清楚：
 
 - SDK 提供 at-least-once。崩溃、重试和 checkpoint 持久化边界可能产生少量重复；如果业务不能接受重复，需要用业务主键或消费侧去重。
-- at-least-once 只覆盖已经成功进入 persistent 的日志。如果 `add_log` 因参数错误、内存背压或 persistent quota 返回失败，这条日志不在恢复范围内。
+- `add_log` 成功表示达到所选持久化模式的本地接纳边界，不代表服务端成功。写 WAL 前的参数校验等失败不进入恢复范围；WAL 写入后的内存背压、同步失败或并发关闭仍可能留下可恢复记录，不能仅根据返回失败判断日志未保存。重试需要处理潜在重复，详见[持久化说明](docs/persistent.md)。
 - `success callback` 表示请求进入成功路径，不等于 checkpoint 已经 durable 落盘。崩溃发生在两者之间时，recover 可能重放边界内日志。
 - persistent 默认使用 buffered WAL，在 segment rotation、显式 flush 和正常 close 时同步；`force_flush_disk=1` 兼容映射为每条 append 同步的 sync WAL。新接入显式配置 `persistent_durability` 时，必须配对使用 `ve_tls_config_init_versioned` 与 `ve_tls_producer_create_versioned`。
-- lease 用于避免多个活跃 owner 同时写一个目录。`TAKEOVER_IF_STALE` 适合崩溃恢复，不适合多个活跃进程共享同一路径。
+- lease 记录 owner 和心跳，用于检测部分目录误用，不提供多进程原子抢占保证。每个活跃 Producer 必须独占目录；跨进程协调需要由宿主持有覆盖整个实例生命周期的进程锁。`TAKEOVER_IF_STALE` 适合崩溃恢复，不适合多个活跃进程共享同一路径。
 - `DROP_OLDEST_UNACKED` 会牺牲完整性，只适合明确要保新丢旧的场景。
 
 推荐做法：

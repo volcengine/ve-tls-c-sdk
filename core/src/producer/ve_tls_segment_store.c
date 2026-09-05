@@ -144,6 +144,7 @@ static int read_record_from_current_position(
 ) {
     unsigned char header[VE_TLS_PERSISTENT_RECORD_HEADER_SIZE];
     uint32_t total_len;
+    uint32_t ext_len;
     unsigned char * record;
     if (!platform || !file || !out_record || !out_size) {
         return -1;
@@ -159,7 +160,11 @@ static int read_record_from_current_position(
         return -1;
     }
     total_len = read_u32_le_local(header + 4);
-    if (total_len < VE_TLS_PERSISTENT_RECORD_HEADER_SIZE) {
+    ext_len = read_u32_le_local(header + 24);
+    if (read_u32_le_local(header) != VE_TLS_PERSISTENT_RECORD_MAGIC ||
+        total_len < VE_TLS_PERSISTENT_RECORD_HEADER_SIZE ||
+        ext_len > VE_TLS_PERSISTENT_RECORD_EXT_MAX ||
+        (uint64_t)VE_TLS_PERSISTENT_RECORD_HEADER_SIZE + (uint64_t)ext_len >= (uint64_t)total_len) {
         return -1;
     }
     if (limit != UINT64_MAX && (uint64_t)total_len > limit - offset) {

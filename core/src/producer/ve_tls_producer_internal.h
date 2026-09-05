@@ -59,6 +59,10 @@ typedef struct {
     size_t precompressed_size;
     ve_tls_obj_pool * body_pool;
     ve_tls_obj_pool * precompressed_pool;
+    /* Number of completed, bounded retry cycles for a durable batch. This is
+     * process-local scheduling state only; the WAL remains the source of
+     * truth across producer restarts. */
+    int32_t persistent_retry_cycle;
     /* scratch 预算的"中转持有"：从 prepare 阶段的 scratch_bytes 占位，
      * 直到 push 阶段把它原子迁移到 send_queue_bytes 为止。任何分支
      * 在 task 销毁前未完成迁移时，必须由 send_task_free 兜底归还。 */
@@ -136,6 +140,7 @@ struct ve_tls_producer {
     int32_t fast_builder;
     const char * default_norm_key;
     ve_tls_log_group_builder * default_builder;
+    ve_tls_log_group_builder * persistent_builder_cache;
     ve_tls_mutex * mutex;
     ve_tls_cond * cond;
     ve_tls_cond * send_cond;
@@ -302,6 +307,7 @@ int ve_tls_log_builder_append(ve_tls_log_group_builder * b, const unsigned char 
 void ve_tls_log_builder_shrink_if_needed(ve_tls_log_group_builder * b, size_t shrink_threshold, size_t shrink_to);
 int ve_tls_producer_build_group_suffix(ve_tls_producer * producer);
 int ve_tls_builder_to_send_task(ve_tls_producer * producer, ve_tls_log_group_builder * b, ve_tls_send_task * out);
+int ve_tls_builder_move_to_send_task(ve_tls_producer * producer, ve_tls_log_group_builder * b, ve_tls_send_task * out);
 
 int ve_tls_send_queue_init(ve_tls_send_queue * q, ve_tls_platform * platform, size_t cap, ve_tls_obj_pool * task_pool);
 int ve_tls_send_queue_push(ve_tls_send_queue * q, const ve_tls_send_task * t, int wait_ms);
@@ -345,6 +351,9 @@ int ve_tls_sender_step(ve_tls_producer * producer);
 int ve_tls_env_register_producer(ve_tls_producer * producer);
 void ve_tls_env_unregister_producer(ve_tls_producer * producer);
 void ve_tls_env_notify(ve_tls_producer * producer);
+#if defined(VE_TLS_ENABLE_ALLOC_FAULT_INJECT)
+int ve_tls_env_test_queue_full_resets_flag(void);
+#endif
 
 void * ve_tls_worker_main(void * arg);
 void * ve_tls_sender_main(void * arg);

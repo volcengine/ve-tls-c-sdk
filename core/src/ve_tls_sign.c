@@ -68,6 +68,92 @@ static void ve_tls_pair_free(ve_tls_kv_pair * p) {
     p->own_value = 0;
 }
 
+static int ve_tls_size_add_checked(size_t a, size_t b, size_t * out) {
+    if (!out || b > (size_t)-1 - a) {
+        return -1;
+    }
+    *out = a + b;
+    return 0;
+}
+
+static int ve_tls_query_pair_capacity(size_t cap, size_t len, size_t * out_capacity) {
+    size_t required;
+    size_t next;
+    if (!out_capacity || ve_tls_size_add_checked(len, 1, &required) != 0 || required <= cap) {
+        return -1;
+    }
+    if (cap != 0 && cap > (size_t)-1 / 2) {
+        return -1;
+    }
+    next = cap ? cap * 2 : 8;
+    if (next < required) {
+        next = required;
+    }
+    if (next > (size_t)-1 / sizeof(ve_tls_kv_pair)) {
+        return -1;
+    }
+    *out_capacity = next;
+    return 0;
+}
+
+static int ve_tls_canonical_request_size(
+    size_t method_size,
+    size_t uri_size,
+    size_t query_size,
+    size_t headers_size,
+    size_t signed_headers_size,
+    size_t payload_hash_size,
+    size_t * out_size
+) {
+    size_t total = 5;
+    if (!out_size) {
+        return -1;
+    }
+    const size_t parts[] = {
+        method_size,
+        uri_size,
+        query_size,
+        headers_size,
+        signed_headers_size,
+        payload_hash_size
+    };
+    for (size_t i = 0; i < sizeof(parts) / sizeof(parts[0]); i++) {
+        if (ve_tls_size_add_checked(total, parts[i], &total) != 0) {
+            return -1;
+        }
+    }
+    if (total == (size_t)-1) {
+        return -1;
+    }
+    *out_size = total;
+    return 0;
+}
+
+#if defined(VE_TLS_ENABLE_ALLOC_FAULT_INJECT)
+int ve_tls_sign_test_query_pair_capacity(size_t cap, size_t len, size_t * out_capacity) {
+    return ve_tls_query_pair_capacity(cap, len, out_capacity);
+}
+
+int ve_tls_sign_test_canonical_request_size(
+    size_t method_size,
+    size_t uri_size,
+    size_t query_size,
+    size_t headers_size,
+    size_t signed_headers_size,
+    size_t payload_hash_size,
+    size_t * out_size
+) {
+    return ve_tls_canonical_request_size(
+        method_size,
+        uri_size,
+        query_size,
+        headers_size,
+        signed_headers_size,
+        payload_hash_size,
+        out_size);
+}
+#endif
+
 static int ve_tls_buf_append(char ** buf, size_t * len, size_t * cap, const char * s) {
     if (!buf || !len || !cap || !s) {
         return -1;
@@ -318,8 +404,17 @@ static char * ve_tls_norm_query(const char * query) {
             ve_tls_free(pairs);
             return NULL;
         }
-        if (len + 1 > cap) {
-            size_t next = cap ? cap * 2 : 8;
+        if (len >= cap) {
+            size_t next;
+            if (ve_tls_query_pair_capacity(cap, len, &next) != 0) {
+                ve_tls_free(k);
+                ve_tls_free(v);
+                for (size_t i = 0; i < len; i++) {
+                    ve_tls_pair_free(&pairs[i]);
+                }
+                ve_tls_free(pairs);
+                return NULL;
+            }
             ve_tls_kv_pair * np = (ve_tls_kv_pair *)ve_tls_realloc(pairs, next * sizeof(ve_tls_kv_pair));
             if (!np) {
                 ve_tls_free(k);
@@ -460,8 +555,11 @@ static int ve_tls_parse_headers(const char * headers, ve_tls_kv_pair ** out_pair
     *out_pairs = NULL;
     *out_len = 0;
     *out_arena = NULL;
-    if (!headers || headers[0] == 0) {
+    if ((!headers || headers[0] == 0) && reserve_pairs == 0) {
         return 0;
+    }
+    if (!headers) {
+        headers = "";
     }
 
     size_t pair_count = 0;
@@ -911,12 +1009,20 @@ int ve_tls_sign_v4_append_at(
     size_t canon_headers_n = strlen(canon_headers);
     size_t signed_headers_n = strlen(signed_headers);
     size_t payload_hash_n = strlen(payload_hash_hex);
-    size_t canon_req_need = method_n + norm_uri_n + norm_query_n + canon_headers_n + signed_headers_n + payload_hash_n + 5;
+    size_t canon_req_need = 0;
+    int canon_req_size_ok = ve_tls_canonical_request_size(
+        method_n,
+        norm_uri_n,
+        norm_query_n,
+        canon_headers_n,
+        signed_headers_n,
+        payload_hash_n,
+        &canon_req_need) == 0;
 
     char canon_req_stack[1024];
     char * canon_req = canon_req_stack;
     int canon_req_heap = 0;
-    if (canon_req_need > (size_t)-1 - 1) {
+    if (!canon_req_size_ok) {
         canon_req = NULL;
     } else if (canon_req_need + 1 > sizeof(canon_req_stack)) {
         canon_req = (char *)ve_tls_malloc(canon_req_need + 1);

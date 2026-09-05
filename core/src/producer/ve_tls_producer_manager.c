@@ -29,13 +29,7 @@ static ve_tls_send_callbacks ve_tls_capture_callbacks(ve_tls_producer * producer
 
 static void ve_tls_manager_heartbeat_persistent(ve_tls_producer * producer) {
     if (producer && producer->persistent) {
-        if (producer->persistent_mutex) {
-            producer->config.platform.mutex_lock(producer->persistent_mutex);
-        }
         (void)ve_tls_persistent_heartbeat_if_due(producer->persistent, 0);
-        if (producer->persistent_mutex) {
-            producer->config.platform.mutex_unlock(producer->persistent_mutex);
-        }
     }
 }
 
@@ -444,7 +438,7 @@ static void * ve_tls_worker_main_builder(void * arg) {
             t.body = item.data;
             t.body_size = item.size;
             t.raw_body_size = item.size;
-            t.log_count = 0;
+            t.log_count = 1;
             t.earliest = item.time_ms;
             t.latest = item.time_ms;
             t.batch_bytes = item.size;
@@ -471,7 +465,7 @@ static void * ve_tls_worker_main_builder(void * arg) {
             sealed = sealed->next;
             size_t bytes_in_builder = b->logs_len;
             ve_tls_send_task t;
-            if (ve_tls_builder_to_send_task(producer, b, &t) != 0) {
+            if (ve_tls_builder_move_to_send_task(producer, b, &t) != 0) {
                 ve_tls_manager_drop_range(producer, bytes_in_builder, b->start_id, b->end_id, "MemoryAllocFailed", "build body failed");
             } else {
                 const char * err_code = NULL;

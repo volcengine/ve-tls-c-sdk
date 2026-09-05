@@ -226,17 +226,43 @@ static void ve_tls_env_destroy_finish_lifecycle(void) {
 }
 #endif
 
-static void ve_tls_env_queue_push_locked(ve_tls_producer * producer) {
-    if (!producer ||
-        __atomic_load_n(&producer->env_registered, __ATOMIC_ACQUIRE) == 0 ||
-        g_env.q_count >= g_env.q_cap) {
-        return;
+static int ve_tls_env_queue_push_locked(ve_tls_producer * producer) {
+    if (!producer) {
+        return -1;
+    }
+    if (__atomic_load_n(&producer->env_registered, __ATOMIC_ACQUIRE) == 0 ||
+        !g_env.q || g_env.q_count >= g_env.q_cap) {
+        __atomic_store_n(&producer->env_in_queue, 0, __ATOMIC_RELAXED);
+        return -1;
     }
     g_env.q[g_env.q_tail] = producer;
     g_env.q_tail = (g_env.q_tail + 1) % g_env.q_cap;
     g_env.q_count++;
     g_env.platform.cond_signal(g_env.cond);
+    return 0;
 }
+
+#if defined(VE_TLS_ENABLE_ALLOC_FAULT_INJECT)
+int ve_tls_env_test_queue_full_resets_flag(void) {
+    if (g_env.inited || ve_tls_env_has_resources()) {
+        return -2;
+    }
+    ve_tls_env_state saved = g_env;
+    ve_tls_producer producer;
+    ve_tls_producer * slot = NULL;
+    memset(&producer, 0, sizeof(producer));
+    memset(&g_env, 0, sizeof(g_env));
+    g_env.q = &slot;
+    g_env.q_cap = 1;
+    g_env.q_count = 1;
+    __atomic_store_n(&producer.env_registered, 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&producer.env_in_queue, 1, __ATOMIC_RELAXED);
+    ve_tls_env_queue_push_locked(&producer);
+    int reset = __atomic_load_n(&producer.env_in_queue, __ATOMIC_RELAXED) == 0;
+    g_env = saved;
+    return reset ? 0 : -1;
+}
+#endif
 
 static ve_tls_producer * ve_tls_env_queue_pop_locked(void) {
     if (g_env.q_count == 0) {

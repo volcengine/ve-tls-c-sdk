@@ -28,6 +28,7 @@ typedef struct {
     int64_t now_ms;
     int64_t lease_timeout_ms;
     int mode;
+    int sync_on_heartbeat;
 } ve_tls_lease_options;
 
 int ve_tls_lease_acquire(const ve_tls_lease_options * options, ve_tls_lease_state * state);

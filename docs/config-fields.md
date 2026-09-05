@@ -14,7 +14,7 @@
 | `file_name` | 写入到 LogGroup 的 file name。 |
 | `context_flow` | 写入到 LogGroup 的 context flow。 |
 | `log_tags` / `log_tag_count` | LogGroup 级别 tags。 |
-| `hash_key` | 默认 hashKey。单次写入传入 hashKey 时会覆盖该默认值。 |
+| `hash_key` | 默认 hashKey。允许为空；非空时必须是 32 位小写十六进制，范围为 `[00000000000000000000000000000000, ffffffffffffffffffffffffffffffff)`。单次写入传入 hashKey 时会覆盖该默认值。 |
 | `access_key_id` / `access_key_secret` | 静态 AK/SK。 |
 | `security_token` | 临时凭证 token。 |
 | `credentials_provider` | 临时凭证刷新回调。 |
@@ -38,14 +38,14 @@
 | `agg_max_log_group_logs` | 单个 LogGroup 的日志条数上限。 |
 | `agg_max_raw_bytes_per_request` | 单个请求的原始日志字节上限。 |
 | `agg_max_compressed_bytes_per_request` | 单个请求的压缩后字节上限。 |
-| `enable_time_ns` | 是否写入纳秒时间字段。 |
+| `enable_time_ns` | 是否写入 protobuf `TimeNs` 字段。`time_ms` 保留毫秒时间戳，`TimeNs` 是该毫秒之后 `0..999999` 的纳秒余数。 |
 
 默认派生规则：
 
 - `log_bytes_per_package` 未配置时，`max_buffer_bytes <= 64 MiB` 派生为 `2 MiB`，否则派生为 `4 MiB`。
 - `send_thread_count` 未配置时，`max_buffer_bytes <= 64 MiB` 派生为 `2`，`<= 256 MiB` 派生为 `4`，更大派生为 `8`。
 - `pack_thread_count` 未配置时跟随 `send_thread_count`。
-- `send_queue_size` 未配置时派生为 `8 + max_buffer_bytes / log_bytes_per_package`，范围限制在 `8..128`。
+- `send_queue_size=0` 时派生为 `8 + max_buffer_bytes / log_bytes_per_package`，范围限制在 `8..128`；任意正值都是精确配置，不会被派生逻辑覆盖。
 - 显式配置过的字段不会被派生值覆盖。
 
 ## 资源与背压
@@ -87,7 +87,7 @@
 | `user_agent` | 空 | 自定义客户端标识。通常不需要配置。 |
 | `http_debug` | `0` | HTTP 调试开关。生产环境不要开启。 |
 | `tcp_keepalive` / `tcp_keepidle` / `tcp_keepintvl` | 关闭 / `60` / `30` | curl adapter 的 TCP keepalive 参数。 |
-| `http_client` | 由构建选项决定 | 自定义 HTTP client。真实网络发送通常使用 curl adapter。 |
+| `http_client` | 由构建选项决定 | 自定义 HTTP client。`do_request` 返回 transport failure 时必须显式设置 `response.transport_retryable`；`0` 表示终态不可重试，非零表示允许重放。该合同对 generic/curl transport 一致。真实网络发送通常使用 curl adapter。 |
 
 ## 回调与重试
 
@@ -132,5 +132,5 @@ authentication failure；Persistent 模式下是否保留由
 `ve_tls_producer_create_versioned`，并传对应版本的精确 size。旧 init/create 只消费
 `VE_TLS_CONFIG_LEGACY_SIZE`，继续通过 `force_flush_disk` 保留原有 sync-WAL 映射。
 
-Core 默认不启用 max-age。需要与 SLS iOS 行为对齐的语言层可以显式配置 7 天并选择
-`VE_TLS_PEXPIRED_REWRITE`，但该语言层默认不应反向改变 C Core 和其他 SDK 的兼容默认。
+Core 默认不启用 max-age。需要固定日志保留时间的语言层可以显式配置期限并选择
+`VE_TLS_PEXPIRED_REWRITE`，但语言层默认不应反向改变 C Core 和其他 SDK 的兼容默认。

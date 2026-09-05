@@ -45,6 +45,9 @@ Persistent 模式下，指标要和本地目录状态一起看：
 - `persistent_overflow_drop_oldest_unacked(records, wal_bytes)`：overflow policy 显式删除了旧未 ACK closed segment；两个值是本次损失的记录数和 WAL 字节数，同时累加 dropped totals。
 - `persistent_backlog_retarget(records, wal_bytes)`：更新 endpoint、region 或 topic 时本地仍有 persistent backlog；这些记录会使用更新后的 current target。该事件只告警，不阻止更新。
 - `persistent_auth_failure_drop(start_id, end_id)`：用户显式配置认证失败 drop 后，对应范围作为终态推进 checkpoint，并累计 dropped totals。
+- `persistent_retry_cycle_delayed(delay_ms, 0)`：一次请求级重试预算耗尽，但最后错误仍可重试；persistent 批次保留在 live keyed queue，并在给定跨轮退避后再次发送。
+- `persistent_retry_persisted_for_recovery(start_id, end_id)`：Producer 已 close/stop，跨轮重试任务只保留在 WAL，等待下一次启动 recover；这不是数据 drop。
+- `persistent_retry_reschedule_failed(start_id, end_id)`：跨轮重试无法重新进入内存队列（通常是分配失败）；WAL 仍未 ACK，需告警并依赖后续 recover。
 - `persistent_expired_rewrite(log_id, enqueue_time_ms)`：recover 时发现超龄记录并成功重写日志时间。
 - `persistent_expired_rewrite_skipped(log_id, enqueue_time_ms)`：超龄 raw payload 无法安全解析，SDK 保留原 payload 继续发送，不执行隐式 drop。
 - `persistent_expired_drop(log_id, enqueue_time_ms)`：用户显式配置 max-age drop 后，该记录作为终态推进 checkpoint，并累计 dropped totals。

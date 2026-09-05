@@ -73,6 +73,7 @@ struct ve_tls_persistent {
     ve_tls_persistent_durability durability;
     ve_tls_mutex * heartbeat_mutex;
     _Atomic(int64_t) next_heartbeat_ms;
+    _Atomic(int64_t) lease_valid_until_ms;
     uint64_t current_bytes;
     uint64_t current_records;
     uint32_t current_segments;

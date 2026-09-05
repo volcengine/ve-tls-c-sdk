@@ -11,13 +11,13 @@ typedef struct {
 } ve_tls_buf;
 
 static int ve_tls_buf_reserve(ve_tls_buf * b, size_t n) {
-    if (b->len + n <= b->cap) {
-        return 0;
-    }
-    if (b->len > (size_t)-1 - n) {
+    if (n > (size_t)-1 - b->len) {
         return -1;
     }
     size_t target = b->len + n;
+    if (target <= b->cap) {
+        return 0;
+    }
     size_t next = b->cap ? b->cap : 128;
     while (next < target) {
         if (next > (size_t)-1 / 2) {
@@ -34,6 +34,36 @@ static int ve_tls_buf_reserve(ve_tls_buf * b, size_t n) {
     b->cap = next;
     return 0;
 }
+
+#if defined(VE_TLS_ENABLE_ALLOC_FAULT_INJECT)
+int ve_tls_proto_test_reserve(size_t len, size_t cap, size_t append_size) {
+    ve_tls_buf b;
+    int rc;
+    unsigned char sentinel = 0;
+    memset(&b, 0, sizeof(b));
+    b.len = len;
+    b.cap = cap;
+    /* Do not materialize a synthetic capacity when the request is already
+     * known to overflow; use a non-null sentinel so even this synthetic
+     * buffer has a valid data/capacity pairing. */
+    if (append_size > (size_t)-1 - len) {
+        b.data = &sentinel;
+        return ve_tls_buf_reserve(&b, append_size);
+    }
+    if (len > cap) {
+        return -1;
+    }
+    if (cap > 0) {
+        b.data = (unsigned char *)ve_tls_malloc(cap);
+        if (!b.data) {
+            return -1;
+        }
+    }
+    rc = ve_tls_buf_reserve(&b, append_size);
+    ve_tls_free(b.data);
+    return rc;
+}
+#endif
 
 static int ve_tls_buf_put(ve_tls_buf * b, const void * p, size_t n) {
     if (ve_tls_buf_reserve(b, n) != 0) {
@@ -150,6 +180,9 @@ int ve_tls_proto_encode_log(int64_t time_ms, const ve_tls_kv * kvs, size_t kv_co
 
 int ve_tls_proto_encode_log_ex(int64_t time_ms, uint32_t time_ns, int32_t has_time_ns, const ve_tls_kv * kvs, size_t kv_count, ve_tls_bytes * out) {
     if (!out) {
+        return -1;
+    }
+    if (has_time_ns && time_ns >= 1000000U) {
         return -1;
     }
     memset(out, 0, sizeof(ve_tls_bytes));

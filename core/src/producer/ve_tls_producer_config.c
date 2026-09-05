@@ -1,8 +1,12 @@
 #include "ve_tls_producer_internal.h"
+#include "ve_tls_version.h"
 
 #include <string.h>
 
-#include "ve_tls_version.h"
+enum {
+    VE_TLS_DEFAULT_PERSISTENT_LEASE_TIMEOUT_MS = 60000,
+    VE_TLS_DEFAULT_PERSISTENT_HEARTBEAT_INTERVAL_MS = 10000
+};
 
 #if defined(VE_TLS_HAVE_CURL)
 #include "ve_tls_http_curl.h"
@@ -32,12 +36,18 @@ static void ve_tls_http_client_init_noop(ve_tls_http_client * client) {
 #endif
 
 enum {
-    VE_TLS_DEFAULT_SEND_THREAD_COUNT = 1,
-    VE_TLS_DEFAULT_PACK_THREAD_COUNT = 1,
+    /* Zero is the auto-tune sentinel. Positive values are exact caller
+     * overrides, including one; do not conflate an explicit single-thread
+     * configuration with the runtime-derived default. */
+    VE_TLS_DEFAULT_SEND_THREAD_COUNT = 0,
+    VE_TLS_DEFAULT_PACK_THREAD_COUNT = 0,
     VE_TLS_DEFAULT_MAX_BUFFER_BYTES = 64 * 1024 * 1024,
     VE_TLS_DEFAULT_LOG_BYTES_PER_PACKAGE = 10 * 1024 * 1024,
     VE_TLS_DEFAULT_LOG_COUNT_PER_PACKAGE = 2048,
-    VE_TLS_DEFAULT_SEND_QUEUE_SIZE = 1024
+    /* Zero is the auto-tune sentinel. Keep positive values available as exact
+     * caller overrides; 1024 is also a useful real capacity for high-cardinality
+     * ordered/hash routing and must not be mistaken for "use defaults". */
+    VE_TLS_AUTO_SEND_QUEUE_SIZE = 0
 };
 
 static int32_t ve_tls_runtime_default_package_bytes(int32_t max_buffer_bytes) {
@@ -99,7 +109,7 @@ void ve_tls_producer_config_init(ve_tls_config * config) {
     config->log_bytes_per_package = VE_TLS_DEFAULT_LOG_BYTES_PER_PACKAGE;
     config->log_count_per_package = VE_TLS_DEFAULT_LOG_COUNT_PER_PACKAGE;
     config->flush_interval_ms = 1000;
-    config->send_queue_size = VE_TLS_DEFAULT_SEND_QUEUE_SIZE;
+    config->send_queue_size = VE_TLS_AUTO_SEND_QUEUE_SIZE;
     config->send_queue_full_policy = VE_TLS_SEND_QUEUE_FULL_DROP;
     config->send_queue_block_timeout_ms = 100;
     config->send_queue_sample_every_n = 10;
@@ -134,8 +144,8 @@ void ve_tls_producer_config_init(ve_tls_config * config) {
     config->persistent_overflow_policy = VE_TLS_POVERFLOW_REJECT_NEW;
     config->persistent_sample_every_n = 10;
     config->persistent_block_timeout_ms = 1000;
-    config->persistent_lease_timeout_ms = 60000;
-    config->persistent_heartbeat_interval_ms = 10000;
+    config->persistent_lease_timeout_ms = VE_TLS_DEFAULT_PERSISTENT_LEASE_TIMEOUT_MS;
+    config->persistent_heartbeat_interval_ms = VE_TLS_DEFAULT_PERSISTENT_HEARTBEAT_INTERVAL_MS;
     config->persistent_open_mode = VE_TLS_POPEN_TAKEOVER_IF_STALE;
     config->persistent_durability = VE_TLS_PDURABILITY_DEFAULT;
     config->persistent_max_log_delay_ms = 0;
@@ -158,6 +168,13 @@ void ve_tls_producer_config_apply_runtime_defaults(ve_tls_config * config) {
         return;
     }
 
+    if (config->persistent_lease_timeout_ms == 0) {
+        config->persistent_lease_timeout_ms = VE_TLS_DEFAULT_PERSISTENT_LEASE_TIMEOUT_MS;
+    }
+    if (config->persistent_heartbeat_interval_ms == 0) {
+        config->persistent_heartbeat_interval_ms = VE_TLS_DEFAULT_PERSISTENT_HEARTBEAT_INTERVAL_MS;
+    }
+
     derived_log_bytes = ve_tls_runtime_default_package_bytes(config->max_buffer_bytes);
     if (config->log_bytes_per_package == VE_TLS_DEFAULT_LOG_BYTES_PER_PACKAGE) {
         config->log_bytes_per_package = derived_log_bytes;
@@ -173,7 +190,7 @@ void ve_tls_producer_config_apply_runtime_defaults(ve_tls_config * config) {
     if (config->pack_thread_count == VE_TLS_DEFAULT_PACK_THREAD_COUNT) {
         config->pack_thread_count = config->send_thread_count;
     }
-    if (config->send_queue_size == VE_TLS_DEFAULT_SEND_QUEUE_SIZE) {
+    if (config->send_queue_size == VE_TLS_AUTO_SEND_QUEUE_SIZE) {
         config->send_queue_size = ve_tls_runtime_default_send_queue_size(
             config->max_buffer_bytes,
             config->log_bytes_per_package > 0 ? config->log_bytes_per_package : derived_log_bytes);

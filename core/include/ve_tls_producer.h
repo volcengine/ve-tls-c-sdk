@@ -100,7 +100,9 @@ typedef struct {
     const char * context_flow;
     const ve_tls_kv * log_tags;
     size_t log_tag_count;
+    /* NULL or exactly 32 lowercase hex characters in [0, ff..ff). */
     const char * hash_key;
+    /* Enables the protobuf TimeNs field, the 0..999999 ns remainder after time_ms. */
     int32_t enable_time_ns;
     const char * access_key_id;
     const char * access_key_secret;
@@ -111,6 +113,7 @@ typedef struct {
     int64_t credentials_refresh_min_interval_ms;
     const char * api_version;
     const char * compress_type;
+    /* 0 selects a runtime-derived default; positive values are exact. */
     int32_t send_thread_count;
     int32_t pack_thread_count;
     int32_t use_global_env;
@@ -126,6 +129,7 @@ typedef struct {
     int32_t log_bytes_per_package;
     int32_t log_count_per_package;
     int32_t flush_interval_ms;
+    /* 0 selects a runtime-derived capacity; positive values are exact. */
     int32_t send_queue_size;
     ve_tls_send_queue_full_policy send_queue_full_policy;
     int32_t send_queue_block_timeout_ms;
@@ -169,7 +173,9 @@ typedef struct {
     int32_t persistent_overflow_policy;
     int32_t persistent_sample_every_n;
     int32_t persistent_block_timeout_ms;
+    /* Zero selects the 60000 ms runtime default; negative values are invalid. */
     int32_t persistent_lease_timeout_ms;
+    /* Zero selects the 10000 ms runtime default; negative values are invalid. */
     int32_t persistent_heartbeat_interval_ms;
     int32_t persistent_open_mode;
     ve_tls_platform platform;
