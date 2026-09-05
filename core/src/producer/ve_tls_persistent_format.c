@@ -105,6 +105,7 @@ static size_t ext_hash_key_size(const ve_tls_persistent_record_view * view) {
 
 size_t ve_tls_persistent_record_encoded_size(const ve_tls_persistent_record_view * view) {
     size_t ext_len;
+    uint64_t total_len;
     if (!view || !view->payload || view->payload_size == 0) {
         return 0;
     }
@@ -121,7 +122,12 @@ size_t ve_tls_persistent_record_encoded_size(const ve_tls_persistent_record_view
     if (ext_len > VE_TLS_PERSISTENT_RECORD_EXT_MAX) {
         return 0;
     }
-    return VE_TLS_PERSISTENT_RECORD_HEADER_SIZE + ext_len + view->payload_size;
+    total_len = (uint64_t)VE_TLS_PERSISTENT_RECORD_HEADER_SIZE +
+        (uint64_t)ext_len + (uint64_t)view->payload_size;
+    if (total_len > UINT32_MAX) {
+        return 0;
+    }
+    return (size_t)total_len;
 }
 
 int ve_tls_persistent_record_encode(unsigned char * out, size_t out_cap, const ve_tls_persistent_record_view * view, size_t * out_size) {

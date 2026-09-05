@@ -97,13 +97,13 @@ static size_t ve_tls_bytes_field_size(uint32_t field_number, size_t n) {
 }
 
 static int ve_tls_wire_reserve(ve_tls_wire_buf * b, size_t n) {
-    if (b->len + n <= b->cap) {
-        return 0;
-    }
-    if (b->len > (size_t)-1 - n) {
+    if (!b || n > (size_t)-1 - b->len) {
         return -1;
     }
     size_t target = b->len + n;
+    if (target <= b->cap) {
+        return 0;
+    }
     size_t next = b->cap ? b->cap : 128;
     while (next < target) {
         if (next > (size_t)-1 / 2) {
@@ -281,6 +281,10 @@ void ve_tls_log_builder_shrink_if_needed(ve_tls_log_group_builder * b, size_t sh
 
 int ve_tls_log_builder_append(ve_tls_log_group_builder * b, const unsigned char * logs, size_t logs_len, int32_t log_count, int64_t earliest, int64_t latest, int64_t start_id, int64_t end_id, int64_t last_time_ms, uint32_t last_time_ns, int32_t last_has_time_ns) {
     if (!b || !logs || logs_len == 0 || log_count <= 0) {
+        return -1;
+    }
+    if ((b->logs_len > b->logs_cap) || ((b->logs == NULL) != (b->logs_cap == 0)) || b->log_count < 0 ||
+        logs_len > (size_t)-1 - b->logs_len || log_count > INT32_MAX - b->log_count) {
         return -1;
     }
     size_t need = b->logs_len + logs_len;

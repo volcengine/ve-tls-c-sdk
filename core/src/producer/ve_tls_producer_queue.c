@@ -27,13 +27,16 @@ void ve_tls_queue_free_all(ve_tls_producer * producer) {
 
 static int ve_tls_queue_ensure(ve_tls_producer * producer) {
     if (producer->queue_cap == 0) {
+        ve_tls_log_item * items = (ve_tls_log_item *)ve_tls_calloc(1024, sizeof(ve_tls_log_item));
+        if (!items) return -1;
+        producer->queue = items;
         producer->queue_cap = 1024;
-        producer->queue = (ve_tls_log_item *)ve_tls_calloc(producer->queue_cap, sizeof(ve_tls_log_item));
-        return producer->queue ? 0 : -1;
+        return 0;
     }
     if (producer->queue_count < producer->queue_cap) {
         return 0;
     }
+    if (producer->queue_cap > SIZE_MAX / 2 / sizeof(ve_tls_log_item)) return -1;
     size_t next_cap = producer->queue_cap * 2;
     ve_tls_log_item * next = (ve_tls_log_item *)ve_tls_calloc(next_cap, sizeof(ve_tls_log_item));
     if (!next) {
@@ -58,6 +61,7 @@ static int ve_tls_queue_push_owned_internal(ve_tls_producer * producer, unsigned
     if (!producer || !data || size == 0) {
         return -1;
     }
+    if (count_bytes && size > SIZE_MAX - producer->queue_bytes) return -1;
     if (ve_tls_queue_ensure(producer) != 0) {
         return -1;
     }
@@ -87,6 +91,7 @@ int ve_tls_queue_push_reserved_owned(ve_tls_producer * producer, unsigned char *
 }
 
 int ve_tls_queue_push(ve_tls_producer * producer, const unsigned char * data, size_t size, int64_t id, int64_t time_ms, uint32_t time_ns, int32_t has_time_ns, const char * hash_key) {
+    if (!producer || !data || size == 0) return -1;
     unsigned char * copy = (unsigned char *)ve_tls_malloc(size);
     if (!copy) {
         return -1;
@@ -109,9 +114,12 @@ int ve_tls_queue_push(ve_tls_producer * producer, const unsigned char * data, si
 }
 
 int ve_tls_queue_pop(ve_tls_producer * producer, ve_tls_log_item * out) {
-    if (producer->queue_count == 0) {
+    if (!producer || !out || !producer->queue || producer->queue_count == 0 ||
+        producer->queue_head >= producer->queue_cap) {
         return -1;
     }
+    /* Preserve ownership and counters if their invariant has been violated. */
+    if (producer->queue_bytes < producer->queue[producer->queue_head].size) return -1;
     *out = producer->queue[producer->queue_head];
     producer->queue[producer->queue_head].hash_key = NULL;
     producer->queue[producer->queue_head].data = NULL;
@@ -484,13 +492,16 @@ const char * ve_tls_normalize_hash_key(ve_tls_producer * producer, const char * 
 
 static int ve_tls_key_queue_ensure(ve_tls_key_queue * q) {
     if (q->cap == 0) {
+        ve_tls_send_task * tasks = (ve_tls_send_task *)ve_tls_calloc(64, sizeof(ve_tls_send_task));
+        if (!tasks) return -1;
+        q->q = tasks;
         q->cap = 64;
-        q->q = (ve_tls_send_task *)ve_tls_calloc(q->cap, sizeof(ve_tls_send_task));
-        return q->q ? 0 : -1;
+        return 0;
     }
     if (q->count < q->cap) {
         return 0;
     }
+    if (q->cap > SIZE_MAX / 2 / sizeof(ve_tls_send_task)) return -1;
     size_t next_cap = q->cap * 2;
     ve_tls_send_task * next = (ve_tls_send_task *)ve_tls_calloc(next_cap, sizeof(ve_tls_send_task));
     if (!next) {

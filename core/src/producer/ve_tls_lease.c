@@ -1,10 +1,15 @@
 #include "ve_tls_lease.h"
 
 #include <stddef.h>
+#include <stdatomic.h>
+#include <stdio.h>
 #include <string.h>
 
 #define VE_TLS_LEASE_MAGIC 0x544C5331u
 #define VE_TLS_LEASE_VERSION 1u
+#define VE_TLS_LEASE_TEMP_ATTEMPTS 256u
+
+static _Atomic(uint64_t) g_lease_temp_sequence = 1;
 
 typedef struct {
     uint32_t magic;
@@ -89,10 +94,17 @@ int ve_tls_lease_load(ve_tls_platform * platform, const char * path, ve_tls_leas
     return 0;
 }
 
-static int lease_file_save(ve_tls_platform * platform, const char * path, const ve_tls_lease_state * state) {
+static int lease_file_save(
+    ve_tls_platform * platform,
+    const char * path,
+    const ve_tls_lease_state * state,
+    int sync_file
+) {
     ve_tls_lease_file file_data;
-    ve_tls_file * file;
-    if (!platform || !path || !state) {
+    ve_tls_file * file = NULL;
+    char temp_path[768];
+    int rc = -1;
+    if (!platform || !path || !state || !platform->path_rename || !platform->path_remove) {
         return -1;
     }
     memset(&file_data, 0, sizeof(file_data));
@@ -100,25 +112,63 @@ static int lease_file_save(ve_tls_platform * platform, const char * path, const 
     file_data.version = VE_TLS_LEASE_VERSION;
     file_data.state = *state;
     file_data.checksum = checksum_bytes((const unsigned char *)&file_data, offsetof(ve_tls_lease_file, checksum));
-    file = platform->file_open(path, VE_TLS_FILE_OPEN_WRONLY | VE_TLS_FILE_OPEN_CREATE | VE_TLS_FILE_OPEN_TRUNC, 0644);
+    for (uint32_t attempt = 0; attempt < VE_TLS_LEASE_TEMP_ATTEMPTS; attempt++) {
+        uint64_t sequence = atomic_fetch_add_explicit(
+            &g_lease_temp_sequence,
+            1,
+            memory_order_relaxed);
+        int n = snprintf(
+            temp_path,
+            sizeof(temp_path),
+            "%s.tmp.%016llx.%016llx",
+            path,
+            (unsigned long long)state->last_heartbeat_ms,
+            (unsigned long long)sequence);
+        if (n < 0 || (size_t)n >= sizeof(temp_path)) {
+            return -1;
+        }
+        file = platform->file_open(
+            temp_path,
+            VE_TLS_FILE_OPEN_WRONLY | VE_TLS_FILE_OPEN_CREATE | VE_TLS_FILE_OPEN_EXCL,
+            0600);
+        if (file) {
+            break;
+        }
+    }
     if (!file) {
         return -1;
     }
-    if (write_full(platform, file, &file_data, sizeof(file_data)) != 0 || platform->file_fsync(file) != 0) {
-        platform->file_close(file);
+    if (write_full(platform, file, &file_data, sizeof(file_data)) != 0 ||
+        (sync_file && platform->file_fsync(file) != 0)) {
+        goto done;
+    }
+    rc = 0;
+
+done:
+    platform->file_close(file);
+    if (rc != 0 || platform->path_rename(temp_path, path) != 0) {
+        (void)platform->path_remove(temp_path);
         return -1;
     }
-    platform->file_close(file);
     return 0;
 }
 
 int ve_tls_lease_acquire(const ve_tls_lease_options * options, ve_tls_lease_state * state) {
     ve_tls_lease_state current;
+    ve_tls_path_info info;
     if (!options || !options->platform || !options->lease_path || !state) {
         return -1;
     }
     memset(state, 0, sizeof(*state));
-    if (ve_tls_lease_load(options->platform, options->lease_path, &current) == 0) {
+    memset(&info, 0, sizeof(info));
+    if (!options->platform->path_stat ||
+        options->platform->path_stat(options->lease_path, &info) != 0) {
+        return -1;
+    }
+    if (info.exists) {
+        if (ve_tls_lease_load(options->platform, options->lease_path, &current) != 0) {
+            return -1;
+        }
         if (options->now_ms - current.last_heartbeat_ms <= options->lease_timeout_ms) {
             return -1;
         }
@@ -135,19 +185,29 @@ int ve_tls_lease_acquire(const ve_tls_lease_options * options, ve_tls_lease_stat
     state->owner_pid = options->owner_pid;
     state->acquire_time_ms = options->now_ms;
     state->last_heartbeat_ms = options->now_ms;
-    return lease_file_save(options->platform, options->lease_path, state);
+    return lease_file_save(options->platform, options->lease_path, state, 1);
 }
 
 int ve_tls_lease_heartbeat(const ve_tls_lease_options * options, ve_tls_lease_state * state) {
+    ve_tls_lease_state next;
     if (!options || !options->platform || !options->lease_path || !state) {
         return -1;
     }
-    state->last_heartbeat_ms = options->now_ms;
-    return lease_file_save(options->platform, options->lease_path, state);
+    next = *state;
+    next.last_heartbeat_ms = options->now_ms;
+    if (lease_file_save(
+            options->platform,
+            options->lease_path,
+            &next,
+            options->sync_on_heartbeat ? 1 : 0) != 0) {
+        return -1;
+    }
+    *state = next;
+    return 0;
 }
 
 int ve_tls_lease_release(ve_tls_platform * platform, const char * lease_path) {
-    if (!platform || !lease_path) {
+    if (!platform || !lease_path || !platform->path_remove) {
         return -1;
     }
     return platform->path_remove(lease_path);

@@ -132,5 +132,5 @@ authentication failure；Persistent 模式下是否保留由
 `ve_tls_producer_create_versioned`，并传对应版本的精确 size。旧 init/create 只消费
 `VE_TLS_CONFIG_LEGACY_SIZE`，继续通过 `force_flush_disk` 保留原有 sync-WAL 映射。
 
-Core 默认不启用 max-age。需要与 SLS iOS 行为对齐的语言层可以显式配置 7 天并选择
-`VE_TLS_PEXPIRED_REWRITE`，但该语言层默认不应反向改变 C Core 和其他 SDK 的兼容默认。
+Core 默认不启用 max-age。需要固定日志保留时间的语言层可以显式配置期限并选择
+`VE_TLS_PEXPIRED_REWRITE`，但语言层默认不应反向改变 C Core 和其他 SDK 的兼容默认。

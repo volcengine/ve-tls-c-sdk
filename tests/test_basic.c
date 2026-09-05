@@ -594,6 +594,10 @@ static int g_track_segment_stats = 0;
 static ve_tls_mutex * g_track_producer_mutex = NULL;
 static _Thread_local int g_track_producer_mutex_depth = 0;
 static int g_track_file_write_saw_producer_mutex = 0;
+static int g_block_lease_rename = 0;
+static int g_lease_rename_entered = 0;
+static int g_release_lease_rename = 0;
+static int g_fail_next_path_rename = 0;
 static int g_fail_next_file_fsync = 0;
 static int g_file_fsync_calls = 0;
 static int g_fail_file_fsync_call = 0;
@@ -623,6 +627,25 @@ static int test_path_in_tracked_dir(const char * path) {
     }
     n = strlen(g_track_dir);
     return strncmp(path, g_track_dir, n) == 0 ? 1 : 0;
+}
+
+static int test_blocking_lease_path_rename(const char * from, const char * to) {
+    size_t length = to ? strlen(to) : 0;
+    if (__atomic_load_n(&g_block_lease_rename, __ATOMIC_ACQUIRE) &&
+        length >= 6 && strcmp(to + length - 6, "/lease") == 0) {
+        __atomic_store_n(&g_lease_rename_entered, 1, __ATOMIC_RELEASE);
+        while (!__atomic_load_n(&g_release_lease_rename, __ATOMIC_ACQUIRE)) {
+            g_real_platform.sleep_ms(1);
+        }
+    }
+    return g_real_platform.path_rename(from, to);
+}
+
+static int test_fail_next_path_rename(const char * from, const char * to) {
+    if (__atomic_exchange_n(&g_fail_next_path_rename, 0, __ATOMIC_ACQ_REL)) {
+        return -1;
+    }
+    return g_real_platform.path_rename(from, to);
 }
 
 static int test_path_is_tracked_lease(const char * path) {
@@ -705,7 +728,7 @@ static void test_track_mutex_unlock(ve_tls_mutex * m) {
 
 static int64_t test_track_file_write(ve_tls_file * f, const void * buf, size_t size) {
     if (g_track_producer_mutex_depth > 0) {
-        g_track_file_write_saw_producer_mutex = 1;
+        __atomic_store_n(&g_track_file_write_saw_producer_mutex, 1, __ATOMIC_RELEASE);
     }
     return g_real_platform.file_write(f, buf, size);
 }
@@ -791,6 +814,28 @@ static int test_http_do(ve_tls_http_client * client, const ve_tls_http_request *
     const char * body = "{\"errorCode\":\"LimitExceeded\",\"errorMessage\":\"too many\",\"requestID\":\"body-rid\"}";
     resp->body = (unsigned char *)strdup(body);
     resp->body_size = strlen(body);
+    return 0;
+}
+
+static int g_env_destroy_http_entered = 0;
+static int g_env_destroy_http_release = 0;
+
+static int test_http_env_destroy_block_do(
+    ve_tls_http_client * client,
+    const ve_tls_http_request * req,
+    ve_tls_http_response * resp
+) {
+    (void)client;
+    (void)req;
+    if (!resp) {
+        return -1;
+    }
+    __atomic_store_n(&g_env_destroy_http_entered, 1, __ATOMIC_RELEASE);
+    while (!__atomic_load_n(&g_env_destroy_http_release, __ATOMIC_ACQUIRE)) {
+        usleep(1000);
+    }
+    resp->status_code = 200;
+    resp->request_id = strdup("env-destroy-rid");
     return 0;
 }
 
@@ -5170,6 +5215,15 @@ static int test_sender_putlogs_includes_empty_hashkey_header(void) {
 static int g_raw_done = 0;
 static int g_raw_ok = 0;
 static int g_raw_ok_count = 0;
+static int g_raw_log_count_header_ok = 0;
+
+static int test_http_raw_count_do(ve_tls_http_client * client, const ve_tls_http_request * req, ve_tls_http_response * resp) {
+    if (!req || !req->headers || !strstr(req->headers, "log-count: 1\n")) {
+        return -1;
+    }
+    __atomic_store_n(&g_raw_log_count_header_ok, 1, __ATOMIC_RELEASE);
+    return test_http_ok_do(client, req, resp);
+}
 
 static void on_send_done_raw_v2(
     ve_tls_result result,
@@ -5200,6 +5254,7 @@ static int test_raw_add_log_paths_ok(void) {
     __atomic_store_n(&g_raw_done, 0, __ATOMIC_RELAXED);
     __atomic_store_n(&g_raw_ok, 0, __ATOMIC_RELAXED);
     __atomic_store_n(&g_raw_ok_count, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_raw_log_count_header_ok, 0, __ATOMIC_RELAXED);
 
     ve_tls_config cfg;
     ve_tls_config_init(&cfg);
@@ -5212,7 +5267,7 @@ static int test_raw_add_log_paths_ok(void) {
     cfg.flush_interval_ms = 0;
     cfg.agg_strategy = 0;
     cfg.compress_type = "none";
-    cfg.http_client.do_request = test_http_ok_do;
+    cfg.http_client.do_request = test_http_raw_count_do;
     cfg.http_client.free_response = test_http_free;
 
     ve_tls_producer * p = ve_tls_producer_create(&cfg);
@@ -5235,7 +5290,8 @@ static int test_raw_add_log_paths_ok(void) {
         cfg.platform.sleep_ms(10);
     }
     ve_tls_producer_destroy(p);
-    return __atomic_load_n(&g_raw_ok, __ATOMIC_RELAXED) ? 0 : -1;
+    return (__atomic_load_n(&g_raw_ok, __ATOMIC_RELAXED) &&
+            __atomic_load_n(&g_raw_log_count_header_ok, __ATOMIC_ACQUIRE)) ? 0 : -1;
 }
 
 static int test_add_log_with_id_returns_monotonic_ids(void) {
@@ -5505,7 +5561,13 @@ static int test_env_create_without_init_fails(void) {
     return 0;
 }
 
+static int test_env_queue_full_resets_scheduling_flag(void) {
+    return ve_tls_env_test_queue_full_resets_flag();
+}
+
 static int test_env_destroy_timeout_then_recover(void) {
+    __atomic_store_n(&g_env_destroy_http_entered, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_env_destroy_http_release, 0, __ATOMIC_RELEASE);
     if (ve_tls_env_init(1) != VE_TLS_OK) {
         return -1;
     }
@@ -5518,7 +5580,7 @@ static int test_env_destroy_timeout_then_recover(void) {
     cfg.access_key_id = "ak";
     cfg.access_key_secret = "sk";
     cfg.retry_policy.max_attempts = 1;
-    cfg.http_client.do_request = test_http_do;
+    cfg.http_client.do_request = test_http_env_destroy_block_do;
     cfg.http_client.free_response = test_http_free;
     cfg.use_global_env = 1;
 
@@ -5537,17 +5599,29 @@ static int test_env_destroy_timeout_then_recover(void) {
         return -1;
     }
 
+    for (int i = 0; i < 5000 &&
+            !__atomic_load_n(&g_env_destroy_http_entered, __ATOMIC_ACQUIRE); i++) {
+        cfg.platform.sleep_ms(1);
+    }
+    if (!__atomic_load_n(&g_env_destroy_http_entered, __ATOMIC_ACQUIRE)) {
+        __atomic_store_n(&g_env_destroy_http_release, 1, __ATOMIC_RELEASE);
+        ve_tls_producer_destroy(p);
+        (void)ve_tls_env_destroy(1000);
+        return -1;
+    }
+
     ve_tls_result trc = ve_tls_env_destroy(0);
+    __atomic_store_n(&g_env_destroy_http_release, 1, __ATOMIC_RELEASE);
     if (trc != VE_TLS_TIMEOUT) {
         ve_tls_producer_destroy(p);
         (void)ve_tls_env_destroy(1000);
         return -1;
     }
 
-    (void)ve_tls_producer_close(p, 5000);
+    ve_tls_result close_rc = ve_tls_producer_close(p, 5000);
     ve_tls_producer_destroy(p);
     ve_tls_result rc = ve_tls_env_destroy(5000);
-    return rc == VE_TLS_OK ? 0 : -1;
+    return close_rc == VE_TLS_OK && rc == VE_TLS_OK ? 0 : -1;
 }
 
 typedef struct {
@@ -6078,6 +6152,42 @@ static int test_alloc_fail_fuzz_proto_does_not_crash(void) {
     return 0;
 }
 
+static int test_proto_reserve_rejects_size_overflow_before_capacity_check(void) {
+    if (ve_tls_proto_test_reserve((size_t)-4, (size_t)-1, 8) != -1) {
+        return -1;
+    }
+    if (ve_tls_proto_test_reserve(17, 16, 0) != -1) {
+        return -1;
+    }
+    /* A non-empty capacity must be backed by storage and released by the
+     * helper; this also exercises the no-growth and growth paths. */
+    ve_tls_alloc_hooks saved;
+    alloc_track_state tracking;
+    memset(&saved, 0, sizeof(saved));
+    memset(&tracking, 0, sizeof(tracking));
+    ve_tls_alloc_get_hooks(&saved);
+    enable_alloc_tracking(&tracking);
+    int rc = ve_tls_proto_test_reserve(8, 16, 4);
+    int grow_rc = ve_tls_proto_test_reserve(16, 16, 1);
+    ve_tls_alloc_set_hooks(&saved);
+    if (rc != 0 || grow_rc != 0 ||
+        __atomic_load_n(&tracking.live, __ATOMIC_RELAXED) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+static int test_sign_size_arithmetic_rejects_overflow(void) {
+    size_t out = 0;
+    if (ve_tls_sign_test_query_pair_capacity((size_t)-1 / 2 + 1, (size_t)-1 / 2 + 1, &out) != -1) {
+        return -1;
+    }
+    if (ve_tls_sign_test_canonical_request_size((size_t)-1, 1, 0, 0, 0, 0, &out) != -1) {
+        return -1;
+    }
+    return 0;
+}
+
 static int test_alloc_fail_fuzz_proto_group_list_does_not_crash(void) {
     ve_tls_alloc_hooks saved;
     memset(&saved, 0, sizeof(saved));
@@ -6491,20 +6601,26 @@ static int test_hash_key_and_time_ns_public_contract(void) {
         return -1;
     }
 
+    cfg.hash_key = "";
+    p = ve_tls_producer_create(&cfg);
+    if (!p) return -2;
+    ve_tls_producer_destroy(p);
+
     cfg.hash_key = TEST_HASH_KEY_ZERO;
     cfg.flush_interval_ms = 100000;
     cfg.http_client.do_request = test_http_ok_do;
     cfg.http_client.free_response = test_http_ok_free;
     p = ve_tls_producer_create(&cfg);
-    if (!p) return -2;
+    if (!p) return -3;
 
-    if (ve_tls_producer_add_log_kv_hashkey(p, 1710000000000LL, TEST_HASH_KEY_ZERO, &kv, 1, 0) != VE_TLS_OK ||
+    if (ve_tls_producer_add_log_kv_hashkey(p, 1709999999999LL, "", &kv, 1, 0) != VE_TLS_OK ||
+        ve_tls_producer_add_log_kv_hashkey(p, 1710000000000LL, TEST_HASH_KEY_ZERO, &kv, 1, 0) != VE_TLS_OK ||
         ve_tls_producer_add_log_kv_hashkey(p, 1710000000001LL, TEST_HASH_KEY_MAX, &kv, 1, 0) != VE_TLS_OK ||
         ve_tls_producer_add_log_kv_hashkey(p, 1710000000002LL, TEST_HASH_KEY_UPPER_BOUND, &kv, 1, 0) != VE_TLS_INVALID ||
         ve_tls_producer_add_log_kv_hashkey(p, 1710000000003LL, "0000000000000000000000000000000A", &kv, 1, 0) != VE_TLS_INVALID ||
         ve_tls_producer_add_log_kv_hashkey(p, 1710000000004LL, "01", &kv, 1, 0) != VE_TLS_INVALID) {
         ve_tls_producer_destroy(p);
-        return -3;
+        return -4;
     }
 
     if (ve_tls_producer_add_log_kv_time_parts_hashkey(
@@ -6514,18 +6630,25 @@ static int test_hash_key_and_time_ns_public_contract(void) {
         ve_tls_producer_add_log_raw_time_parts(
             p, 1710000000007LL, 1, 1000000U, "raw", 3, 0) != VE_TLS_INVALID) {
         ve_tls_producer_destroy(p);
-        return -4;
+        return -5;
     }
+
+    tpl = ve_tls_template_create(p, keys, key_lens, 1, "");
+    if (!tpl) {
+        ve_tls_producer_destroy(p);
+        return -6;
+    }
+    ve_tls_template_destroy(tpl);
 
     tpl = ve_tls_template_create(p, keys, key_lens, 1, TEST_HASH_KEY_MAX);
     if (!tpl) {
         ve_tls_producer_destroy(p);
-        return -5;
+        return -7;
     }
     ve_tls_template_destroy(tpl);
     if (ve_tls_template_create(p, keys, key_lens, 1, TEST_HASH_KEY_UPPER_BOUND) != NULL) {
         ve_tls_producer_destroy(p);
-        return -6;
+        return -8;
     }
 
     ve_tls_producer_destroy(p);
@@ -6779,27 +6902,33 @@ static int test_export_import_raw_buffer(void) {
     }
     ve_tls_producer_destroy(p);
 
-    ve_tls_producer * p2 = ve_tls_producer_create(&cfg);
-    if (!p2) {
+    /* This checks serialization round-tripping, not asynchronous delivery.
+     * A live worker can consume the imported queue before the second export. */
+    ve_tls_producer imported;
+    ve_tls_producer * p2 = &imported;
+    if (init_fake_sender_producer(p2, &cfg) != 0) {
         ve_tls_producer_free_raw_buffer(b1);
         return -1;
     }
     if (ve_tls_producer_import_raw_buffer(p2, b1, n1) != VE_TLS_OK) {
         ve_tls_producer_free_raw_buffer(b1);
-        ve_tls_producer_destroy(p2);
+        ve_tls_queue_free_all(p2);
+        destroy_fake_sender_producer(p2);
         return -1;
     }
     unsigned char * b2 = NULL;
     size_t n2 = 0;
     if (ve_tls_producer_export_raw_buffer(p2, &b2, &n2) != VE_TLS_OK || !b2 || n2 == 0) {
         ve_tls_producer_free_raw_buffer(b1);
-        ve_tls_producer_destroy(p2);
+        ve_tls_queue_free_all(p2);
+        destroy_fake_sender_producer(p2);
         return -1;
     }
     int ok = (n1 == n2 && memcmp(b1, b2, n1) == 0) ? 0 : -1;
     ve_tls_producer_free_raw_buffer(b1);
     ve_tls_producer_free_raw_buffer(b2);
-    ve_tls_producer_destroy(p2);
+    ve_tls_queue_free_all(p2);
+    destroy_fake_sender_producer(p2);
     return ok;
 }
 
@@ -9304,13 +9433,16 @@ static int test_http_sleep_do(ve_tls_http_client * client, const ve_tls_http_req
     return 0;
 }
 
+static int g_takeover_http_started = 0;
+
 static int test_http_takeover_block_do(ve_tls_http_client * client, const ve_tls_http_request * req, ve_tls_http_response * resp) {
     (void)client;
     (void)req;
     if (!resp) {
         return -1;
     }
-    usleep(200 * 1000);
+    __atomic_store_n(&g_takeover_http_started, 1, __ATOMIC_RELEASE);
+    usleep(500 * 1000);
     resp->status_code = 200;
     resp->request_id = strdup("rid-takeover");
     return 0;
@@ -10535,6 +10667,15 @@ static int test_persistent_record_roundtrip_hash_key(void) {
     return 0;
 }
 
+static int test_persistent_record_rejects_uint32_length_overflow(void) {
+    ve_tls_persistent_record_view view;
+    unsigned char payload = 1;
+    memset(&view, 0, sizeof(view));
+    view.payload = &payload;
+    view.payload_size = (size_t)UINT32_MAX;
+    return ve_tls_persistent_record_encoded_size(&view) == 0 ? 0 : -1;
+}
+
 static int test_persistent_record_legacy_v1_remains_readable(void) {
     static const unsigned char payload[] = {'v', '1'};
     ve_tls_persistent_record_view view;
@@ -11485,6 +11626,8 @@ fail:
     return -1;
 }
 
+static int test_write_text_file(const char * path, const char * text);
+
 static int test_checkpoint_roundtrip_and_lease_takeover(void) {
     char dir[PATH_MAX];
     char checkpoint_path[PATH_MAX];
@@ -11550,6 +11693,95 @@ static int test_checkpoint_roundtrip_and_lease_takeover(void) {
         return -1;
     }
 
+    cleanup_persistent_dir(dir);
+    return 0;
+}
+
+static int test_lease_acquire_rejects_corrupt_existing_file(void) {
+    char dir[PATH_MAX];
+    char lease_path[PATH_MAX];
+    ve_tls_lease_options opt;
+    ve_tls_lease_state state;
+    ve_tls_config cfg;
+    if (make_temp_dir(dir, sizeof(dir)) != 0) {
+        return -1;
+    }
+    join_path(lease_path, sizeof(lease_path), dir, "lease");
+    ve_tls_config_init(&cfg);
+    memset(&opt, 0, sizeof(opt));
+    memset(&state, 0, sizeof(state));
+    if (test_write_text_file(lease_path, "corrupt") != 0) {
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    opt.platform = &cfg.platform;
+    opt.lease_path = lease_path;
+    opt.owner_id = "owner-a";
+    opt.owner_pid = 100;
+    opt.owner_process_name = "proc-a";
+    opt.now_ms = 1000;
+    opt.lease_timeout_ms = 200;
+    opt.mode = VE_TLS_LEASE_OPEN_TAKEOVER_IF_STALE;
+    if (ve_tls_lease_acquire(&opt, &state) == 0) {
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    cleanup_persistent_dir(dir);
+    return 0;
+}
+
+static int test_lease_failed_heartbeat_preserves_last_published_state(void) {
+    char dir[PATH_MAX];
+    char lease_path[PATH_MAX];
+    ve_tls_lease_options opt;
+    ve_tls_lease_state state;
+    ve_tls_lease_state loaded;
+    ve_tls_config cfg;
+    if (make_temp_dir(dir, sizeof(dir)) != 0) {
+        return -1;
+    }
+    join_path(lease_path, sizeof(lease_path), dir, "lease");
+    ve_tls_config_init(&cfg);
+    g_real_platform = cfg.platform;
+    memset(&opt, 0, sizeof(opt));
+    memset(&state, 0, sizeof(state));
+    memset(&loaded, 0, sizeof(loaded));
+    opt.platform = &cfg.platform;
+    opt.lease_path = lease_path;
+    opt.owner_id = "owner-a";
+    opt.owner_pid = 100;
+    opt.owner_process_name = "proc-a";
+    opt.now_ms = 1000;
+    opt.lease_timeout_ms = 200;
+    opt.mode = VE_TLS_LEASE_OPEN_TAKEOVER_IF_STALE;
+    if (ve_tls_lease_acquire(&opt, &state) != 0) {
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    cfg.platform.file_write = test_short_write_then_fail_file_write;
+    opt.now_ms = 1100;
+    __atomic_store_n(&g_fail_next_file_write, 1, __ATOMIC_RELEASE);
+    if (ve_tls_lease_heartbeat(&opt, &state) == 0 ||
+        ve_tls_lease_load(&cfg.platform, lease_path, &loaded) != 0 ||
+        loaded.last_heartbeat_ms != 1000 ||
+        loaded.fencing_token != 1) {
+        __atomic_store_n(&g_fail_next_file_write, 0, __ATOMIC_RELEASE);
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    __atomic_store_n(&g_fail_next_file_write, 0, __ATOMIC_RELEASE);
+    cfg.platform.file_write = g_real_platform.file_write;
+    cfg.platform.path_rename = test_fail_next_path_rename;
+    opt.now_ms = 1200;
+    __atomic_store_n(&g_fail_next_path_rename, 1, __ATOMIC_RELEASE);
+    if (ve_tls_lease_heartbeat(&opt, &state) == 0 ||
+        ve_tls_lease_load(&cfg.platform, lease_path, &loaded) != 0 ||
+        loaded.last_heartbeat_ms != 1000 || state.last_heartbeat_ms != 1000) {
+        __atomic_store_n(&g_fail_next_path_rename, 0, __ATOMIC_RELEASE);
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    __atomic_store_n(&g_fail_next_path_rename, 0, __ATOMIC_RELEASE);
     cleanup_persistent_dir(dir);
     return 0;
 }
@@ -11620,6 +11852,7 @@ static void test_init_persistent_options(
     opt->max_segments = 8;
     opt->now_ms = 1000;
     opt->lease_timeout_ms = 300;
+    opt->heartbeat_interval_ms = 100;
     opt->open_mode = VE_TLS_LEASE_OPEN_TAKEOVER_IF_STALE;
 }
 
@@ -11658,6 +11891,7 @@ static int test_persistent_open_creates_metadata_files(void) {
     opt.max_segments = 8;
     opt.now_ms = 1000;
     opt.lease_timeout_ms = 300;
+    opt.heartbeat_interval_ms = 100;
     opt.open_mode = VE_TLS_LEASE_OPEN_TAKEOVER_IF_STALE;
     if (ve_tls_persistent_open(&persistent, &opt) != 0) {
         cleanup_persistent_dir(dir);
@@ -12235,8 +12469,12 @@ static int test_append_persistent_encoded_log(
     ve_tls_kv kv = {"message", "max-age"};
     ve_tls_log_group_builder * builder = NULL;
     ve_tls_producer * producer = NULL;
+    unsigned char * record = NULL;
+    size_t record_size = 0;
+    ve_tls_persistent_record_view view;
+    int rc = -1;
     if (test_init_persistent_v2_config(&cfg, dir) != 0) return -1;
-    g_fake_time = enqueue_time_ms;
+    g_fake_time = enqueue_time_ms > 0 ? enqueue_time_ms : 1000;
     producer = ve_tls_producer_create_versioned(
         &cfg, sizeof(cfg), VE_TLS_CONFIG_VERSION_CURRENT);
     builder = ve_tls_log_builder_create("");
@@ -12248,9 +12486,25 @@ static int test_append_persistent_encoded_log(
         return -1;
     }
     producer->config.platform.mutex_lock(producer->persistent_mutex);
-    int rc = ve_tls_persistent_append(
-        producer->persistent, 1, NULL, builder->logs, builder->logs_len);
+    if (enqueue_time_ms > 0) {
+        rc = ve_tls_persistent_append(
+            producer->persistent, 1, NULL, builder->logs, builder->logs_len);
+    } else {
+        memset(&view, 0, sizeof(view));
+        view.log_id = 1;
+        view.record_version = VE_TLS_PERSISTENT_RECORD_VERSION_CURRENT;
+        view.enqueue_time_ms = 0;
+        view.payload = builder->logs;
+        view.payload_size = builder->logs_len;
+        record_size = ve_tls_persistent_record_encoded_size(&view);
+        record = record_size > 0 ? (unsigned char *)malloc(record_size) : NULL;
+        if (record &&
+            ve_tls_persistent_record_encode(record, record_size, &view, &record_size) == 0) {
+            rc = ve_tls_segment_store_append(&producer->persistent->store, record, record_size, NULL);
+        }
+    }
     producer->config.platform.mutex_unlock(producer->persistent_mutex);
+    free(record);
     ve_tls_log_builder_free(builder);
     ve_tls_producer_destroy(producer);
     return rc == 0 ? 0 : -1;
@@ -13309,6 +13563,187 @@ static int test_persistent_heartbeat_updates_lease(void) {
     return 0;
 }
 
+static int test_persistent_heartbeat_fsync_matches_durability(void) {
+    char buffered_dir[PATH_MAX] = {0};
+    char sync_dir[PATH_MAX] = {0};
+    ve_tls_persistent_options opt;
+    ve_tls_persistent persistent;
+    ve_tls_config cfg;
+    int fsync_calls_after_open;
+    if (make_temp_dir(buffered_dir, sizeof(buffered_dir)) != 0 ||
+        make_temp_dir(sync_dir, sizeof(sync_dir)) != 0) {
+        cleanup_persistent_dir(buffered_dir);
+        cleanup_persistent_dir(sync_dir);
+        return -1;
+    }
+    ve_tls_config_init(&cfg);
+    g_real_platform = cfg.platform;
+    g_fake_time = 1000;
+    cfg.platform.time_ms = test_fake_time_ms;
+    cfg.platform.sleep_ms = test_fake_sleep_ms;
+    cfg.platform.file_fsync = test_count_file_fsync;
+    memset(&opt, 0, sizeof(opt));
+    memset(&persistent, 0, sizeof(persistent));
+    opt.platform = &cfg.platform;
+    opt.dir_path = buffered_dir;
+    opt.instance_id = "test-instance";
+    opt.owner_id = "owner-a";
+    opt.owner_process_name = "proc-a";
+    opt.owner_pid = 123;
+    opt.segment_max_bytes = 1024;
+    opt.segment_max_records = 128;
+    opt.max_bytes = 4096;
+    opt.max_records = 512;
+    opt.max_segments = 8;
+    opt.now_ms = 1000;
+    opt.lease_timeout_ms = 1000;
+    opt.heartbeat_interval_ms = 100;
+    opt.open_mode = VE_TLS_LEASE_OPEN_TAKEOVER_IF_STALE;
+    opt.durability = VE_TLS_PDURABILITY_BUFFERED_WAL;
+    __atomic_store_n(&g_file_fsync_calls, 0, __ATOMIC_RELEASE);
+    if (ve_tls_persistent_open(&persistent, &opt) != 0) {
+        goto fail;
+    }
+    fsync_calls_after_open = __atomic_load_n(&g_file_fsync_calls, __ATOMIC_ACQUIRE);
+    if (fsync_calls_after_open <= 0 ||
+        ve_tls_persistent_heartbeat_if_due(&persistent, 1) != 0 ||
+        __atomic_load_n(&g_file_fsync_calls, __ATOMIC_ACQUIRE) != fsync_calls_after_open) {
+        goto fail;
+    }
+    ve_tls_persistent_close(&persistent);
+    memset(&persistent, 0, sizeof(persistent));
+
+    opt.dir_path = sync_dir;
+    opt.durability = VE_TLS_PDURABILITY_SYNC_WAL;
+    __atomic_store_n(&g_file_fsync_calls, 0, __ATOMIC_RELEASE);
+    if (ve_tls_persistent_open(&persistent, &opt) != 0) {
+        goto fail;
+    }
+    fsync_calls_after_open = __atomic_load_n(&g_file_fsync_calls, __ATOMIC_ACQUIRE);
+    if (fsync_calls_after_open <= 0 ||
+        ve_tls_persistent_heartbeat_if_due(&persistent, 1) != 0 ||
+        __atomic_load_n(&g_file_fsync_calls, __ATOMIC_ACQUIRE) != fsync_calls_after_open + 1) {
+        goto fail;
+    }
+    ve_tls_persistent_close(&persistent);
+    cleanup_persistent_dir(buffered_dir);
+    cleanup_persistent_dir(sync_dir);
+    return 0;
+
+fail:
+    ve_tls_persistent_close(&persistent);
+    cleanup_persistent_dir(buffered_dir);
+    cleanup_persistent_dir(sync_dir);
+    return -1;
+}
+
+static int invalid_persistent_lease_options_are_rejected(
+    int64_t now_ms,
+    int64_t heartbeat_ms,
+    int64_t timeout_ms
+) {
+    char dir[PATH_MAX];
+    ve_tls_persistent_options opt;
+    ve_tls_persistent persistent;
+    ve_tls_config cfg;
+    int open_rc;
+    if (make_temp_dir(dir, sizeof(dir)) != 0) {
+        return -1;
+    }
+    ve_tls_config_init(&cfg);
+    memset(&opt, 0, sizeof(opt));
+    memset(&persistent, 0, sizeof(persistent));
+    opt.platform = &cfg.platform;
+    opt.dir_path = dir;
+    opt.instance_id = "test-instance";
+    opt.owner_id = "owner-a";
+    opt.owner_process_name = "proc-a";
+    opt.owner_pid = 123;
+    opt.segment_max_bytes = 1024;
+    opt.segment_max_records = 128;
+    opt.max_bytes = 4096;
+    opt.max_records = 512;
+    opt.max_segments = 8;
+    opt.now_ms = now_ms;
+    opt.lease_timeout_ms = timeout_ms;
+    opt.heartbeat_interval_ms = heartbeat_ms;
+    opt.open_mode = VE_TLS_LEASE_OPEN_TAKEOVER_IF_STALE;
+    open_rc = ve_tls_persistent_open(&persistent, &opt);
+    if (open_rc == 0) {
+        ve_tls_persistent_close(&persistent);
+    }
+    cleanup_persistent_dir(dir);
+    return open_rc == 0 ? -1 : 0;
+}
+
+static int test_persistent_open_rejects_invalid_lease_clock_config(void) {
+    return invalid_persistent_lease_options_are_rejected(0, 100, 1000) == 0 &&
+           invalid_persistent_lease_options_are_rejected(1000, 0, 1000) == 0 &&
+           invalid_persistent_lease_options_are_rejected(1000, 100, 0) == 0
+        ? 0
+        : -1;
+}
+
+static int test_persistent_mutation_rejects_invalid_clock_without_lease_write(void) {
+    char dir[PATH_MAX];
+    char lease_path[PATH_MAX];
+    ve_tls_persistent_options opt;
+    ve_tls_persistent persistent;
+    ve_tls_lease_state loaded;
+    ve_tls_config cfg;
+    static const unsigned char payload[] = "123456789";
+    int append_rc;
+    int ack_rc;
+    int failed;
+    if (make_temp_dir(dir, sizeof(dir)) != 0) {
+        return -1;
+    }
+    join_path(lease_path, sizeof(lease_path), dir, "lease");
+    ve_tls_config_init(&cfg);
+    g_real_platform = cfg.platform;
+    g_fake_time = 1000;
+    cfg.platform.time_ms = test_fake_time_ms;
+    cfg.platform.file_fsync = test_count_file_fsync;
+    memset(&opt, 0, sizeof(opt));
+    memset(&persistent, 0, sizeof(persistent));
+    memset(&loaded, 0, sizeof(loaded));
+    opt.platform = &cfg.platform;
+    opt.dir_path = dir;
+    opt.instance_id = "test-instance";
+    opt.owner_id = "owner-a";
+    opt.owner_process_name = "proc-a";
+    opt.owner_pid = 123;
+    opt.segment_max_bytes = 1024;
+    opt.segment_max_records = 128;
+    opt.max_bytes = 4096;
+    opt.max_records = 512;
+    opt.max_segments = 8;
+    opt.now_ms = g_fake_time;
+    opt.lease_timeout_ms = 1000;
+    opt.heartbeat_interval_ms = 100;
+    opt.open_mode = VE_TLS_LEASE_OPEN_TAKEOVER_IF_STALE;
+    opt.durability = VE_TLS_PDURABILITY_SYNC_WAL;
+    if (ve_tls_persistent_open(&persistent, &opt) != 0 ||
+        ve_tls_persistent_append(&persistent, 1, NULL, payload, sizeof(payload) - 1) != 0) {
+        ve_tls_persistent_close(&persistent);
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    __atomic_store_n(&g_file_fsync_calls, 0, __ATOMIC_RELEASE);
+    g_fake_time = 0;
+    append_rc = ve_tls_persistent_append(&persistent, 2, NULL, payload, sizeof(payload) - 1);
+    ack_rc = ve_tls_persistent_ack_range(&persistent, 1, 1);
+    failed = append_rc == 0 ||
+        ack_rc == 0 ||
+        __atomic_load_n(&g_file_fsync_calls, __ATOMIC_ACQUIRE) != 0 ||
+        persistent.lease.last_heartbeat_ms != 1000 ||
+        ve_tls_lease_load(&cfg.platform, lease_path, &loaded) != 0 ||
+        loaded.last_heartbeat_ms != 1000;
+    ve_tls_persistent_close(&persistent);
+    cleanup_persistent_dir(dir);
+    return failed ? -1 : 0;
+}
+
 static int test_persistent_heartbeat_before_due_skips_lease_reload(void) {
     char dir[PATH_MAX];
     ve_tls_persistent_options opt;
@@ -13405,6 +13840,109 @@ static int test_persistent_append_before_due_skips_lease_reload(void) {
     return 0;
 }
 
+static int test_persistent_append_after_heartbeat_due_uses_valid_lease_window(void) {
+    char dir[PATH_MAX];
+    ve_tls_persistent_options opt;
+    ve_tls_persistent persistent;
+    ve_tls_config cfg;
+    static const unsigned char payload[] = "123456789";
+    if (make_temp_dir(dir, sizeof(dir)) != 0) {
+        return -1;
+    }
+    ve_tls_config_init(&cfg);
+    g_real_platform = cfg.platform;
+    g_fake_time = 1000;
+    cfg.platform.time_ms = test_fake_time_ms;
+    cfg.platform.sleep_ms = test_fake_sleep_ms;
+    cfg.platform.file_open = test_track_file_open;
+    memset(&opt, 0, sizeof(opt));
+    memset(&persistent, 0, sizeof(persistent));
+    test_track_reset(dir);
+    opt.platform = &cfg.platform;
+    opt.dir_path = dir;
+    opt.instance_id = "test-instance";
+    opt.owner_id = "owner-a";
+    opt.owner_process_name = "proc-a";
+    opt.owner_pid = 123;
+    opt.segment_max_bytes = 1024;
+    opt.segment_max_records = 128;
+    opt.max_bytes = 4096;
+    opt.max_records = 512;
+    opt.max_segments = 8;
+    opt.now_ms = g_fake_time;
+    opt.lease_timeout_ms = 1000;
+    opt.heartbeat_interval_ms = 100;
+    opt.open_mode = VE_TLS_LEASE_OPEN_TAKEOVER_IF_STALE;
+    if (ve_tls_persistent_open(&persistent, &opt) != 0) {
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    g_fake_time = 1101;
+    test_track_reset(dir);
+    if (ve_tls_persistent_append(&persistent, 1, NULL, payload, sizeof(payload) - 1) != 0 ||
+        g_track_lease_opens != 0) {
+        ve_tls_persistent_close(&persistent);
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    ve_tls_persistent_close(&persistent);
+    cleanup_persistent_dir(dir);
+    return 0;
+}
+
+static int test_persistent_failed_heartbeat_uses_bounded_retry(void) {
+    char dir[PATH_MAX];
+    char lease_path[PATH_MAX];
+    ve_tls_persistent_options opt;
+    ve_tls_persistent persistent;
+    ve_tls_lease_state loaded;
+    ve_tls_config cfg;
+    int failed = 0;
+    if (make_temp_dir(dir, sizeof(dir)) != 0) {
+        return -1;
+    }
+    join_path(lease_path, sizeof(lease_path), dir, "lease");
+    ve_tls_config_init(&cfg);
+    g_real_platform = cfg.platform;
+    g_fake_time = 1000;
+    cfg.platform.time_ms = test_fake_time_ms;
+    cfg.platform.file_write = test_short_write_then_fail_file_write;
+    memset(&opt, 0, sizeof(opt));
+    memset(&persistent, 0, sizeof(persistent));
+    memset(&loaded, 0, sizeof(loaded));
+    opt.platform = &cfg.platform;
+    opt.dir_path = dir;
+    opt.instance_id = "test-instance";
+    opt.owner_id = "owner-a";
+    opt.owner_process_name = "proc-a";
+    opt.owner_pid = 123;
+    opt.segment_max_bytes = 1024;
+    opt.segment_max_records = 128;
+    opt.max_bytes = 4096;
+    opt.max_records = 512;
+    opt.max_segments = 8;
+    opt.now_ms = g_fake_time;
+    opt.lease_timeout_ms = 10000;
+    opt.heartbeat_interval_ms = 5000;
+    opt.open_mode = VE_TLS_LEASE_OPEN_TAKEOVER_IF_STALE;
+    if (ve_tls_persistent_open(&persistent, &opt) != 0) {
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    g_fake_time = 6000;
+    __atomic_store_n(&g_fail_next_file_write, 1, __ATOMIC_RELEASE);
+    failed = ve_tls_persistent_heartbeat_if_due(&persistent, 0) == 0 ||
+        atomic_load_explicit(&persistent.next_heartbeat_ms, memory_order_acquire) != 7000 ||
+        atomic_load_explicit(&persistent.lease_valid_until_ms, memory_order_acquire) != 11000 ||
+        persistent.lease.last_heartbeat_ms != 1000 ||
+        ve_tls_lease_load(&cfg.platform, lease_path, &loaded) != 0 ||
+        loaded.last_heartbeat_ms != 1000;
+    __atomic_store_n(&g_fail_next_file_write, 0, __ATOMIC_RELEASE);
+    ve_tls_persistent_close(&persistent);
+    cleanup_persistent_dir(dir);
+    return failed ? -1 : 0;
+}
+
 static int test_persistent_takeover_invalidates_old_writer(void) {
     char dir[PATH_MAX];
     char lease_path[PATH_MAX];
@@ -13420,6 +13958,10 @@ static int test_persistent_takeover_invalidates_old_writer(void) {
     }
     join_path(lease_path, sizeof(lease_path), dir, "lease");
     ve_tls_config_init(&cfg);
+    g_real_platform = cfg.platform;
+    g_fake_time = 1000;
+    cfg.platform.time_ms = test_fake_time_ms;
+    cfg.platform.sleep_ms = test_fake_sleep_ms;
     memset(&opt1, 0, sizeof(opt1));
     memset(&persistent1, 0, sizeof(persistent1));
     memset(&takeover, 0, sizeof(takeover));
@@ -13460,6 +14002,7 @@ static int test_persistent_takeover_invalidates_old_writer(void) {
     takeover.lease_timeout_ms = 100;
     takeover.mode = VE_TLS_LEASE_OPEN_TAKEOVER_IF_STALE;
     int takeover_rc = ve_tls_lease_acquire(&takeover, &state2);
+    g_fake_time = takeover.now_ms;
     int second_append_rc = ve_tls_persistent_append(&persistent1, 2, NULL, payload, sizeof(payload) - 1);
     if (takeover_rc != 0 ||
         state2.fencing_token != persistent1.lease.fencing_token + 1 ||
@@ -14078,6 +14621,60 @@ static int test_persistent_watermark_config_validation(void) {
     return invalid_public_watermark_config_is_rejected(0, 85) == 0 &&
            invalid_public_watermark_config_is_rejected(70, 70) == 0 &&
            invalid_public_watermark_config_is_rejected(70, 101) == 0
+        ? 0
+        : -1;
+}
+
+static int public_lease_config_matches_expectation(
+    int32_t heartbeat_ms,
+    int32_t timeout_ms,
+    int expect_success,
+    int32_t expected_heartbeat_ms,
+    int32_t expected_timeout_ms
+) {
+    char dir[PATH_MAX];
+    ve_tls_config cfg;
+    ve_tls_producer * producer;
+    if (make_temp_dir(dir, sizeof(dir)) != 0) {
+        return -1;
+    }
+    ve_tls_config_init(&cfg);
+    cfg.endpoint = "https://example.com";
+    cfg.region = "cn-beijing";
+    cfg.topic_id = "lease-invalid";
+    cfg.access_key_id = "ak";
+    cfg.access_key_secret = "sk";
+    cfg.use_persistent = 1;
+    cfg.persistent_file_path = dir;
+    cfg.max_persistent_log_count = 64;
+    cfg.max_persistent_file_size = 4096;
+    cfg.max_persistent_file_count = 4;
+    cfg.persistent_heartbeat_interval_ms = heartbeat_ms;
+    cfg.persistent_lease_timeout_ms = timeout_ms;
+    producer = ve_tls_producer_create(&cfg);
+    int matched = expect_success
+        ? producer && producer->persistent &&
+            producer->config.persistent_heartbeat_interval_ms == expected_heartbeat_ms &&
+            producer->config.persistent_lease_timeout_ms == expected_timeout_ms &&
+            producer->persistent->heartbeat_interval_ms == expected_heartbeat_ms &&
+            producer->persistent->lease_timeout_ms == expected_timeout_ms
+        : producer == NULL;
+    if (producer) {
+        ve_tls_producer_destroy(producer);
+    }
+    cleanup_persistent_dir(dir);
+    return matched ? 0 : -1;
+}
+
+static int test_persistent_lease_config_validation(void) {
+    return public_lease_config_matches_expectation(0, 0, 1, 10000, 60000) == 0 &&
+           public_lease_config_matches_expectation(0, 60000, 1, 10000, 60000) == 0 &&
+           public_lease_config_matches_expectation(10000, 0, 1, 10000, 60000) == 0 &&
+           public_lease_config_matches_expectation(0, 1000, 0, 0, 0) == 0 &&
+           public_lease_config_matches_expectation(-1, 60000, 0, 0, 0) == 0 &&
+           public_lease_config_matches_expectation(10000, -1, 0, 0, 0) == 0 &&
+           public_lease_config_matches_expectation(1000, 1000, 0, 0, 0) == 0 &&
+           public_lease_config_matches_expectation(1001, 1000, 0, 0, 0) == 0
         ? 0
         : -1;
 }
@@ -14793,7 +15390,7 @@ static int test_persistent_append_releases_producer_mutex_for_disk_write(void) {
         return -1;
     }
     __atomic_store_n(&g_track_producer_mutex, p->mutex, __ATOMIC_RELEASE);
-    g_track_file_write_saw_producer_mutex = 0;
+    __atomic_store_n(&g_track_file_write_saw_producer_mutex, 0, __ATOMIC_RELEASE);
     g_track_producer_mutex_depth = 0;
     kvs[0].key = "message";
     kvs[0].value = "persistent-mutex";
@@ -14801,10 +15398,181 @@ static int test_persistent_append_releases_producer_mutex_for_disk_write(void) {
     ve_tls_producer_destroy(p);
     __atomic_store_n(&g_track_producer_mutex, NULL, __ATOMIC_RELEASE);
     cleanup_persistent_dir(dir);
-    if (rc != VE_TLS_OK || g_track_file_write_saw_producer_mutex) {
+    if (rc != VE_TLS_OK ||
+        __atomic_load_n(&g_track_file_write_saw_producer_mutex, __ATOMIC_ACQUIRE)) {
         return -1;
     }
     return 0;
+}
+
+static int test_background_heartbeat_does_not_hold_persistent_mutex(void) {
+    char dir[PATH_MAX];
+    char lease_path[PATH_MAX];
+    ve_tls_config cfg;
+    ve_tls_producer * p = NULL;
+    ve_tls_lease_state initial;
+    ve_tls_lease_state current;
+    int observed_heartbeat = 0;
+    int failed = 0;
+    if (make_temp_dir(dir, sizeof(dir)) != 0) {
+        return -1;
+    }
+    join_path(lease_path, sizeof(lease_path), dir, "lease");
+    if (ve_tls_config_init_versioned(
+            &cfg, sizeof(cfg), VE_TLS_CONFIG_VERSION_CURRENT) != VE_TLS_OK) {
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    g_real_platform = cfg.platform;
+    cfg.platform.mutex_create = test_track_mutex_create;
+    cfg.platform.mutex_destroy = test_track_mutex_destroy;
+    cfg.platform.mutex_lock = test_track_mutex_lock;
+    cfg.platform.mutex_unlock = test_track_mutex_unlock;
+    cfg.platform.file_write = test_track_file_write;
+    cfg.endpoint = "https://example.com";
+    cfg.region = "cn-beijing";
+    cfg.topic_id = "t";
+    cfg.access_key_id = "ak";
+    cfg.access_key_secret = "sk";
+    cfg.retry_policy.max_attempts = 1;
+    cfg.flush_interval_ms = 100000;
+    cfg.compress_type = "none";
+    cfg.http_client.do_request = test_http_ok_do;
+    cfg.http_client.free_response = test_http_ok_free;
+    cfg.use_persistent = 1;
+    cfg.persistent_file_path = dir;
+    cfg.max_persistent_log_count = 128;
+    cfg.max_persistent_file_size = 4096;
+    cfg.max_persistent_file_count = 4;
+    cfg.persistent_lease_timeout_ms = 1000;
+    cfg.persistent_heartbeat_interval_ms = 10;
+    p = ve_tls_producer_create_versioned(
+        &cfg, sizeof(cfg), VE_TLS_CONFIG_VERSION_CURRENT);
+    if (!p || !p->persistent ||
+        ve_tls_lease_load(&cfg.platform, lease_path, &initial) != 0) {
+        failed = 1;
+        goto done;
+    }
+    __atomic_store_n(&g_track_producer_mutex, p->persistent_mutex, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_track_file_write_saw_producer_mutex, 0, __ATOMIC_RELEASE);
+    for (int i = 0; i < 500; i++) {
+        cfg.platform.sleep_ms(1);
+        if (ve_tls_lease_load(&cfg.platform, lease_path, &current) == 0 &&
+            current.last_heartbeat_ms > initial.last_heartbeat_ms) {
+            observed_heartbeat = 1;
+            break;
+        }
+    }
+    if (!observed_heartbeat ||
+        __atomic_load_n(&g_track_file_write_saw_producer_mutex, __ATOMIC_ACQUIRE)) {
+        fprintf(
+            stderr,
+            "background heartbeat debug observed=%d held_persistent_mutex=%d initial_ms=%lld current_ms=%lld\n",
+            observed_heartbeat,
+            __atomic_load_n(&g_track_file_write_saw_producer_mutex, __ATOMIC_ACQUIRE),
+            (long long)initial.last_heartbeat_ms,
+            (long long)current.last_heartbeat_ms);
+        failed = 1;
+    }
+
+done:
+    __atomic_store_n(&g_track_producer_mutex, NULL, __ATOMIC_RELEASE);
+    ve_tls_producer_destroy(p);
+    cleanup_persistent_dir(dir);
+    return failed ? -1 : 0;
+}
+
+typedef struct {
+    ve_tls_producer * producer;
+    ve_tls_result result;
+    int completed;
+} heartbeat_append_thread_arg;
+
+static void * heartbeat_append_thread(void * arg) {
+    heartbeat_append_thread_arg * state = (heartbeat_append_thread_arg *)arg;
+    static const char payload[] = "{\"message\":\"heartbeat-concurrency\"}";
+    state->result = ve_tls_producer_add_log_raw(
+        state->producer, payload, sizeof(payload) - 1, 0);
+    __atomic_store_n(&state->completed, 1, __ATOMIC_RELEASE);
+    return NULL;
+}
+
+static int test_blocked_background_heartbeat_does_not_block_append(void) {
+    char dir[PATH_MAX];
+    ve_tls_config cfg;
+    ve_tls_producer * producer = NULL;
+    ve_tls_thread * append_thread = NULL;
+    heartbeat_append_thread_arg append_state;
+    int completed_before_release = 0;
+    int failed = 0;
+    if (make_temp_dir(dir, sizeof(dir)) != 0) {
+        return -1;
+    }
+    if (ve_tls_config_init_versioned(
+            &cfg, sizeof(cfg), VE_TLS_CONFIG_VERSION_CURRENT) != VE_TLS_OK) {
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    g_real_platform = cfg.platform;
+    cfg.platform.path_rename = test_blocking_lease_path_rename;
+    cfg.endpoint = "https://example.com";
+    cfg.region = "cn-beijing";
+    cfg.topic_id = "heartbeat-concurrency";
+    cfg.access_key_id = "ak";
+    cfg.access_key_secret = "sk";
+    cfg.retry_policy.max_attempts = 1;
+    cfg.flush_interval_ms = 100000;
+    cfg.compress_type = "none";
+    cfg.http_client.do_request = test_http_ok_do;
+    cfg.http_client.free_response = test_http_ok_free;
+    cfg.use_persistent = 1;
+    cfg.persistent_file_path = dir;
+    cfg.max_persistent_log_count = 128;
+    cfg.max_persistent_file_size = 4096;
+    cfg.max_persistent_file_count = 4;
+    cfg.persistent_lease_timeout_ms = 1000;
+    cfg.persistent_heartbeat_interval_ms = 10;
+    producer = ve_tls_producer_create_versioned(
+        &cfg, sizeof(cfg), VE_TLS_CONFIG_VERSION_CURRENT);
+    if (!producer) {
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    memset(&append_state, 0, sizeof(append_state));
+    append_state.producer = producer;
+    __atomic_store_n(&g_lease_rename_entered, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_release_lease_rename, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_block_lease_rename, 1, __ATOMIC_RELEASE);
+    for (int i = 0; i < 500 &&
+            !__atomic_load_n(&g_lease_rename_entered, __ATOMIC_ACQUIRE); i++) {
+        cfg.platform.sleep_ms(1);
+    }
+    if (!__atomic_load_n(&g_lease_rename_entered, __ATOMIC_ACQUIRE)) {
+        failed = 1;
+        goto done;
+    }
+    append_thread = cfg.platform.thread_create(heartbeat_append_thread, &append_state);
+    if (!append_thread) {
+        failed = 1;
+        goto done;
+    }
+    for (int i = 0; i < 200 &&
+            !__atomic_load_n(&append_state.completed, __ATOMIC_ACQUIRE); i++) {
+        cfg.platform.sleep_ms(1);
+    }
+    completed_before_release = __atomic_load_n(&append_state.completed, __ATOMIC_ACQUIRE);
+
+done:
+    __atomic_store_n(&g_release_lease_rename, 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_block_lease_rename, 0, __ATOMIC_RELEASE);
+    if (append_thread) {
+        cfg.platform.thread_join(append_thread);
+    }
+    failed = failed || !completed_before_release ||
+        append_state.result != VE_TLS_OK;
+    ve_tls_producer_destroy(producer);
+    cleanup_persistent_dir(dir);
+    return failed ? -1 : 0;
 }
 
 static int test_persistent_ordered_add_avoids_secondary_ingress_allocation(void) {
@@ -15288,7 +16056,14 @@ static int test_producer_takeover_recovers_and_invalidates_old_writer(void) {
     if (make_temp_dir(dir, sizeof(dir)) != 0) {
         return -1;
     }
-    ve_tls_config_init(&cfg);
+    if (ve_tls_config_init_versioned(
+            &cfg, sizeof(cfg), VE_TLS_CONFIG_VERSION_CURRENT) != VE_TLS_OK) {
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    g_real_platform = cfg.platform;
+    g_fake_time = 1000;
+    cfg.platform.time_ms = test_fake_time_ms;
     cfg.endpoint = "https://example.com";
     cfg.region = "cn-beijing";
     cfg.topic_id = "t";
@@ -15304,12 +16079,14 @@ static int test_producer_takeover_recovers_and_invalidates_old_writer(void) {
     cfg.max_persistent_file_size = 4096;
     cfg.max_persistent_file_count = 4;
     cfg.persistent_lease_timeout_ms = 50;
-    cfg.persistent_heartbeat_interval_ms = 1000;
+    cfg.persistent_heartbeat_interval_ms = 25;
     cfg.persistent_open_mode = VE_TLS_POPEN_TAKEOVER_IF_STALE;
     cfg.http_client.do_request = test_http_takeover_block_do;
     cfg.http_client.free_response = test_http_sleep_free;
+    __atomic_store_n(&g_takeover_http_started, 0, __ATOMIC_RELEASE);
 
-    p1 = ve_tls_producer_create(&cfg);
+    p1 = ve_tls_producer_create_versioned(
+        &cfg, sizeof(cfg), VE_TLS_CONFIG_VERSION_CURRENT);
     if (!p1 || !p1->persistent) {
         cleanup_persistent_dir(dir);
         return -1;
@@ -15319,9 +16096,19 @@ static int test_producer_takeover_recovers_and_invalidates_old_writer(void) {
         cleanup_persistent_dir(dir);
         return -1;
     }
-    cfg.platform.sleep_ms(80);
+    for (int i = 0; i < 500 &&
+            !__atomic_load_n(&g_takeover_http_started, __ATOMIC_ACQUIRE); i++) {
+        cfg.platform.sleep_ms(1);
+    }
+    if (!__atomic_load_n(&g_takeover_http_started, __ATOMIC_ACQUIRE)) {
+        ve_tls_producer_destroy(p1);
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    g_fake_time = 1100;
 
-    p2 = ve_tls_producer_create(&cfg);
+    p2 = ve_tls_producer_create_versioned(
+        &cfg, sizeof(cfg), VE_TLS_CONFIG_VERSION_CURRENT);
     if (!p2 || !p2->persistent) {
         ve_tls_producer_destroy(p1);
         cleanup_persistent_dir(dir);
@@ -16269,7 +17056,7 @@ static int t_p2_persistent_open_fuzz(void) {
         opt.owner_process_name = "p"; opt.owner_pid = 1;
         opt.segment_max_bytes = 1024; opt.segment_max_records = 64;
         opt.max_bytes = 4096; opt.max_records = 256; opt.max_segments = 8;
-        opt.now_ms = 1000; opt.lease_timeout_ms = 300;
+        opt.now_ms = 1000; opt.lease_timeout_ms = 300; opt.heartbeat_interval_ms = 100;
         opt.open_mode = VE_TLS_LEASE_OPEN_TAKEOVER_IF_STALE;
         if (ve_tls_persistent_open(&persistent, &opt) != 0) {
             cleanup_persistent_dir(dir); return -2;
@@ -16288,7 +17075,7 @@ static int t_p2_persistent_open_fuzz(void) {
         opt.owner_process_name = "p"; opt.owner_pid = 1;
         opt.segment_max_bytes = 1024; opt.segment_max_records = 64;
         opt.max_bytes = 4096; opt.max_records = 256; opt.max_segments = 8;
-        opt.now_ms = 2000 + i; opt.lease_timeout_ms = 300;
+        opt.now_ms = 2000 + i; opt.lease_timeout_ms = 300; opt.heartbeat_interval_ms = 100;
         opt.open_mode = VE_TLS_LEASE_OPEN_TAKEOVER_IF_STALE;
         ve_tls_alloc_fault_inject("persistent_open", i, 1);
         int rc = ve_tls_persistent_open(&persistent, &opt);
@@ -17544,11 +18331,20 @@ static int t_p9_global_env_create(void) {
 
 /* === END coverage uplift round 5 === */
 
+#include "test_queue_sender_regressions.inc"
+#include "test_builder_sign_regressions.inc"
+#include "test_producer_admission_regressions.inc"
+#include "test_persistent_reader_regressions.inc"
+
 int main(void) {
     int rc = 0;
     const char * filter = getenv("VE_TLS_TEST_FILTER");
 #define RUN(code, fn) do { if (!filter || strstr(#fn, filter)) { int _test_rc = (fn); if (_test_rc != 0) { fprintf(stderr, "test failed: %s rc=%d code=%d\n", #fn, _test_rc, (code)); rc = (code); goto end; } } } while (0)
 
+    RUN(2001, test_queue_sender_regressions());
+    RUN(2002, test_builder_sign_regressions());
+    RUN(2003, test_producer_admission_regressions());
+    RUN(2004, test_persistent_reader_regressions());
     RUN(1, test_sha256());
     RUN(2, test_proto());
     RUN(3, test_proto_log_group_list_multi_groups());
@@ -17690,6 +18486,7 @@ int main(void) {
     RUN(29, test_send_queue_full_paths_drop_and_timeout());
     RUN(30, test_env_shared_senders_multi_producer());
     RUN(31, test_env_create_without_init_fails());
+    RUN(333, test_env_queue_full_resets_scheduling_flag());
     RUN(32, test_env_destroy_timeout_then_recover());
     RUN(168, test_env_destroy_concurrent_notify_no_uaf());
     RUN(169, test_env_destroy_concurrent_producer_destroy_no_uaf());
@@ -17705,6 +18502,8 @@ int main(void) {
     RUN(65, test_alloc_tracking_producer_lifecycle_no_leak());
     RUN(69, test_alloc_fail_fuzz_sign_does_not_crash());
     RUN(70, test_alloc_fail_fuzz_proto_does_not_crash());
+    RUN(331, test_proto_reserve_rejects_size_overflow_before_capacity_check());
+    RUN(332, test_sign_size_arithmetic_rejects_overflow());
     RUN(109, test_alloc_fail_fuzz_proto_group_list_does_not_crash());
     RUN(110, test_proto_group_list_edge_cases());
     RUN(111, test_compress_apply_edge_cases());
@@ -17722,6 +18521,7 @@ int main(void) {
     RUN(125, test_platform_default_has_file_hooks());
     RUN(319, test_platform_default_rejects_symlink_file_open());
     RUN(126, test_persistent_record_roundtrip_hash_key());
+    RUN(334, test_persistent_record_rejects_uint32_length_overflow());
     RUN(300, test_persistent_record_legacy_v1_remains_readable());
     RUN(301, test_persistent_unknown_record_version_does_not_truncate_segment());
     RUN(305, test_persistent_append_unknown_record_version_on_rotation());
@@ -17733,6 +18533,8 @@ int main(void) {
     RUN(188, test_persistent_durability_config_mapping());
     RUN(189, test_persistent_append_and_sync_failures_emit_distinct_metrics());
     RUN(128, test_checkpoint_roundtrip_and_lease_takeover());
+    RUN(337, test_lease_acquire_rejects_corrupt_existing_file());
+    RUN(338, test_lease_failed_heartbeat_preserves_last_published_state());
     RUN(129, test_persistent_open_creates_metadata_files());
     RUN(302, test_persistent_manifest_v1_upgrades_and_unknown_is_preserved());
     RUN(303, test_persistent_endpoint_update_emits_backlog_retarget_metric());
@@ -17753,8 +18555,13 @@ int main(void) {
     RUN(134, test_persistent_overflow_reject_new_returns_drop_error());
     RUN(135, test_persistent_overflow_block_times_out());
     RUN(136, test_persistent_heartbeat_updates_lease());
+    RUN(335, test_persistent_heartbeat_fsync_matches_durability());
+    RUN(343, test_persistent_open_rejects_invalid_lease_clock_config());
+    RUN(344, test_persistent_mutation_rejects_invalid_clock_without_lease_write());
     RUN(148, test_persistent_heartbeat_before_due_skips_lease_reload());
     RUN(159, test_persistent_append_before_due_skips_lease_reload());
+    RUN(336, test_persistent_append_after_heartbeat_due_uses_valid_lease_window());
+    RUN(341, test_persistent_failed_heartbeat_uses_bounded_retry());
     RUN(137, test_persistent_takeover_invalidates_old_writer());
     RUN(149, test_persistent_ack_range_reclaims_without_rescanning_segments());
     RUN(156, test_persistent_ack_range_throttles_checkpoint_persistence());
@@ -17765,6 +18572,7 @@ int main(void) {
     RUN(191, test_persistent_high_watermark_stops_at_unacked_segment());
     RUN(192, test_persistent_high_watermark_preserves_and_revisits_replay_segment());
     RUN(193, test_persistent_watermark_config_validation());
+    RUN(340, test_persistent_lease_config_validation());
     RUN(194, test_persistent_drop_newest_sample_never_deletes_old_wal());
     RUN(195, test_persistent_ack_range_rejects_hole());
     RUN(197, test_persistent_concurrent_append_ack_and_reclaim());
@@ -17778,6 +18586,8 @@ int main(void) {
     RUN(143, test_persistent_overflow_reject_new_kv_does_not_double_free());
     RUN(144, test_persistent_kv_path_batches_multiple_logs_into_single_request());
     RUN(150, test_persistent_append_releases_producer_mutex_for_disk_write());
+    RUN(339, test_background_heartbeat_does_not_hold_persistent_mutex());
+    RUN(342, test_blocked_background_heartbeat_does_not_block_append());
     RUN(322, test_persistent_ordered_add_avoids_secondary_ingress_allocation());
     RUN(324, test_persistent_ordered_add_reuses_single_log_builder());
     RUN(325, test_log_builder_shrink_releases_large_allocation_safely());

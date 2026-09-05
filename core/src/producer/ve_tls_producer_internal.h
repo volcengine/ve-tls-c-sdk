@@ -351,6 +351,9 @@ int ve_tls_sender_step(ve_tls_producer * producer);
 int ve_tls_env_register_producer(ve_tls_producer * producer);
 void ve_tls_env_unregister_producer(ve_tls_producer * producer);
 void ve_tls_env_notify(ve_tls_producer * producer);
+#if defined(VE_TLS_ENABLE_ALLOC_FAULT_INJECT)
+int ve_tls_env_test_queue_full_resets_flag(void);
+#endif
 
 void * ve_tls_worker_main(void * arg);
 void * ve_tls_sender_main(void * arg);

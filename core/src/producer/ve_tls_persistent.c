@@ -16,6 +16,7 @@
 #define VE_TLS_PERSISTENT_DEFAULT_LOW_WATERMARK_PCT 70
 #define VE_TLS_PERSISTENT_MANIFEST_VERSION_CURRENT 2
 #define VE_TLS_PERSISTENT_MANIFEST_MAX_BYTES 4096
+#define VE_TLS_PERSISTENT_HEARTBEAT_RETRY_MAX_MS 1000
 
 static uint64_t add_u64_saturating(uint64_t left, uint64_t right) {
     return right > UINT64_MAX - left ? UINT64_MAX : left + right;
@@ -53,6 +54,49 @@ static int64_t persistent_now_ms(ve_tls_persistent * persistent) {
         return 0;
     }
     return persistent->platform->time_ms();
+}
+
+static int64_t persistent_add_ms_saturating(int64_t now_ms, int64_t delta_ms) {
+    if (now_ms <= 0 || delta_ms <= 0) {
+        return 0;
+    }
+    return now_ms > INT64_MAX - delta_ms ? INT64_MAX : now_ms + delta_ms;
+}
+
+static int persistent_lease_window_is_valid(ve_tls_persistent * persistent, int64_t now_ms) {
+    int64_t valid_until_ms;
+    if (!persistent || now_ms <= 0) {
+        return 0;
+    }
+    valid_until_ms = atomic_load_explicit(
+        &persistent->lease_valid_until_ms,
+        memory_order_acquire);
+    return valid_until_ms > 0 && now_ms <= valid_until_ms;
+}
+
+static void persistent_publish_lease_window(ve_tls_persistent * persistent, int64_t heartbeat_ms) {
+    if (!persistent) {
+        return;
+    }
+    atomic_store_explicit(
+        &persistent->lease_valid_until_ms,
+        persistent_add_ms_saturating(heartbeat_ms, persistent->lease_timeout_ms),
+        memory_order_release);
+}
+
+static void persistent_schedule_heartbeat_retry(ve_tls_persistent * persistent, int64_t now_ms) {
+    int64_t retry_ms;
+    if (!persistent || now_ms <= 0) {
+        return;
+    }
+    retry_ms = persistent->heartbeat_interval_ms;
+    if (retry_ms <= 0 || retry_ms > VE_TLS_PERSISTENT_HEARTBEAT_RETRY_MAX_MS) {
+        retry_ms = VE_TLS_PERSISTENT_HEARTBEAT_RETRY_MAX_MS;
+    }
+    atomic_store_explicit(
+        &persistent->next_heartbeat_ms,
+        persistent_add_ms_saturating(now_ms, retry_ms),
+        memory_order_release);
 }
 
 static void persistent_heartbeat_lock(ve_tls_persistent * persistent) {
@@ -462,11 +506,15 @@ static int ve_tls_persistent_heartbeat_if_due_locked(ve_tls_persistent * persist
     ve_tls_lease_options options;
     int64_t now_ms;
     now_ms = persistent_now_ms(persistent);
+    if (now_ms <= 0) {
+        return -1;
+    }
     if (!force && persistent->heartbeat_interval_ms > 0 && now_ms > 0 &&
         now_ms < atomic_load_explicit(&persistent->next_heartbeat_ms, memory_order_relaxed)) {
         return 0;
     }
     if (validate_current_lease_locked(persistent) != 0) {
+        persistent_schedule_heartbeat_retry(persistent, now_ms);
         return -1;
     }
     memset(&options, 0, sizeof(options));
@@ -478,18 +526,42 @@ static int ve_tls_persistent_heartbeat_if_due_locked(ve_tls_persistent * persist
     options.now_ms = now_ms;
     options.lease_timeout_ms = persistent->lease_timeout_ms;
     options.mode = persistent->open_mode;
+    options.sync_on_heartbeat = persistent->durability == VE_TLS_PDURABILITY_SYNC_WAL ? 1 : 0;
     if (ve_tls_lease_heartbeat(&options, &persistent->lease) != 0) {
+        persistent_schedule_heartbeat_retry(persistent, now_ms);
         return -1;
     }
+    persistent_publish_lease_window(persistent, now_ms);
     if (persistent->heartbeat_interval_ms > 0 && now_ms > 0) {
         atomic_store_explicit(
             &persistent->next_heartbeat_ms,
-            now_ms + persistent->heartbeat_interval_ms,
+            persistent_add_ms_saturating(now_ms, persistent->heartbeat_interval_ms),
             memory_order_relaxed);
     } else {
         atomic_store_explicit(&persistent->next_heartbeat_ms, now_ms, memory_order_relaxed);
     }
     return 0;
+}
+
+static int persistent_validate_lease_for_mutation(ve_tls_persistent * persistent) {
+    int64_t now_ms;
+    int rc;
+    if (!persistent || !persistent->platform) {
+        return -1;
+    }
+    now_ms = persistent_now_ms(persistent);
+    if (persistent_lease_window_is_valid(persistent, now_ms)) {
+        return 0;
+    }
+    persistent_heartbeat_lock(persistent);
+    now_ms = persistent_now_ms(persistent);
+    if (persistent_lease_window_is_valid(persistent, now_ms)) {
+        persistent_heartbeat_unlock(persistent);
+        return 0;
+    }
+    rc = ve_tls_persistent_heartbeat_if_due_locked(persistent, 1);
+    persistent_heartbeat_unlock(persistent);
+    return rc;
 }
 
 static int persistent_heartbeat_and_validate_if_needed(ve_tls_persistent * persistent, int force) {
@@ -874,7 +946,9 @@ int ve_tls_persistent_open(ve_tls_persistent * persistent, const ve_tls_persiste
     ve_tls_segment_store_options store_options;
     int32_t high_watermark_pct;
     int32_t low_watermark_pct;
-    if (!persistent || !options || !options->platform || !options->dir_path || options->dir_path[0] == 0) {
+    if (!persistent || !options || !options->platform || !options->platform->time_ms ||
+        !options->dir_path || options->dir_path[0] == 0 || options->now_ms <= 0 ||
+        options->heartbeat_interval_ms <= 0 || options->lease_timeout_ms <= 0) {
         return -1;
     }
     high_watermark_pct = options->high_watermark_pct;
@@ -1000,9 +1074,10 @@ int ve_tls_persistent_open(ve_tls_persistent * persistent, const ve_tls_persiste
     atomic_store_explicit(
         &persistent->next_heartbeat_ms,
         options->now_ms > 0 && persistent->heartbeat_interval_ms > 0
-            ? options->now_ms + persistent->heartbeat_interval_ms
+            ? persistent_add_ms_saturating(options->now_ms, persistent->heartbeat_interval_ms)
             : options->now_ms,
         memory_order_relaxed);
+    persistent_publish_lease_window(persistent, persistent->lease.last_heartbeat_ms);
     return 0;
 }
 
@@ -1066,7 +1141,7 @@ int ve_tls_persistent_append(ve_tls_persistent * persistent, int64_t log_id, con
     if (!persistent->platform || !payload || payload_size == 0) {
         return -1;
     }
-    if (persistent_heartbeat_and_validate_if_needed(persistent, 0) != 0) {
+    if (persistent_validate_lease_for_mutation(persistent) != 0) {
         return -1;
     }
     memset(&view, 0, sizeof(view));
@@ -1249,7 +1324,7 @@ int ve_tls_persistent_ack_range(ve_tls_persistent * persistent, int64_t start_id
         start_id > persistent->checkpoint.acked_log_id + 1) {
         return -1;
     }
-    if (persistent_heartbeat_and_validate_if_needed(persistent, 0) != 0) {
+    if (persistent_validate_lease_for_mutation(persistent) != 0) {
         return -1;
     }
     if (end_id > persistent->checkpoint.acked_log_id) {

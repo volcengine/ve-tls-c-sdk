@@ -173,7 +173,9 @@ typedef struct {
     int32_t persistent_overflow_policy;
     int32_t persistent_sample_every_n;
     int32_t persistent_block_timeout_ms;
+    /* Zero selects the 60000 ms runtime default; negative values are invalid. */
     int32_t persistent_lease_timeout_ms;
+    /* Zero selects the 10000 ms runtime default; negative values are invalid. */
     int32_t persistent_heartbeat_interval_ms;
     int32_t persistent_open_mode;
     ve_tls_platform platform;

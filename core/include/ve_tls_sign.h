@@ -74,6 +74,19 @@ int ve_tls_sign_v4_append_at(
  */
 void ve_tls_sign_thread_cache_clear(void);
 
+#if defined(VE_TLS_ENABLE_ALLOC_FAULT_INJECT)
+int ve_tls_sign_test_query_pair_capacity(size_t cap, size_t len, size_t * out_capacity);
+int ve_tls_sign_test_canonical_request_size(
+    size_t method_size,
+    size_t uri_size,
+    size_t query_size,
+    size_t headers_size,
+    size_t signed_headers_size,
+    size_t payload_hash_size,
+    size_t * out_size
+);
+#endif
+
 VE_TLS_END_DECLS
 
 #endif

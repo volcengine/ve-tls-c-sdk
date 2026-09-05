@@ -1,8 +1,12 @@
 #include "ve_tls_producer_internal.h"
+#include "ve_tls_version.h"
 
 #include <string.h>
 
-#include "ve_tls_version.h"
+enum {
+    VE_TLS_DEFAULT_PERSISTENT_LEASE_TIMEOUT_MS = 60000,
+    VE_TLS_DEFAULT_PERSISTENT_HEARTBEAT_INTERVAL_MS = 10000
+};
 
 #if defined(VE_TLS_HAVE_CURL)
 #include "ve_tls_http_curl.h"
@@ -140,8 +144,8 @@ void ve_tls_producer_config_init(ve_tls_config * config) {
     config->persistent_overflow_policy = VE_TLS_POVERFLOW_REJECT_NEW;
     config->persistent_sample_every_n = 10;
     config->persistent_block_timeout_ms = 1000;
-    config->persistent_lease_timeout_ms = 60000;
-    config->persistent_heartbeat_interval_ms = 10000;
+    config->persistent_lease_timeout_ms = VE_TLS_DEFAULT_PERSISTENT_LEASE_TIMEOUT_MS;
+    config->persistent_heartbeat_interval_ms = VE_TLS_DEFAULT_PERSISTENT_HEARTBEAT_INTERVAL_MS;
     config->persistent_open_mode = VE_TLS_POPEN_TAKEOVER_IF_STALE;
     config->persistent_durability = VE_TLS_PDURABILITY_DEFAULT;
     config->persistent_max_log_delay_ms = 0;
@@ -162,6 +166,13 @@ void ve_tls_producer_config_apply_runtime_defaults(ve_tls_config * config) {
 
     if (!config) {
         return;
+    }
+
+    if (config->persistent_lease_timeout_ms == 0) {
+        config->persistent_lease_timeout_ms = VE_TLS_DEFAULT_PERSISTENT_LEASE_TIMEOUT_MS;
+    }
+    if (config->persistent_heartbeat_interval_ms == 0) {
+        config->persistent_heartbeat_interval_ms = VE_TLS_DEFAULT_PERSISTENT_HEARTBEAT_INTERVAL_MS;
     }
 
     derived_log_bytes = ve_tls_runtime_default_package_bytes(config->max_buffer_bytes);
