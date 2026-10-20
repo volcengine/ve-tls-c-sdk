@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(ve_tls_c_sdk VERSION 0.3.0 LANGUAGES C)
+project(ve_tls_c_sdk VERSION 0.3.4 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -124,10 +124,14 @@ if(BUILD_SHARED_LIBS AND (APPLE OR UNIX))
         target_link_options(ve_tls_core PRIVATE
             "-Wl,-exported_symbols_list,${CMAKE_CURRENT_BINARY_DIR}/ve_tls_exports.macos.txt"
         )
+        set_property(TARGET ve_tls_core APPEND PROPERTY LINK_DEPENDS
+            "${CMAKE_CURRENT_BINARY_DIR}/ve_tls_exports.macos.txt")
     else()
         target_link_options(ve_tls_core PRIVATE
             "-Wl,--version-script=${CMAKE_CURRENT_BINARY_DIR}/ve_tls_exports.map"
         )
+        set_property(TARGET ve_tls_core APPEND PROPERTY LINK_DEPENDS
+            "${CMAKE_CURRENT_BINARY_DIR}/ve_tls_exports.map")
     endif()
 endif()
 
@@ -199,6 +203,7 @@ install(FILES
     docs/abi.md
     docs/platform-contract.md
     docs/release-notes-0.3.0.md
+    docs/release-notes-0.3.4.md
     DESTINATION share/doc/ve_tls_core
 )
 
@@ -258,6 +263,10 @@ endif()
 
 if(VE_TLS_BUILD_TESTS)
     enable_testing()
+    add_executable(ve_tls_test_apikey tests/test_apikey.c)
+    target_link_libraries(ve_tls_test_apikey PRIVATE ve_tls_core)
+    add_test(NAME ve_tls_test_apikey COMMAND ve_tls_test_apikey)
+    set_tests_properties(ve_tls_test_apikey PROPERTIES TIMEOUT 120)
     enable_language(CXX)
     # test_basic intentionally reaches internal symbols and fault hooks. Keep it
     # on the static test build rather than weakening the shared-library ABI.
@@ -404,6 +413,7 @@ if(VE_TLS_ENABLE_ASAN OR VE_TLS_ENABLE_UBSAN)
     foreach(tgt IN ITEMS
         ve_tls_core
         ve_tls_test_basic
+        ve_tls_test_apikey
         ve_tls_test_lz4_host_consumer
         ve_tls_test_android_binding
         ve_tls_test_cpp_headers

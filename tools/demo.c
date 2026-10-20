@@ -21,7 +21,8 @@ static int32_t env_i32(const char * key, int32_t defv) {
 
 static void usage(const char * argv0) {
     fprintf(stderr, "usage: %s [--help]\n", argv0 ? argv0 : "ve_tls_demo");
-    fprintf(stderr, "required env: VE_TLS_ENDPOINT VE_TLS_REGION VE_TLS_TOPIC_ID VE_TLS_ACCESS_KEY_ID VE_TLS_ACCESS_KEY_SECRET\n");
+    fprintf(stderr, "required env: VE_TLS_ENDPOINT VE_TLS_REGION VE_TLS_TOPIC_ID\n");
+    fprintf(stderr, "auth: VE_TLS_API_KEY or VE_TLS_ACCESS_KEY_ID + VE_TLS_ACCESS_KEY_SECRET; API key takes precedence\n");
     fprintf(stderr, "optional env: VE_TLS_SECURITY_TOKEN VE_TLS_HASH_KEY VE_TLS_DEMO_MESSAGE VE_TLS_COMPRESS_TYPE VE_TLS_FLUSH_INTERVAL_MS VE_TLS_SEND_THREAD_COUNT VE_TLS_CLOSE_TIMEOUT_MS VE_TLS_HTTP_DEBUG\n");
 }
 
@@ -67,6 +68,7 @@ int main(int argc, char ** argv) {
     const char * access_key_id = env_str("VE_TLS_ACCESS_KEY_ID", NULL);
     const char * access_key_secret = env_str("VE_TLS_ACCESS_KEY_SECRET", NULL);
     const char * security_token = env_str("VE_TLS_SECURITY_TOKEN", "");
+    const char * api_key = env_str("VE_TLS_API_KEY", NULL);
     const char * hash_key = env_str("VE_TLS_HASH_KEY", NULL);
     const char * message = env_str("VE_TLS_DEMO_MESSAGE", "hello from producer demo");
     const char * compress_type = env_str("VE_TLS_COMPRESS_TYPE", NULL);
@@ -77,7 +79,7 @@ int main(int argc, char ** argv) {
     ve_tls_result add_rc;
     ve_tls_result close_rc;
 
-    if (!endpoint || !region || !topic_id || !access_key_id || !access_key_secret) {
+    if (!endpoint || !region || !topic_id || (!api_key && (!access_key_id || !access_key_secret))) {
         usage(argv[0]);
         return 2;
     }
@@ -97,7 +99,7 @@ int main(int argc, char ** argv) {
         cfg.compress_type = compress_type;
     }
 
-    producer = ve_tls_producer_create(&cfg);
+    producer = ve_tls_producer_create_with_api_key(&cfg, api_key);
     if (!producer) {
         fprintf(stderr, "ve_tls_producer_create failed\n");
         return 3;

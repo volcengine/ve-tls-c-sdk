@@ -25,6 +25,10 @@
 #include <limits.h>
 #include <stdatomic.h>
 #include <sys/stat.h>
+#include <dirent.h>
+#include <pthread.h>
+#include <errno.h>
+#include <time.h>
 
 #if defined(VE_TLS_HAVE_ZLIB)
 #include <zlib.h>
@@ -36,15 +40,48 @@
 
 static int test_http_ok_do(ve_tls_http_client * client, const ve_tls_http_request * req, ve_tls_http_response * resp);
 static void test_http_ok_free(ve_tls_http_client * client, ve_tls_http_response * resp);
+static void test_delivery_diagnostic(const ve_tls_delivery_diagnostic * event, void * user_param);
 static double fixed_rand01(void * p);
 static int init_fake_sender_producer(ve_tls_producer * p, ve_tls_config * cfg);
 static void destroy_fake_sender_producer(ve_tls_producer * p);
+static int make_temp_dir(char * out, size_t out_size);
+static void cleanup_persistent_dir(const char * dir);
+
+typedef struct delivery_diag_state {
+    int event_count[6];
+    int terminal_count;
+    int retained_count;
+    int scheduled_count;
+    int attempt_count;
+    int started_count;
+    int sealed_count;
+    uint64_t started_attempt_id;
+    uint64_t finished_attempt_id;
+    uint64_t terminal_attempt_id;
+    int schema_error;
+    ve_tls_delivery_diagnostic_reason terminal_reason;
+    ve_tls_delivery_diagnostic_disposition terminal_disposition;
+    int32_t terminal_attempts;
+    int64_t terminal_elapsed_ms;
+    int64_t finished_attempt_elapsed_ms;
+    int64_t terminal_attempt_elapsed_ms;
+    int64_t terminal_queue_wait_ms;
+    char terminal_error_code[64];
+} delivery_diag_state;
+static delivery_diag_state g_delivery_diag;
 
 #define TEST_HASH_KEY_ZERO "00000000000000000000000000000000"
 #define TEST_HASH_KEY_A "00000000000000000000000000000001"
 #define TEST_HASH_KEY_B "00000000000000000000000000000002"
 #define TEST_HASH_KEY_MAX "fffffffffffffffffffffffffffffffe"
 #define TEST_HASH_KEY_UPPER_BOUND "ffffffffffffffffffffffffffffffff"
+
+_Static_assert(VE_TLS_DELIVERY_DIAGNOSTIC_ATTEMPT_FINISHED == 0, "legacy diagnostic event value changed");
+_Static_assert(VE_TLS_DELIVERY_DIAGNOSTIC_RETRY_SCHEDULED == 1, "legacy diagnostic event value changed");
+_Static_assert(VE_TLS_DELIVERY_DIAGNOSTIC_BATCH_RETAINED == 2, "legacy diagnostic event value changed");
+_Static_assert(VE_TLS_DELIVERY_DIAGNOSTIC_BATCH_TERMINAL == 3, "legacy diagnostic event value changed");
+_Static_assert(VE_TLS_DELIVERY_DIAGNOSTIC_BATCH_SEALED == 4, "Core batch sealed event value changed");
+_Static_assert(VE_TLS_DELIVERY_DIAGNOSTIC_ATTEMPT_STARTED == 5, "Core attempt started event value changed");
 
 static int g_http_done = 0;
 static int g_http_ok = 0;
@@ -566,6 +603,74 @@ static int64_t test_fake_time_ms(void) {
     return g_fake_time;
 }
 
+typedef struct {
+    int64_t advance_ms;
+    int calls;
+    int prep_calls;
+} alloc_advance_time_state;
+
+static void alloc_advance_time_tick(alloc_advance_time_state * state) {
+    if (!state) {
+        return;
+    }
+    state->calls++;
+    const char * site = ve_tls_alloc_set_site(NULL);
+    int in_request_preparation = site &&
+        (strcmp(site, "sender_send_putlogs") == 0 ||
+         strcmp(site, "sign_v4_emit") == 0);
+    ve_tls_alloc_set_site(site);
+    if (!in_request_preparation) {
+        return;
+    }
+    state->prep_calls++;
+    g_fake_time += state->advance_ms;
+}
+
+static void * alloc_advance_time_malloc(size_t n, void * user_data) {
+    alloc_advance_time_tick((alloc_advance_time_state *)user_data);
+    return malloc(n);
+}
+
+static void * alloc_advance_time_calloc(size_t n, size_t size, void * user_data) {
+    alloc_advance_time_tick((alloc_advance_time_state *)user_data);
+    return calloc(n, size);
+}
+
+static void * alloc_advance_time_realloc(void * p, size_t n, void * user_data) {
+    alloc_advance_time_tick((alloc_advance_time_state *)user_data);
+    return realloc(p, n);
+}
+
+static void alloc_advance_time_free(void * p, void * user_data) {
+    (void)user_data;
+    free(p);
+}
+
+static char * alloc_advance_time_strdup(const char * s, void * user_data) {
+    if (!s) {
+        return NULL;
+    }
+    size_t n = strlen(s);
+    char * copy = (char *)alloc_advance_time_malloc(n + 1, user_data);
+    if (!copy) {
+        return NULL;
+    }
+    memcpy(copy, s, n + 1);
+    return copy;
+}
+
+static void set_alloc_advance_time(alloc_advance_time_state * state) {
+    ve_tls_alloc_hooks hooks;
+    memset(&hooks, 0, sizeof(hooks));
+    hooks.malloc_fn = alloc_advance_time_malloc;
+    hooks.calloc_fn = alloc_advance_time_calloc;
+    hooks.realloc_fn = alloc_advance_time_realloc;
+    hooks.free_fn = alloc_advance_time_free;
+    hooks.strdup_fn = alloc_advance_time_strdup;
+    hooks.user_data = state;
+    ve_tls_alloc_set_hooks(&hooks);
+}
+
 static void test_fake_sleep_ms(int64_t ms) {
     if (ms > 0) {
         g_fake_time += ms;
@@ -588,6 +693,8 @@ static int test_fake_cond_timedwait_ms(ve_tls_cond * c, ve_tls_mutex * m, int64_
 
 static char g_track_dir[PATH_MAX];
 static int g_track_lease_opens = 0;
+static int g_track_lease_temp_opens = 0;
+static int g_track_lease_renames = 0;
 static int g_track_checkpoint_opens = 0;
 static int g_track_segment_opens = 0;
 static int g_track_segment_stats = 0;
@@ -597,6 +704,12 @@ static int g_track_file_write_saw_producer_mutex = 0;
 static int g_block_lease_rename = 0;
 static int g_lease_rename_entered = 0;
 static int g_release_lease_rename = 0;
+static pthread_mutex_t g_lease_rename_gate_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_lease_rename_gate_cond = PTHREAD_COND_INITIALIZER;
+static ve_tls_mutex * g_observe_persistent_mutex = NULL;
+static pthread_mutex_t g_observe_persistent_event_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_observe_persistent_event_cond = PTHREAD_COND_INITIALIZER;
+static int g_observe_persistent_lock = 0;
 static int g_fail_next_path_rename = 0;
 static int g_fail_next_file_fsync = 0;
 static int g_file_fsync_calls = 0;
@@ -633,12 +746,42 @@ static int test_blocking_lease_path_rename(const char * from, const char * to) {
     size_t length = to ? strlen(to) : 0;
     if (__atomic_load_n(&g_block_lease_rename, __ATOMIC_ACQUIRE) &&
         length >= 6 && strcmp(to + length - 6, "/lease") == 0) {
+        pthread_mutex_lock(&g_lease_rename_gate_mutex);
         __atomic_store_n(&g_lease_rename_entered, 1, __ATOMIC_RELEASE);
+        pthread_cond_broadcast(&g_lease_rename_gate_cond);
         while (!__atomic_load_n(&g_release_lease_rename, __ATOMIC_ACQUIRE)) {
-            g_real_platform.sleep_ms(1);
+            pthread_cond_wait(&g_lease_rename_gate_cond, &g_lease_rename_gate_mutex);
         }
+        pthread_mutex_unlock(&g_lease_rename_gate_mutex);
     }
     return g_real_platform.path_rename(from, to);
+}
+
+static int test_wait_lease_rename_entered(void) {
+    int entered;
+    pthread_mutex_lock(&g_lease_rename_gate_mutex);
+    while (!__atomic_load_n(&g_lease_rename_entered, __ATOMIC_ACQUIRE)) {
+        struct timespec deadline;
+        if (clock_gettime(CLOCK_REALTIME, &deadline) != 0) {
+            pthread_mutex_unlock(&g_lease_rename_gate_mutex);
+            return -1;
+        }
+        deadline.tv_sec += 3;
+        if (pthread_cond_timedwait(&g_lease_rename_gate_cond, &g_lease_rename_gate_mutex, &deadline) == ETIMEDOUT) {
+            pthread_mutex_unlock(&g_lease_rename_gate_mutex);
+            return -1;
+        }
+    }
+    entered = __atomic_load_n(&g_lease_rename_entered, __ATOMIC_ACQUIRE);
+    pthread_mutex_unlock(&g_lease_rename_gate_mutex);
+    return entered ? 0 : -1;
+}
+
+static void test_release_lease_rename_gate(void) {
+    pthread_mutex_lock(&g_lease_rename_gate_mutex);
+    __atomic_store_n(&g_release_lease_rename, 1, __ATOMIC_RELEASE);
+    pthread_cond_broadcast(&g_lease_rename_gate_cond);
+    pthread_mutex_unlock(&g_lease_rename_gate_mutex);
 }
 
 static int test_fail_next_path_rename(const char * from, const char * to) {
@@ -658,6 +801,10 @@ static int test_path_is_tracked_lease(const char * path) {
     return n >= sizeof(suffix) - 1 && strcmp(path + n - (sizeof(suffix) - 1), suffix) == 0;
 }
 
+static int test_path_is_tracked_lease_temp(const char * path) {
+    return test_path_in_tracked_dir(path) && strstr(path, "/lease.tmp.") != NULL;
+}
+
 static int test_path_is_tracked_checkpoint(const char * path) {
     size_t n;
     static const char suffix[] = "/checkpoint";
@@ -674,6 +821,8 @@ static int test_path_is_tracked_segment(const char * path) {
 
 static void test_track_reset(const char * dir) {
     g_track_lease_opens = 0;
+    g_track_lease_temp_opens = 0;
+    g_track_lease_renames = 0;
     g_track_checkpoint_opens = 0;
     g_track_segment_opens = 0;
     g_track_segment_stats = 0;
@@ -688,6 +837,9 @@ static ve_tls_file * test_track_file_open(const char * path, int flags, int mode
     if (test_path_is_tracked_lease(path)) {
         g_track_lease_opens++;
     }
+    if (test_path_is_tracked_lease_temp(path)) {
+        g_track_lease_temp_opens++;
+    }
     if (test_path_is_tracked_checkpoint(path)) {
         g_track_checkpoint_opens++;
     }
@@ -695,6 +847,13 @@ static ve_tls_file * test_track_file_open(const char * path, int flags, int mode
         g_track_segment_opens++;
     }
     return g_real_platform.file_open(path, flags, mode);
+}
+
+static int test_track_path_rename(const char * from, const char * to) {
+    if (test_path_is_tracked_lease(to)) {
+        g_track_lease_renames++;
+    }
+    return g_real_platform.path_rename(from, to);
 }
 
 static int test_track_path_stat(const char * path, ve_tls_path_info * info) {
@@ -717,6 +876,34 @@ static void test_track_mutex_lock(ve_tls_mutex * m) {
     if (m == __atomic_load_n(&g_track_producer_mutex, __ATOMIC_ACQUIRE)) {
         g_track_producer_mutex_depth++;
     }
+    if (m == __atomic_load_n(&g_observe_persistent_mutex, __ATOMIC_ACQUIRE)) {
+        pthread_mutex_lock(&g_observe_persistent_event_mutex);
+        g_observe_persistent_lock = 1;
+        pthread_cond_broadcast(&g_observe_persistent_event_cond);
+        pthread_mutex_unlock(&g_observe_persistent_event_mutex);
+    }
+}
+
+static int test_wait_observed_persistent_lock(void) {
+    int rc = 0;
+    pthread_mutex_lock(&g_observe_persistent_event_mutex);
+    while (!g_observe_persistent_lock) {
+        struct timespec deadline;
+        if (clock_gettime(CLOCK_REALTIME, &deadline) != 0) {
+            rc = -1;
+            break;
+        }
+        deadline.tv_sec += 3;
+        if (pthread_cond_timedwait(
+                &g_observe_persistent_event_cond,
+                &g_observe_persistent_event_mutex,
+                &deadline) == ETIMEDOUT) {
+            rc = -1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_observe_persistent_event_mutex);
+    return rc;
 }
 
 static void test_track_mutex_unlock(ve_tls_mutex * m) {
@@ -1870,6 +2057,7 @@ static int test_sender_credentials_min_interval_fail_without_cached(void) {
 static int test_builder_flush_interval_respects_configured_deadline(void) {
     memset(g_sender_time_t, 0, sizeof(g_sender_time_t));
     __atomic_store_n(&g_sender_time_n, 0, __ATOMIC_RELAXED);
+    memset(&g_delivery_diag, 0, sizeof(g_delivery_diag));
 
     ve_tls_config cfg;
     ve_tls_config_init(&cfg);
@@ -1895,6 +2083,8 @@ static int test_builder_flush_interval_respects_configured_deadline(void) {
 
     ve_tls_producer * p = ve_tls_producer_create(&cfg);
     if (!p) return -1;
+    p->delivery_diagnostic = test_delivery_diagnostic;
+    p->delivery_diagnostic_param = &g_delivery_diag;
 
     ve_tls_kv kvs[1];
     kvs[0].key = "k";
@@ -1919,6 +2109,13 @@ static int test_builder_flush_interval_respects_configured_deadline(void) {
     if (g_sender_time_t[0] - 5000 < 10 || g_sender_time_t[0] - 5000 > 20) {
         fprintf(stderr, "builder_flush_deadline: send_at=%lld fake_now=%lld\n",
             (long long)g_sender_time_t[0], (long long)g_fake_time);
+        return -1;
+    }
+    if (g_delivery_diag.sealed_count < 1 ||
+        g_delivery_diag.event_count[VE_TLS_DELIVERY_DIAGNOSTIC_BATCH_SEALED] < 1 ||
+        g_delivery_diag.event_count[VE_TLS_DELIVERY_DIAGNOSTIC_ATTEMPT_STARTED] < 1 ||
+        g_delivery_diag.started_attempt_id == 0 ||
+        g_delivery_diag.schema_error != 0) {
         return -1;
     }
     return 0;
@@ -2816,6 +3013,13 @@ static int test_producer_common_rate_limit_and_breaker_paths(void) {
 
 static int init_fake_sender_producer(ve_tls_producer * p, ve_tls_config * cfg) {
     if (!p || !cfg) return -1;
+    /* Legacy init intentionally only writes its legacy prefix; keep the
+     * version-3 tail deterministic for this direct internal test fixture. */
+    cfg->memory_retry_retention_ms = 0;
+    cfg->bound_request_timeout_to_retry_budget = 0;
+    cfg->delivery_diagnostic = NULL;
+    cfg->delivery_diagnostic_param = NULL;
+    cfg->retry_transient_http_errors = 0;
     memset(p, 0, sizeof(*p));
     p->config = *cfg;
     p->mutex = p->config.platform.mutex_create();
@@ -2850,6 +3054,322 @@ static int g_step_http_calls = 0;
 static int g_step_ok_calls = 0;
 static int g_step_drop_calls = 0;
 static char g_step_drop_code[64];
+
+static int g_delivery_http_calls = 0;
+static int64_t g_delivery_timeouts[8];
+static int g_delivery_recover_on_second = 0;
+static ve_tls_producer * g_memory_requeue_close_producer = NULL;
+static ve_tls_producer * g_memory_requeue_oom_producer = NULL;
+static alloc_fail_state g_memory_requeue_oom_alloc;
+static int g_budget_provider_calls = 0;
+static int g_budget_provider_advance_ms = 0;
+
+static int g_delivery_done = 0;
+static ve_tls_result g_delivery_result = VE_TLS_INVALID;
+
+#define DELIVERY_COMPARE_MAX_REQUESTS 8
+#define DELIVERY_COMPARE_MAX_HEADERS 8192
+#define DELIVERY_COMPARE_MAX_BODY 256
+
+typedef struct delivery_compare_state {
+    int request_count;
+    int capture_error;
+    char method[DELIVERY_COMPARE_MAX_REQUESTS][16];
+    char url[DELIVERY_COMPARE_MAX_REQUESTS][512];
+    char headers[DELIVERY_COMPARE_MAX_REQUESTS][DELIVERY_COMPARE_MAX_HEADERS];
+    unsigned char body[DELIVERY_COMPARE_MAX_REQUESTS][DELIVERY_COMPARE_MAX_BODY];
+    size_t body_size[DELIVERY_COMPARE_MAX_REQUESTS];
+    int64_t connect_timeout_ms[DELIVERY_COMPARE_MAX_REQUESTS];
+    int64_t timeout_ms[DELIVERY_COMPARE_MAX_REQUESTS];
+    int sleep_count;
+    int64_t sleeps[DELIVERY_COMPARE_MAX_REQUESTS];
+    int done_count;
+    ve_tls_result result;
+    int terminal_count;
+    int retained_count;
+    int scheduled_count;
+    ve_tls_delivery_diagnostic_reason terminal_reason;
+    ve_tls_delivery_diagnostic_disposition terminal_disposition;
+    int64_t acked_log_id;
+    int64_t durable_acked_log_id;
+} delivery_compare_state;
+
+static delivery_compare_state * g_delivery_compare = NULL;
+
+static void capture_delivery_compare_request(
+    delivery_compare_state * state,
+    const ve_tls_http_request * req
+) {
+    if (!state || !req || state->request_count < 0 ||
+        state->request_count >= DELIVERY_COMPARE_MAX_REQUESTS ||
+        req->body_size > DELIVERY_COMPARE_MAX_BODY) {
+        if (state) state->capture_error = 1;
+        return;
+    }
+    int index = state->request_count;
+    snprintf(state->method[index], sizeof(state->method[index]), "%s", req->method ? req->method : "");
+    snprintf(state->url[index], sizeof(state->url[index]), "%s", req->url ? req->url : "");
+    snprintf(state->headers[index], sizeof(state->headers[index]), "%s", req->headers ? req->headers : "");
+    state->body_size[index] = req->body_size;
+    if (req->body_size > 0 && req->body) {
+        memcpy(state->body[index], req->body, req->body_size);
+    }
+    state->connect_timeout_ms[index] = req->connect_timeout_ms;
+    state->timeout_ms[index] = req->timeout_ms;
+    state->request_count++;
+}
+
+static void delivery_compare_sleep_ms(int64_t ms) {
+    if (g_delivery_compare) {
+        if (g_delivery_compare->sleep_count >= DELIVERY_COMPARE_MAX_REQUESTS) {
+            g_delivery_compare->capture_error = 1;
+        } else {
+            g_delivery_compare->sleeps[g_delivery_compare->sleep_count++] = ms;
+        }
+    }
+    test_fake_sleep_ms(ms);
+}
+
+static int test_http_delivery_compare_do(
+    ve_tls_http_client * client,
+    const ve_tls_http_request * req,
+    ve_tls_http_response * resp
+) {
+    (void)client;
+    if (!g_delivery_compare || !req || !resp) return -1;
+    capture_delivery_compare_request(g_delivery_compare, req);
+    int request_index = g_delivery_compare->request_count - 1;
+    if (request_index < 0) return -1;
+    if (request_index == 0) {
+        resp->status_code = 503;
+        resp->request_id = strdup("compare-failure");
+    } else {
+        resp->status_code = 200;
+        resp->request_id = strdup("compare-success");
+    }
+    return 0;
+}
+
+static void snapshot_delivery_compare_state(delivery_compare_state * state) {
+    if (!state) return;
+    state->done_count = g_delivery_done;
+    state->result = g_delivery_result;
+    state->terminal_count = g_delivery_diag.terminal_count;
+    state->retained_count = g_delivery_diag.retained_count;
+    state->scheduled_count = g_delivery_diag.scheduled_count;
+    state->terminal_reason = g_delivery_diag.terminal_reason;
+    state->terminal_disposition = g_delivery_diag.terminal_disposition;
+}
+
+static int delivery_compare_requests_equal(
+    const delivery_compare_state * lhs,
+    const delivery_compare_state * rhs
+) {
+    if (!lhs || !rhs || lhs->capture_error || rhs->capture_error ||
+        lhs->request_count != rhs->request_count ||
+        lhs->sleep_count != rhs->sleep_count) {
+        return 0;
+    }
+    for (int i = 0; i < lhs->request_count; i++) {
+        if (strcmp(lhs->method[i], rhs->method[i]) != 0 ||
+            strcmp(lhs->url[i], rhs->url[i]) != 0 ||
+            strcmp(lhs->headers[i], rhs->headers[i]) != 0 ||
+            lhs->body_size[i] != rhs->body_size[i] ||
+            memcmp(lhs->body[i], rhs->body[i], lhs->body_size[i]) != 0 ||
+            lhs->connect_timeout_ms[i] != rhs->connect_timeout_ms[i] ||
+            lhs->timeout_ms[i] != rhs->timeout_ms[i]) {
+            return 0;
+        }
+    }
+    for (int i = 0; i < lhs->sleep_count; i++) {
+        if (lhs->sleeps[i] != rhs->sleeps[i]) return 0;
+    }
+    return 1;
+}
+
+static void test_delivery_diagnostic(
+    const ve_tls_delivery_diagnostic * event,
+    void * user_param
+) {
+    delivery_diag_state * state = (delivery_diag_state *)user_param;
+    if (!event || !state) return;
+    if ((int)event->event >= 0 && (int)event->event < 6) {
+        state->event_count[event->event]++;
+    }
+    if (event->metadata_version != VE_TLS_DELIVERY_DIAGNOSTIC_METADATA_VERSION_1 ||
+        event->metadata_size != sizeof(*event)) {
+        state->schema_error = 1;
+    }
+    if (event->event == VE_TLS_DELIVERY_DIAGNOSTIC_ATTEMPT_FINISHED) {
+        state->attempt_count++;
+        state->finished_attempt_id = event->attempt_id;
+        state->finished_attempt_elapsed_ms = event->attempt_elapsed_ms;
+    } else if (event->event == VE_TLS_DELIVERY_DIAGNOSTIC_RETRY_SCHEDULED) {
+        state->scheduled_count++;
+    } else if (event->event == VE_TLS_DELIVERY_DIAGNOSTIC_BATCH_RETAINED) {
+        state->retained_count++;
+    } else if (event->event == VE_TLS_DELIVERY_DIAGNOSTIC_BATCH_TERMINAL) {
+        state->terminal_count++;
+        state->terminal_attempt_id = event->attempt_id;
+        state->terminal_reason = event->reason;
+        state->terminal_disposition = event->disposition;
+        state->terminal_attempts = event->attempt_count;
+        state->terminal_elapsed_ms = event->elapsed_ms;
+        state->terminal_attempt_elapsed_ms = event->attempt_elapsed_ms;
+        state->terminal_queue_wait_ms = event->queue_wait_ms;
+        snprintf(
+            state->terminal_error_code,
+            sizeof(state->terminal_error_code),
+            "%s",
+            event->error_code ? event->error_code : "");
+    } else if (event->event == VE_TLS_DELIVERY_DIAGNOSTIC_ATTEMPT_STARTED) {
+        state->started_count++;
+        state->started_attempt_id = event->attempt_id;
+    } else if (event->event == VE_TLS_DELIVERY_DIAGNOSTIC_BATCH_SEALED) {
+        state->sealed_count++;
+    }
+}
+
+static void on_delivery_done_v2(
+    ve_tls_result result,
+    size_t log_bytes,
+    size_t compressed_bytes,
+    const ve_tls_error * error,
+    const unsigned char * raw_buffer,
+    void * user_param,
+    int64_t start_id,
+    int64_t end_id
+) {
+    (void)log_bytes;
+    (void)compressed_bytes;
+    (void)error;
+    (void)raw_buffer;
+    (void)user_param;
+    (void)start_id;
+    (void)end_id;
+    g_delivery_done++;
+    g_delivery_result = result;
+}
+
+static int test_http_bound_retry_do(
+    ve_tls_http_client * client,
+    const ve_tls_http_request * req,
+    ve_tls_http_response * resp
+) {
+    (void)client;
+    if (!req || !resp) return -1;
+    if (g_delivery_http_calls < (int)(sizeof(g_delivery_timeouts) / sizeof(g_delivery_timeouts[0]))) {
+        g_delivery_timeouts[g_delivery_http_calls] = req->timeout_ms;
+    }
+    g_delivery_http_calls++;
+    g_fake_time += 3;
+    resp->transport_kind = VE_TLS_TRANSPORT_GENERIC;
+    resp->transport_code = 7;
+    resp->transport_retryable = 1;
+    return -1;
+}
+
+static int test_http_capture_timeout_ok_do(
+    ve_tls_http_client * client,
+    const ve_tls_http_request * req,
+    ve_tls_http_response * resp
+) {
+    (void)client;
+    if (!req || !resp) {
+        return -1;
+    }
+    if (g_delivery_http_calls <
+        (int)(sizeof(g_delivery_timeouts) / sizeof(g_delivery_timeouts[0]))) {
+        g_delivery_timeouts[g_delivery_http_calls] = req->timeout_ms;
+    }
+    g_delivery_http_calls++;
+    resp->status_code = 200;
+    return 0;
+}
+
+static int test_http_memory_retry_do(
+    ve_tls_http_client * client,
+    const ve_tls_http_request * req,
+    ve_tls_http_response * resp
+) {
+    (void)client;
+    (void)req;
+    if (!resp) return -1;
+    g_delivery_http_calls++;
+    if (g_delivery_recover_on_second && g_delivery_http_calls >= 2) {
+        resp->status_code = 200;
+        resp->request_id = strdup("memory-recovered");
+        return 0;
+    }
+    resp->transport_kind = VE_TLS_TRANSPORT_GENERIC;
+    resp->transport_code = 9;
+    resp->transport_retryable = 1;
+    return -1;
+}
+
+static int test_http_memory_retry_closing_do(
+    ve_tls_http_client * client,
+    const ve_tls_http_request * req,
+    ve_tls_http_response * resp
+) {
+    (void)client;
+    (void)req;
+    if (!resp) return -1;
+    g_delivery_http_calls++;
+    if (g_memory_requeue_close_producer) {
+        g_memory_requeue_close_producer->closing = 1;
+    }
+    resp->status_code = 503;
+    return 0;
+}
+
+static int test_budget_credentials_provider(
+    ve_tls_credentials * out,
+    void * user_param
+) {
+    (void)user_param;
+    if (!out) return -1;
+    g_budget_provider_calls++;
+    g_fake_time += g_budget_provider_advance_ms;
+    out->access_key_id = "provider-ak";
+    out->access_key_secret = "provider-sk";
+    out->security_token = NULL;
+    out->expire_time_ms = INT64_MAX;
+    return 0;
+}
+
+static int g_transient_http_code = 0;
+static const char * g_transient_error_code = NULL;
+static int g_transient_failures = 0;
+static int g_transient_http_calls = 0;
+static int g_transient_bound_budget = 0;
+
+static int test_http_transient_response_do(
+    ve_tls_http_client * client,
+    const ve_tls_http_request * req,
+    ve_tls_http_response * resp
+) {
+    (void)client;
+    (void)req;
+    if (!resp) return -1;
+    g_transient_http_calls++;
+    if (g_transient_http_calls <= g_transient_failures) {
+        char body[192];
+        resp->status_code = g_transient_http_code;
+        resp->request_id = strdup("transient-failure");
+        if (g_transient_error_code) {
+            snprintf(body, sizeof(body),
+                "{\"errorCode\":\"%s\",\"errorMessage\":\"server message\"}",
+                g_transient_error_code);
+            resp->body = (unsigned char *)strdup(body);
+            resp->body_size = strlen(body);
+        }
+        return 0;
+    }
+    resp->status_code = 200;
+    resp->request_id = strdup("transient-success");
+    return 0;
+}
 
 static int test_http_step_ok_do(ve_tls_http_client * client, const ve_tls_http_request * req, ve_tls_http_response * resp) {
     (void)client;
@@ -2937,6 +3457,53 @@ static ve_tls_key_queue * find_key_queue(ve_tls_producer * p, const char * key) 
     return NULL;
 }
 
+static int enqueue_delivery_test_task(ve_tls_producer * p, const char * key, int64_t id) {
+    if (!p || !key) return -1;
+    unsigned char * body = (unsigned char *)ve_tls_malloc(8);
+    if (!body) return -1;
+    memset(body, 'R', 8);
+    ve_tls_send_task task;
+    memset(&task, 0, sizeof(task));
+    task.body = body;
+    task.body_size = 8;
+    task.raw_body_size = 8;
+    task.log_count = 1;
+    task.hash_key = ve_tls_strdup(key);
+    task.start_id = id;
+    task.end_id = id;
+    task.batch_bytes = 8;
+    if (!task.hash_key || ve_tls_key_queue_push_task(p, key, &task) != 0) {
+        ve_tls_send_task_free(&task);
+        return -1;
+    }
+    memset(&task, 0, sizeof(task));
+    return 0;
+}
+
+static int test_http_memory_retry_oom_do(
+    ve_tls_http_client * client,
+    const ve_tls_http_request * req,
+    ve_tls_http_response * resp
+) {
+    (void)client;
+    (void)req;
+    if (!resp || !g_memory_requeue_oom_producer) return -1;
+    ve_tls_key_queue * q = find_key_queue(g_memory_requeue_oom_producer, "k1");
+    if (!q || !q->q || q->count != 0) return -1;
+    /* sender_step has popped the only task, so the queue storage can be
+     * removed safely. The next push_front must allocate a fresh ring. */
+    ve_tls_free(q->q);
+    q->q = NULL;
+    q->cap = 0;
+    q->head = 0;
+    q->tail = 0;
+    q->count = 0;
+    set_alloc_fail_after(&g_memory_requeue_oom_alloc, 1);
+    g_delivery_http_calls++;
+    resp->status_code = 503;
+    return 0;
+}
+
 static int test_sender_step_key_rate_limit_delays_then_sends(void) {
     g_step_http_calls = 0;
     g_step_ok_calls = 0;
@@ -3022,6 +3589,7 @@ static int test_sender_step_key_rate_limit_delays_then_sends(void) {
 }
 
 static int test_sender_step_credentials_provider_failure_drops(void) {
+    memset(&g_delivery_diag, 0, sizeof(g_delivery_diag));
     g_step_drop_calls = 0;
     memset(g_step_drop_code, 0, sizeof(g_step_drop_code));
 
@@ -3046,6 +3614,8 @@ static int test_sender_step_credentials_provider_failure_drops(void) {
     if (init_fake_sender_producer(&p, &cfg) != 0) return -1;
     p.send_done_v2 = on_step_done_v2;
     p.send_done_v2_param = NULL;
+    p.delivery_diagnostic = test_delivery_diagnostic;
+    p.delivery_diagnostic_param = &g_delivery_diag;
 
     unsigned char * body = (unsigned char *)ve_tls_malloc(8);
     if (!body) {
@@ -3075,6 +3645,16 @@ static int test_sender_step_credentials_provider_failure_drops(void) {
     }
     memset(&t, 0, sizeof(t));
 
+    ve_tls_key_queue * q = find_key_queue(&p, "k1");
+    if (!q || !q->q || q->count == 0) {
+        destroy_fake_sender_producer(&p);
+        return -1;
+    }
+    /* Seed stale correlation state to prove the provider failure clears the
+     * queue-wait sample before emitting a non-HTTP terminal event. */
+    q->q[q->head].diagnostic_attempt_id = 99;
+    q->q[q->head].diagnostic_queue_wait_ms = 1234;
+
     if (ve_tls_sender_step(&p) != 1) {
         destroy_fake_sender_producer(&p);
         return -1;
@@ -3082,7 +3662,10 @@ static int test_sender_step_credentials_provider_failure_drops(void) {
     destroy_fake_sender_producer(&p);
     if (g_step_drop_calls < 1) return -1;
     if (strcmp(g_step_drop_code, "CredentialsRefreshFailed") != 0) return -1;
-    return 0;
+    return g_delivery_diag.terminal_count == 1 &&
+        g_delivery_diag.started_count == 0 &&
+        g_delivery_diag.terminal_attempt_id == 0 &&
+        g_delivery_diag.terminal_queue_wait_ms == -1 ? 0 : -1;
 }
 
 static int test_sender_step_retries_transport_then_ok(void) {
@@ -3236,6 +3819,994 @@ static int test_sender_step_retry_total_timeout_caps_delay(void) {
     if (g_step_http_calls < 1) return -1;
     if (g_step_ok_calls != 0) return -1;
     if (g_step_drop_calls < 1) return -1;
+    return 0;
+}
+
+static int test_delivery_config_v2_layout_compatibility(void) {
+    ve_tls_config cfg;
+    memset(&cfg, 0xA5, sizeof(cfg));
+    if (ve_tls_config_init_versioned(
+            &cfg, VE_TLS_CONFIG_VERSION_2_SIZE, VE_TLS_CONFIG_VERSION_2) != VE_TLS_OK) {
+        return -1;
+    }
+    if (VE_TLS_CONFIG_VERSION_2_SIZE != offsetof(ve_tls_config, memory_retry_retention_ms) ||
+        VE_TLS_CONFIG_VERSION_3_SIZE != sizeof(ve_tls_config)) {
+        return -2;
+    }
+    cfg.endpoint = "https://example.com";
+    cfg.region = "cn-beijing";
+    cfg.topic_id = "t";
+    cfg.access_key_id = "ak";
+    cfg.access_key_secret = "sk";
+    ve_tls_producer * producer = ve_tls_producer_create_versioned(
+        &cfg, VE_TLS_CONFIG_VERSION_2_SIZE, VE_TLS_CONFIG_VERSION_2);
+    if (!producer) return -3;
+    int ok = producer->config.memory_retry_retention_ms == 0 &&
+        producer->config.bound_request_timeout_to_retry_budget == 0 &&
+        producer->config.delivery_diagnostic == NULL &&
+        producer->config.delivery_diagnostic_param == NULL &&
+        producer->config.retry_transient_http_errors == 0;
+    ve_tls_producer_destroy(producer);
+    return ok ? 0 : -4;
+}
+
+static int test_sender_step_bound_timeout_clips_request_and_stops_at_budget(void) {
+    memset(&g_delivery_diag, 0, sizeof(g_delivery_diag));
+    g_delivery_http_calls = 0;
+    memset(g_delivery_timeouts, 0, sizeof(g_delivery_timeouts));
+    g_delivery_done = 0;
+    g_delivery_result = VE_TLS_INVALID;
+
+    ve_tls_config cfg;
+    ve_tls_config_init(&cfg);
+    g_real_platform = cfg.platform;
+    g_fake_time = 1000;
+    cfg.platform.time_ms = test_fake_time_ms;
+    cfg.platform.sleep_ms = test_fake_sleep_ms;
+    cfg.platform.cond_timedwait_ms = test_fake_cond_timedwait_ms;
+    cfg.endpoint = "https://example.com";
+    cfg.region = "cn-beijing";
+    cfg.topic_id = "t";
+    cfg.access_key_id = "ak";
+    cfg.access_key_secret = "sk";
+    cfg.compress_type = "none";
+    cfg.request_timeout_ms = 50;
+    cfg.retry_policy.max_attempts = 0;
+    cfg.retry_policy.total_timeout_ms = 5;
+    cfg.retry_policy.initial_interval_ms = 1;
+    cfg.retry_policy.max_interval_ms = 1;
+    cfg.retry_policy.randomization_factor = 0;
+    cfg.http_client.do_request = test_http_bound_retry_do;
+    cfg.http_client.free_response = test_http_free;
+
+    ve_tls_producer producer;
+    if (init_fake_sender_producer(&producer, &cfg) != 0) return -1;
+    producer.config.bound_request_timeout_to_retry_budget = 1;
+    producer.send_done_v2 = on_delivery_done_v2;
+    producer.delivery_diagnostic = test_delivery_diagnostic;
+    producer.delivery_diagnostic_param = &g_delivery_diag;
+    if (enqueue_delivery_test_task(&producer, "k1", 1) != 0) {
+        destroy_fake_sender_producer(&producer);
+        return -2;
+    }
+    if (ve_tls_sender_step(&producer) != 1) {
+        destroy_fake_sender_producer(&producer);
+        return -3;
+    }
+    int ok = g_delivery_http_calls == 2 &&
+        g_delivery_timeouts[0] == 5 &&
+        g_delivery_timeouts[1] == 1 &&
+        g_delivery_done == 1 &&
+        g_delivery_result == VE_TLS_DROP_ERROR &&
+        g_delivery_diag.terminal_count == 1 &&
+        g_delivery_diag.terminal_reason == VE_TLS_DELIVERY_DIAGNOSTIC_REASON_RETRY_BUDGET &&
+        g_delivery_diag.started_count == 2 &&
+        g_delivery_diag.started_attempt_id > 0 &&
+        g_delivery_diag.terminal_attempt_id == g_delivery_diag.started_attempt_id &&
+        g_delivery_diag.schema_error == 0;
+    destroy_fake_sender_producer(&producer);
+    return ok ? 0 : -4;
+}
+
+static int test_sender_step_memory_retry_notify_recovery(void) {
+    memset(&g_delivery_diag, 0, sizeof(g_delivery_diag));
+    g_delivery_http_calls = 0;
+    g_delivery_recover_on_second = 1;
+    g_delivery_done = 0;
+    g_delivery_result = VE_TLS_INVALID;
+
+    ve_tls_config cfg;
+    ve_tls_config_init(&cfg);
+    g_real_platform = cfg.platform;
+    g_fake_time = 2000;
+    cfg.platform.time_ms = test_fake_time_ms;
+    cfg.platform.sleep_ms = test_fake_sleep_ms;
+    cfg.platform.cond_timedwait_ms = test_fake_cond_timedwait_ms;
+    cfg.endpoint = "https://example.com";
+    cfg.region = "cn-beijing";
+    cfg.topic_id = "t";
+    cfg.access_key_id = "ak";
+    cfg.access_key_secret = "sk";
+    cfg.compress_type = "none";
+    cfg.retry_policy.max_attempts = 1;
+    cfg.retry_policy.initial_interval_ms = 3;
+    cfg.retry_policy.max_interval_ms = 3;
+    cfg.http_client.do_request = test_http_memory_retry_do;
+    cfg.http_client.free_response = test_http_free;
+
+    ve_tls_producer producer;
+    if (init_fake_sender_producer(&producer, &cfg) != 0) return -1;
+    producer.config.memory_retry_retention_ms = 10;
+    producer.send_done_v2 = on_delivery_done_v2;
+    producer.delivery_diagnostic = test_delivery_diagnostic;
+    producer.delivery_diagnostic_param = &g_delivery_diag;
+    if (enqueue_delivery_test_task(&producer, "k1", 1) != 0 ||
+        ve_tls_sender_step(&producer) != 1 ||
+        !producer.delayed_head || g_delivery_http_calls != 1 ||
+        g_delivery_done != 0 || g_delivery_diag.retained_count != 1) {
+        destroy_fake_sender_producer(&producer);
+        return -2;
+    }
+    g_fake_time += 1;
+    if (ve_tls_producer_notify_network_recovered(&producer) != VE_TLS_OK ||
+        ve_tls_sender_step(&producer) != 1) {
+        destroy_fake_sender_producer(&producer);
+        return -3;
+    }
+    int ok = g_delivery_http_calls == 2 &&
+        g_delivery_done == 1 &&
+        g_delivery_result == VE_TLS_OK &&
+        g_delivery_diag.terminal_count == 1 &&
+        g_delivery_diag.terminal_reason == VE_TLS_DELIVERY_DIAGNOSTIC_REASON_SUCCESS &&
+        producer.delayed_head == NULL;
+    destroy_fake_sender_producer(&producer);
+    g_delivery_recover_on_second = 0;
+    return ok ? 0 : -4;
+}
+
+static int test_sender_step_memory_retry_expiry_and_close_terminal(void) {
+    int results_ok = 1;
+    g_delivery_recover_on_second = 0;
+    for (int close_case = 0; close_case < 2; close_case++) {
+        memset(&g_delivery_diag, 0, sizeof(g_delivery_diag));
+        g_delivery_http_calls = 0;
+        g_delivery_done = 0;
+        g_delivery_result = VE_TLS_INVALID;
+        ve_tls_config cfg;
+        ve_tls_config_init(&cfg);
+        g_real_platform = cfg.platform;
+        g_fake_time = close_case ? 3000 : 4000;
+        cfg.platform.time_ms = test_fake_time_ms;
+        cfg.platform.sleep_ms = test_fake_sleep_ms;
+        cfg.platform.cond_timedwait_ms = test_fake_cond_timedwait_ms;
+        cfg.endpoint = "https://example.com";
+        cfg.region = "cn-beijing";
+        cfg.topic_id = "t";
+        cfg.access_key_id = "ak";
+        cfg.access_key_secret = "sk";
+        cfg.compress_type = "none";
+        cfg.retry_policy.max_attempts = 1;
+        cfg.retry_policy.initial_interval_ms = 3;
+        cfg.retry_policy.max_interval_ms = 3;
+        cfg.http_client.do_request = test_http_memory_retry_do;
+        cfg.http_client.free_response = test_http_free;
+        ve_tls_producer producer;
+        if (init_fake_sender_producer(&producer, &cfg) != 0) return -1;
+        producer.config.memory_retry_retention_ms = 5;
+        producer.send_done_v2 = on_delivery_done_v2;
+        producer.delivery_diagnostic = test_delivery_diagnostic;
+        producer.delivery_diagnostic_param = &g_delivery_diag;
+        if (enqueue_delivery_test_task(&producer, "k1", 1) != 0 ||
+            ve_tls_sender_step(&producer) != 1 || !producer.delayed_head) {
+            destroy_fake_sender_producer(&producer);
+            return -2;
+        }
+        uint64_t finished_attempt_id = g_delivery_diag.finished_attempt_id;
+        int64_t finished_attempt_elapsed_ms = g_delivery_diag.finished_attempt_elapsed_ms;
+        if (g_delivery_diag.attempt_count != 1 || finished_attempt_id == 0 ||
+            finished_attempt_elapsed_ms < 0) {
+            destroy_fake_sender_producer(&producer);
+            return -3;
+        }
+        if (close_case) {
+            producer.closing = 1;
+            g_fake_time += 1;
+        } else {
+            g_fake_time += 5;
+        }
+        if (ve_tls_sender_step(&producer) != 1 || g_delivery_http_calls != 1 ||
+            g_delivery_done != 1 || g_delivery_diag.terminal_count != 1) {
+            results_ok = 0;
+        }
+        if (g_delivery_diag.terminal_attempt_id != finished_attempt_id ||
+            g_delivery_diag.terminal_attempt_elapsed_ms != finished_attempt_elapsed_ms) {
+            results_ok = 0;
+        }
+        if (close_case) {
+            if (g_delivery_result != VE_TLS_CLOSED ||
+                g_delivery_diag.terminal_reason != VE_TLS_DELIVERY_DIAGNOSTIC_REASON_CLOSED) {
+                results_ok = 0;
+            }
+        } else if (g_delivery_result != VE_TLS_DROP_ERROR ||
+                   g_delivery_diag.terminal_reason != VE_TLS_DELIVERY_DIAGNOSTIC_REASON_RETENTION_EXPIRED) {
+            results_ok = 0;
+        }
+        destroy_fake_sender_producer(&producer);
+    }
+    return results_ok ? 0 : -3;
+}
+
+static int test_sender_step_memory_retry_expiry_before_rate_limited_send(void) {
+    memset(&g_delivery_diag, 0, sizeof(g_delivery_diag));
+    g_delivery_http_calls = 0;
+    g_delivery_recover_on_second = 0;
+    g_delivery_done = 0;
+    g_delivery_result = VE_TLS_INVALID;
+
+    ve_tls_config cfg;
+    ve_tls_config_init(&cfg);
+    g_real_platform = cfg.platform;
+    g_fake_time = 6000;
+    cfg.platform.time_ms = test_fake_time_ms;
+    cfg.platform.sleep_ms = test_fake_sleep_ms;
+    cfg.platform.cond_timedwait_ms = test_fake_cond_timedwait_ms;
+    cfg.endpoint = "https://example.com";
+    cfg.region = "cn-beijing";
+    cfg.topic_id = "t";
+    cfg.access_key_id = "ak";
+    cfg.access_key_secret = "sk";
+    cfg.compress_type = "none";
+    cfg.rate_limit_rps = 1;
+    cfg.retry_policy.max_attempts = 1;
+    cfg.retry_policy.initial_interval_ms = 3;
+    cfg.retry_policy.max_interval_ms = 3;
+    cfg.retry_policy.randomization_factor = 0;
+    cfg.http_client.do_request = test_http_memory_retry_do;
+    cfg.http_client.free_response = test_http_free;
+
+    ve_tls_producer producer;
+    if (init_fake_sender_producer(&producer, &cfg) != 0) return -1;
+    producer.config.memory_retry_retention_ms = 5;
+    producer.send_done_v2 = on_delivery_done_v2;
+    producer.delivery_diagnostic = test_delivery_diagnostic;
+    producer.delivery_diagnostic_param = &g_delivery_diag;
+    if (enqueue_delivery_test_task(&producer, "k1", 1) != 0 ||
+        ve_tls_sender_step(&producer) != 1 ||
+        !producer.delayed_head || g_delivery_http_calls != 1) {
+        destroy_fake_sender_producer(&producer);
+        return -2;
+    }
+    g_fake_time += 3;
+    if (ve_tls_sender_step(&producer) != 1) {
+        destroy_fake_sender_producer(&producer);
+        return -3;
+    }
+    int ok = g_delivery_http_calls == 1 &&
+        g_delivery_done == 1 &&
+        g_delivery_result == VE_TLS_DROP_ERROR &&
+        g_delivery_diag.terminal_count == 1 &&
+        g_delivery_diag.terminal_reason == VE_TLS_DELIVERY_DIAGNOSTIC_REASON_RETENTION_EXPIRED;
+    destroy_fake_sender_producer(&producer);
+    return ok ? 0 : -4;
+}
+
+static int test_notify_network_recovery_stable_delayed_iteration(void) {
+    ve_tls_config cfg;
+    ve_tls_producer producer;
+    ve_tls_key_queue * due_a;
+    ve_tls_key_queue * due_b;
+    ve_tls_key_queue * future;
+    ve_tls_key_queue * auth_wait;
+
+    ve_tls_config_init(&cfg);
+    g_real_platform = cfg.platform;
+    g_fake_time = 1000;
+    cfg.platform.time_ms = test_fake_time_ms;
+    cfg.platform.sleep_ms = test_fake_sleep_ms;
+    cfg.platform.cond_timedwait_ms = test_fake_cond_timedwait_ms;
+    if (init_fake_sender_producer(&producer, &cfg) != 0) return -1;
+    producer.config.memory_retry_retention_ms = 100;
+    if (enqueue_delivery_test_task(&producer, "due-a", 1) != 0 ||
+        enqueue_delivery_test_task(&producer, "due-b", 2) != 0 ||
+        enqueue_delivery_test_task(&producer, "future", 3) != 0 ||
+        enqueue_delivery_test_task(&producer, "auth-wait", 4) != 0) {
+        destroy_fake_sender_producer(&producer);
+        return -2;
+    }
+    due_a = find_key_queue(&producer, "due-a");
+    due_b = find_key_queue(&producer, "due-b");
+    future = find_key_queue(&producer, "future");
+    auth_wait = find_key_queue(&producer, "auth-wait");
+    if (!due_a || !due_b || !future || !auth_wait) {
+        destroy_fake_sender_producer(&producer);
+        return -3;
+    }
+    due_a->q[due_a->head].memory_retry_retained = 1;
+    due_b->q[due_b->head].memory_retry_retained = 1;
+    future->q[future->head].memory_retry_retained = 1;
+    auth_wait->q[auth_wait->head].memory_retry_retained = 1;
+    future->breaker_open_until_ms = g_fake_time + 500;
+    auth_wait->auth_wait_cred_version = 7;
+    ve_tls_delayed_add_sorted(&producer, due_a, g_fake_time - 10);
+    ve_tls_delayed_add_sorted(&producer, due_b, g_fake_time - 5);
+    ve_tls_delayed_add_sorted(&producer, future, g_fake_time + 100);
+    ve_tls_delayed_add_sorted(&producer, auth_wait, g_fake_time + 200);
+
+    int notify_rc = ve_tls_producer_notify_network_recovered(&producer);
+    int ok = notify_rc == VE_TLS_OK &&
+        due_a->delayed && due_a->next_ready_ms == g_fake_time &&
+        due_b->delayed && due_b->next_ready_ms == g_fake_time &&
+        future->delayed && future->next_ready_ms == g_fake_time &&
+        future->breaker_open_until_ms == g_fake_time + 500 &&
+        auth_wait->delayed && auth_wait->next_ready_ms == g_fake_time + 200 &&
+        auth_wait->auth_wait_cred_version == 7;
+    if (ok) {
+        ve_tls_delayed_promote_due(&producer, g_fake_time);
+        ok = due_a->ready && due_b->ready && future->ready &&
+            auth_wait->delayed && !auth_wait->ready;
+    }
+    destroy_fake_sender_producer(&producer);
+    return ok ? 0 : -4;
+}
+
+static int test_sender_step_memory_requeue_terminal_guards(void) {
+    ve_tls_config cfg;
+    ve_tls_producer producer;
+
+    memset(&g_delivery_diag, 0, sizeof(g_delivery_diag));
+    g_delivery_http_calls = 0;
+    g_delivery_done = 0;
+    g_delivery_result = VE_TLS_INVALID;
+    g_delivery_recover_on_second = 0;
+    ve_tls_config_init(&cfg);
+    g_real_platform = cfg.platform;
+    g_fake_time = 7000;
+    cfg.platform.time_ms = test_fake_time_ms;
+    cfg.platform.sleep_ms = test_fake_sleep_ms;
+    cfg.platform.cond_timedwait_ms = test_fake_cond_timedwait_ms;
+    cfg.endpoint = "https://example.com";
+    cfg.region = "cn-beijing";
+    cfg.topic_id = "t";
+    cfg.access_key_id = "ak";
+    cfg.access_key_secret = "sk";
+    cfg.compress_type = "none";
+    cfg.retry_policy.max_attempts = 1;
+    cfg.retry_policy.initial_interval_ms = 1;
+    cfg.retry_policy.max_interval_ms = 1;
+    cfg.http_client.do_request = test_http_memory_retry_closing_do;
+    cfg.http_client.free_response = test_http_free;
+    if (init_fake_sender_producer(&producer, &cfg) != 0) return -1;
+    producer.config.memory_retry_retention_ms = 10;
+    producer.send_done_v2 = on_delivery_done_v2;
+    producer.delivery_diagnostic = test_delivery_diagnostic;
+    producer.delivery_diagnostic_param = &g_delivery_diag;
+    g_memory_requeue_close_producer = &producer;
+    int close_rc = enqueue_delivery_test_task(&producer, "k1", 1) == 0
+        ? ve_tls_sender_step(&producer)
+        : -1;
+    g_memory_requeue_close_producer = NULL;
+    int close_ok = close_rc == 1 &&
+        g_delivery_http_calls == 1 &&
+        g_delivery_done == 1 &&
+        g_delivery_result == VE_TLS_CLOSED &&
+        g_delivery_diag.terminal_count == 1 &&
+        g_delivery_diag.terminal_reason == VE_TLS_DELIVERY_DIAGNOSTIC_REASON_CLOSED &&
+        strcmp(g_delivery_diag.terminal_error_code, "ProducerClosed") == 0 &&
+        producer.delayed_head == NULL;
+    destroy_fake_sender_producer(&producer);
+    if (!close_ok) return -2;
+
+    memset(&g_delivery_diag, 0, sizeof(g_delivery_diag));
+    g_delivery_http_calls = 0;
+    g_delivery_done = 0;
+    g_delivery_result = VE_TLS_INVALID;
+    ve_tls_config_init(&cfg);
+    g_real_platform = cfg.platform;
+    g_fake_time = 7100;
+    cfg.platform.time_ms = test_fake_time_ms;
+    cfg.platform.sleep_ms = test_fake_sleep_ms;
+    cfg.platform.cond_timedwait_ms = test_fake_cond_timedwait_ms;
+    cfg.endpoint = "https://example.com";
+    cfg.region = "cn-beijing";
+    cfg.topic_id = "t";
+    cfg.access_key_id = "ak";
+    cfg.access_key_secret = "sk";
+    cfg.compress_type = "none";
+    cfg.retry_policy.max_attempts = 1;
+    cfg.retry_policy.initial_interval_ms = 1;
+    cfg.retry_policy.max_interval_ms = 1;
+    cfg.http_client.do_request = test_http_memory_retry_oom_do;
+    cfg.http_client.free_response = test_http_free;
+    if (init_fake_sender_producer(&producer, &cfg) != 0) return -3;
+    producer.config.memory_retry_retention_ms = 10;
+    producer.send_done_v2 = on_delivery_done_v2;
+    producer.delivery_diagnostic = test_delivery_diagnostic;
+    producer.delivery_diagnostic_param = &g_delivery_diag;
+    g_memory_requeue_oom_producer = &producer;
+    ve_tls_alloc_hooks saved_hooks;
+    ve_tls_alloc_get_hooks(&saved_hooks);
+    int oom_rc = enqueue_delivery_test_task(&producer, "k1", 1) == 0
+        ? ve_tls_sender_step(&producer)
+        : -1;
+    ve_tls_alloc_set_hooks(&saved_hooks);
+    g_memory_requeue_oom_producer = NULL;
+    int oom_ok = oom_rc == 1 &&
+        g_delivery_http_calls == 1 &&
+        g_delivery_done == 1 &&
+        g_delivery_result == VE_TLS_DROP_ERROR &&
+        g_delivery_diag.terminal_count == 1 &&
+        g_delivery_diag.terminal_reason == VE_TLS_DELIVERY_DIAGNOSTIC_REASON_NON_RETRYABLE &&
+        strcmp(g_delivery_diag.terminal_error_code, "OutOfMemory") == 0 &&
+        producer.delayed_head == NULL;
+    destroy_fake_sender_producer(&producer);
+    return oom_ok ? 0 : -4;
+}
+
+static int test_sender_step_budget_recheck_after_credentials_provider(void) {
+    memset(&g_delivery_diag, 0, sizeof(g_delivery_diag));
+    g_delivery_http_calls = 0;
+    g_delivery_done = 0;
+    g_delivery_result = VE_TLS_INVALID;
+    g_budget_provider_calls = 0;
+    g_budget_provider_advance_ms = 10;
+
+    ve_tls_config cfg;
+    ve_tls_config_init(&cfg);
+    g_real_platform = cfg.platform;
+    g_fake_time = 8000;
+    cfg.platform.time_ms = test_fake_time_ms;
+    cfg.platform.sleep_ms = test_fake_sleep_ms;
+    cfg.platform.cond_timedwait_ms = test_fake_cond_timedwait_ms;
+    cfg.endpoint = "https://example.com";
+    cfg.region = "cn-beijing";
+    cfg.topic_id = "t";
+    cfg.compress_type = "none";
+    cfg.request_timeout_ms = 50;
+    cfg.retry_policy.max_attempts = 0;
+    cfg.retry_policy.total_timeout_ms = 5;
+    cfg.retry_policy.initial_interval_ms = 1;
+    cfg.retry_policy.max_interval_ms = 1;
+    cfg.retry_policy.randomization_factor = 0;
+    cfg.credentials_provider = test_budget_credentials_provider;
+    cfg.http_client.do_request = test_http_bound_retry_do;
+    cfg.http_client.free_response = test_http_free;
+
+    ve_tls_producer producer;
+    if (init_fake_sender_producer(&producer, &cfg) != 0) return -1;
+    producer.config.bound_request_timeout_to_retry_budget = 1;
+    producer.send_done_v2 = on_delivery_done_v2;
+    producer.delivery_diagnostic = test_delivery_diagnostic;
+    producer.delivery_diagnostic_param = &g_delivery_diag;
+    if (enqueue_delivery_test_task(&producer, "k1", 1) != 0 ||
+        !find_key_queue(&producer, "k1") ||
+        !find_key_queue(&producer, "k1")->q ||
+        find_key_queue(&producer, "k1")->count == 0) {
+        destroy_fake_sender_producer(&producer);
+        return -2;
+    }
+    ve_tls_key_queue * q = find_key_queue(&producer, "k1");
+    q->q[q->head].diagnostic_attempt_id = 99;
+    q->q[q->head].diagnostic_queue_wait_ms = 1234;
+    if (ve_tls_sender_step(&producer) != 1) {
+        destroy_fake_sender_producer(&producer);
+        return -2;
+    }
+    int ok = g_budget_provider_calls == 1 &&
+        g_delivery_http_calls == 0 &&
+        g_delivery_done == 1 &&
+        g_delivery_result == VE_TLS_DROP_ERROR &&
+        g_delivery_diag.terminal_count == 1 &&
+        g_delivery_diag.started_count == 0 &&
+        g_delivery_diag.terminal_attempt_id == 0 &&
+        g_delivery_diag.terminal_attempt_elapsed_ms == -1 &&
+        g_delivery_diag.terminal_queue_wait_ms == -1 &&
+        g_delivery_diag.terminal_reason == VE_TLS_DELIVERY_DIAGNOSTIC_REASON_RETRY_BUDGET;
+    destroy_fake_sender_producer(&producer);
+    g_budget_provider_advance_ms = 0;
+    return ok ? 0 : -3;
+}
+
+static int test_sender_step_deadline_includes_request_preparation(void) {
+    for (int expired_case = 0; expired_case < 2; expired_case++) {
+        memset(&g_delivery_diag, 0, sizeof(g_delivery_diag));
+        g_delivery_http_calls = 0;
+        memset(g_delivery_timeouts, 0, sizeof(g_delivery_timeouts));
+        g_delivery_done = 0;
+        g_delivery_result = VE_TLS_INVALID;
+
+        ve_tls_config cfg;
+        ve_tls_config_init(&cfg);
+        g_real_platform = cfg.platform;
+        g_fake_time = expired_case ? 10000 : 11000;
+        cfg.platform.time_ms = test_fake_time_ms;
+        cfg.platform.sleep_ms = test_fake_sleep_ms;
+        cfg.platform.cond_timedwait_ms = test_fake_cond_timedwait_ms;
+        cfg.endpoint = "https://example.com";
+        cfg.region = "cn-beijing";
+        cfg.topic_id = "t";
+        cfg.access_key_id = "ak";
+        cfg.access_key_secret = "sk";
+        cfg.compress_type = "none";
+        cfg.request_timeout_ms = 5000;
+        cfg.retry_policy.max_attempts = 1;
+        cfg.retry_policy.total_timeout_ms = expired_case ? 5 : 1000;
+        cfg.retry_policy.initial_interval_ms = 1;
+        cfg.retry_policy.max_interval_ms = 1;
+        cfg.retry_policy.randomization_factor = 0;
+        cfg.http_client.do_request = test_http_capture_timeout_ok_do;
+        cfg.http_client.free_response = test_http_free;
+
+        ve_tls_producer producer;
+        if (init_fake_sender_producer(&producer, &cfg) != 0) {
+            return -1;
+        }
+        producer.config.bound_request_timeout_to_retry_budget = 1;
+        producer.send_done_v2 = on_delivery_done_v2;
+        producer.delivery_diagnostic = test_delivery_diagnostic;
+        producer.delivery_diagnostic_param = &g_delivery_diag;
+        if (enqueue_delivery_test_task(&producer, "k1", 1) != 0) {
+            destroy_fake_sender_producer(&producer);
+            return -2;
+        }
+
+        ve_tls_alloc_hooks saved_hooks;
+        memset(&saved_hooks, 0, sizeof(saved_hooks));
+        ve_tls_alloc_get_hooks(&saved_hooks);
+        alloc_advance_time_state advance_state;
+        advance_state.advance_ms = expired_case ? 10 : 1;
+        advance_state.calls = 0;
+        advance_state.prep_calls = 0;
+        set_alloc_advance_time(&advance_state);
+        int64_t before_send_ms = g_fake_time;
+        int step_rc = ve_tls_sender_step(&producer);
+        int64_t after_send_ms = g_fake_time;
+        ve_tls_alloc_set_hooks(&saved_hooks);
+
+        int ok = step_rc == 1 && advance_state.prep_calls > 0 &&
+            after_send_ms > before_send_ms &&
+            g_delivery_done == 1 && g_delivery_diag.terminal_count == 1;
+        if (expired_case) {
+            ok = ok && g_delivery_http_calls == 0 &&
+                g_delivery_diag.started_count == 0 &&
+                g_delivery_diag.terminal_attempt_id == 0 &&
+                g_delivery_diag.terminal_attempt_elapsed_ms == -1 &&
+                g_delivery_result == VE_TLS_DROP_ERROR &&
+                g_delivery_diag.terminal_reason ==
+                    VE_TLS_DELIVERY_DIAGNOSTIC_REASON_RETRY_BUDGET &&
+                strcmp(g_delivery_diag.terminal_error_code,
+                    "RetryBudgetExceeded") == 0;
+        } else {
+            ok = ok && g_delivery_http_calls == 1 &&
+                g_delivery_diag.started_count == 1 &&
+                g_delivery_result == VE_TLS_OK &&
+                g_delivery_diag.terminal_reason ==
+                    VE_TLS_DELIVERY_DIAGNOSTIC_REASON_SUCCESS &&
+                g_delivery_timeouts[0] > 0 &&
+                g_delivery_timeouts[0] < cfg.retry_policy.total_timeout_ms;
+        }
+        destroy_fake_sender_producer(&producer);
+        if (!ok) {
+            return expired_case ? -3 : -4;
+        }
+    }
+    return 0;
+}
+
+static int test_sender_step_persistent_retry_diagnostic(void) {
+    static const unsigned char wal_payload[] = "retry-persist";
+    char dir[PATH_MAX];
+    ve_tls_persistent persistent;
+    ve_tls_persistent_options opt;
+    int persistent_open = 0;
+    memset(&g_delivery_diag, 0, sizeof(g_delivery_diag));
+    g_delivery_done = 0;
+    g_delivery_result = VE_TLS_INVALID;
+    g_transient_http_code = 503;
+    g_transient_error_code = NULL;
+    g_transient_failures = 1;
+    g_transient_http_calls = 0;
+
+    ve_tls_config cfg;
+    ve_tls_config_init(&cfg);
+    g_real_platform = cfg.platform;
+    g_fake_time = 9000;
+    cfg.platform.time_ms = test_fake_time_ms;
+    cfg.platform.sleep_ms = test_fake_sleep_ms;
+    cfg.platform.cond_timedwait_ms = test_fake_cond_timedwait_ms;
+    cfg.endpoint = "https://example.com";
+    cfg.region = "cn-beijing";
+    cfg.topic_id = "t";
+    cfg.access_key_id = "ak";
+    cfg.access_key_secret = "sk";
+    cfg.compress_type = "none";
+    cfg.use_persistent = 1;
+    cfg.retry_policy.max_attempts = 1;
+    cfg.retry_policy.initial_interval_ms = 1;
+    cfg.retry_policy.max_interval_ms = 1;
+    cfg.http_client.do_request = test_http_transient_response_do;
+    cfg.http_client.free_response = test_http_free;
+
+    if (make_temp_dir(dir, sizeof(dir)) != 0) return -1;
+    memset(&persistent, 0, sizeof(persistent));
+    memset(&opt, 0, sizeof(opt));
+    opt.platform = &cfg.platform;
+    opt.dir_path = dir;
+    opt.instance_id = "retry-diagnostic";
+    opt.owner_id = "owner-a";
+    opt.owner_process_name = "test-basic";
+    opt.owner_pid = 1;
+    opt.segment_max_bytes = 4096;
+    opt.segment_max_records = 16;
+    opt.max_bytes = 65536;
+    opt.max_records = 128;
+    opt.max_segments = 4;
+    opt.overflow_policy = VE_TLS_POVERFLOW_REJECT_NEW;
+    opt.now_ms = g_fake_time;
+    opt.lease_timeout_ms = 1000;
+    opt.heartbeat_interval_ms = 1000;
+    opt.open_mode = VE_TLS_LEASE_OPEN_TAKEOVER_IF_STALE;
+    if (ve_tls_persistent_open(&persistent, &opt) != 0) {
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    persistent_open = 1;
+    if (ve_tls_persistent_append(
+            &persistent, 1, "k1", wal_payload, sizeof(wal_payload) - 1) != 0) {
+        ve_tls_persistent_close(&persistent);
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+
+    ve_tls_producer producer;
+    if (init_fake_sender_producer(&producer, &cfg) != 0) {
+        ve_tls_persistent_close(&persistent);
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    producer.persistent = &persistent;
+    producer.send_done_v2 = on_delivery_done_v2;
+    producer.delivery_diagnostic = test_delivery_diagnostic;
+    producer.delivery_diagnostic_param = &g_delivery_diag;
+    if (enqueue_delivery_test_task(&producer, "k1", 1) != 0 ||
+        ve_tls_sender_step(&producer) != 1) {
+        producer.persistent = NULL;
+        destroy_fake_sender_producer(&producer);
+        ve_tls_persistent_close(&persistent);
+        cleanup_persistent_dir(dir);
+        return -2;
+    }
+    ve_tls_key_queue * q = find_key_queue(&producer, "k1");
+    int ok = g_transient_http_calls == 1 &&
+        g_delivery_done == 0 &&
+        g_delivery_diag.scheduled_count == 1 &&
+        g_delivery_diag.retained_count == 1 &&
+        g_delivery_diag.terminal_count == 0 &&
+        persistent.checkpoint.acked_log_id == 0 &&
+        q && q->delayed && q->count == 1 &&
+        q->q[q->head].persistent_retry_cycle == 1;
+    producer.persistent = NULL;
+    destroy_fake_sender_producer(&producer);
+    if (persistent_open) ve_tls_persistent_close(&persistent);
+    cleanup_persistent_dir(dir);
+    return ok ? 0 : -3;
+}
+
+static int run_delivery_compare_memory_case(
+    int diagnostics_enabled,
+    int retain_between_cycles,
+    delivery_compare_state * out
+) {
+    if (!out) return -1;
+    memset(out, 0, sizeof(*out));
+    out->acked_log_id = -1;
+    out->durable_acked_log_id = -1;
+    memset(&g_delivery_diag, 0, sizeof(g_delivery_diag));
+    g_delivery_done = 0;
+    g_delivery_result = VE_TLS_INVALID;
+
+    ve_tls_config cfg;
+    ve_tls_config_init(&cfg);
+    g_real_platform = cfg.platform;
+    g_fake_time = 12000;
+    cfg.platform.time_ms = test_fake_time_ms;
+    cfg.platform.sleep_ms = delivery_compare_sleep_ms;
+    cfg.platform.cond_timedwait_ms = test_fake_cond_timedwait_ms;
+    cfg.endpoint = "https://example.com";
+    cfg.region = "cn-beijing";
+    cfg.topic_id = "t";
+    cfg.access_key_id = "ak";
+    cfg.access_key_secret = "sk";
+    cfg.compress_type = "none";
+    cfg.request_timeout_ms = 50;
+    cfg.retry_policy.max_attempts = retain_between_cycles ? 1 : 2;
+    cfg.retry_policy.total_timeout_ms = 20;
+    cfg.retry_policy.initial_interval_ms = 3;
+    cfg.retry_policy.max_interval_ms = 3;
+    cfg.retry_policy.randomization_factor = 0;
+    cfg.http_client.do_request = test_http_delivery_compare_do;
+    cfg.http_client.free_response = test_http_free;
+
+    ve_tls_producer producer;
+    if (init_fake_sender_producer(&producer, &cfg) != 0) return -1;
+    producer.config.bound_request_timeout_to_retry_budget = 1;
+    producer.config.memory_retry_retention_ms = retain_between_cycles ? 20 : 0;
+    producer.send_done_v2 = on_delivery_done_v2;
+    if (diagnostics_enabled) {
+        producer.delivery_diagnostic = test_delivery_diagnostic;
+        producer.delivery_diagnostic_param = &g_delivery_diag;
+    }
+    g_delivery_compare = out;
+    int first_rc = enqueue_delivery_test_task(&producer, "k1", 1) == 0
+        ? ve_tls_sender_step(&producer)
+        : -1;
+    int second_rc = 0;
+    if (retain_between_cycles) {
+        if (first_rc != 1 || !producer.delayed_head || out->request_count != 1) {
+            g_delivery_compare = NULL;
+            destroy_fake_sender_producer(&producer);
+            return -2;
+        }
+        g_fake_time += 3;
+        second_rc = ve_tls_sender_step(&producer);
+    }
+    g_delivery_compare = NULL;
+    snapshot_delivery_compare_state(out);
+    int ok = first_rc == 1 && (!retain_between_cycles || second_rc == 1) &&
+        out->request_count == 2 &&
+        out->done_count == 1 && out->result == VE_TLS_OK;
+    if (retain_between_cycles) {
+        ok = ok && out->retained_count == (diagnostics_enabled ? 1 : 0) &&
+            out->scheduled_count == (diagnostics_enabled ? 1 : 0);
+    } else {
+        ok = ok && out->sleep_count == 1 && out->sleeps[0] == 3 &&
+            out->retained_count == 0 &&
+            out->scheduled_count == (diagnostics_enabled ? 1 : 0);
+    }
+    destroy_fake_sender_producer(&producer);
+    return ok ? 0 : -3;
+}
+
+static int run_delivery_compare_persistent_case(
+    int diagnostics_enabled,
+    delivery_compare_state * out
+) {
+    static const unsigned char payload[] = "diagnostic-toggle-wal";
+    char dir[PATH_MAX] = {0};
+    ve_tls_persistent persistent;
+    ve_tls_persistent_options opt;
+    memset(&persistent, 0, sizeof(persistent));
+    memset(out, 0, sizeof(*out));
+    out->acked_log_id = -1;
+    out->durable_acked_log_id = -1;
+    memset(&g_delivery_diag, 0, sizeof(g_delivery_diag));
+    g_delivery_done = 0;
+    g_delivery_result = VE_TLS_INVALID;
+
+    ve_tls_config cfg;
+    ve_tls_config_init(&cfg);
+    g_real_platform = cfg.platform;
+    g_fake_time = 13000;
+    cfg.platform.time_ms = test_fake_time_ms;
+    cfg.platform.sleep_ms = delivery_compare_sleep_ms;
+    cfg.platform.cond_timedwait_ms = test_fake_cond_timedwait_ms;
+    cfg.endpoint = "https://example.com";
+    cfg.region = "cn-beijing";
+    cfg.topic_id = "t";
+    cfg.access_key_id = "ak";
+    cfg.access_key_secret = "sk";
+    cfg.compress_type = "none";
+    cfg.use_persistent = 1;
+    cfg.request_timeout_ms = 50;
+    cfg.retry_policy.max_attempts = 1;
+    cfg.retry_policy.total_timeout_ms = 20;
+    cfg.retry_policy.initial_interval_ms = 3;
+    cfg.retry_policy.max_interval_ms = 3;
+    cfg.retry_policy.randomization_factor = 0;
+    cfg.http_client.do_request = test_http_delivery_compare_do;
+    cfg.http_client.free_response = test_http_free;
+    if (make_temp_dir(dir, sizeof(dir)) != 0) return -1;
+
+    memset(&opt, 0, sizeof(opt));
+    opt.platform = &cfg.platform;
+    opt.dir_path = dir;
+    opt.instance_id = "diagnostic-toggle";
+    opt.owner_id = "owner-a";
+    opt.owner_process_name = "test-basic";
+    opt.owner_pid = 1;
+    opt.segment_max_bytes = 4096;
+    opt.segment_max_records = 16;
+    opt.max_bytes = 65536;
+    opt.max_records = 128;
+    opt.max_segments = 4;
+    opt.overflow_policy = VE_TLS_POVERFLOW_REJECT_NEW;
+    opt.now_ms = g_fake_time;
+    opt.lease_timeout_ms = 1000;
+    opt.heartbeat_interval_ms = 1000;
+    opt.open_mode = VE_TLS_LEASE_OPEN_TAKEOVER_IF_STALE;
+    opt.durability = VE_TLS_PDURABILITY_BUFFERED_WAL;
+    if (ve_tls_persistent_open(&persistent, &opt) != 0 ||
+        ve_tls_persistent_append(
+            &persistent, 1, "k1", payload, sizeof(payload) - 1) != 0) {
+        ve_tls_persistent_close(&persistent);
+        cleanup_persistent_dir(dir);
+        return -2;
+    }
+
+    ve_tls_producer producer;
+    if (init_fake_sender_producer(&producer, &cfg) != 0) {
+        ve_tls_persistent_close(&persistent);
+        cleanup_persistent_dir(dir);
+        return -3;
+    }
+    producer.persistent = &persistent;
+    producer.config.bound_request_timeout_to_retry_budget = 1;
+    producer.send_done_v2 = on_delivery_done_v2;
+    if (diagnostics_enabled) {
+        producer.delivery_diagnostic = test_delivery_diagnostic;
+        producer.delivery_diagnostic_param = &g_delivery_diag;
+    }
+    g_delivery_compare = out;
+    int first_rc = enqueue_delivery_test_task(&producer, "k1", 1) == 0
+        ? ve_tls_sender_step(&producer)
+        : -1;
+    int first_ack = persistent.checkpoint.acked_log_id == 0;
+    if (first_rc != 1 || !producer.delayed_head || out->request_count != 1 || !first_ack) {
+        g_delivery_compare = NULL;
+        producer.persistent = NULL;
+        destroy_fake_sender_producer(&producer);
+        ve_tls_persistent_close(&persistent);
+        cleanup_persistent_dir(dir);
+        return -4;
+    }
+    g_fake_time += 3;
+    int second_rc = ve_tls_sender_step(&producer);
+    g_delivery_compare = NULL;
+    snapshot_delivery_compare_state(out);
+    out->acked_log_id = persistent.checkpoint.acked_log_id;
+    out->durable_acked_log_id = persistent.durable_checkpoint_acked_log_id;
+    int ok = second_rc == 1 && out->request_count == 2 && out->done_count == 1 &&
+        out->result == VE_TLS_OK && out->acked_log_id == 1 &&
+        out->retained_count == (diagnostics_enabled ? 1 : 0) &&
+        out->scheduled_count == (diagnostics_enabled ? 1 : 0);
+    producer.persistent = NULL;
+    destroy_fake_sender_producer(&producer);
+    ve_tls_persistent_close(&persistent);
+    cleanup_persistent_dir(dir);
+    return ok ? 0 : -5;
+}
+
+static int test_sender_diagnostics_toggle_preserves_transport_and_wal_observations(void) {
+    delivery_compare_state memory_off;
+    delivery_compare_state memory_on;
+    delivery_compare_state retained_off;
+    delivery_compare_state retained_on;
+    delivery_compare_state wal_off;
+    delivery_compare_state wal_on;
+    if (run_delivery_compare_memory_case(0, 0, &memory_off) != 0 ||
+        run_delivery_compare_memory_case(1, 0, &memory_on) != 0 ||
+        !delivery_compare_requests_equal(&memory_off, &memory_on) ||
+        memory_off.done_count != memory_on.done_count ||
+        memory_off.result != memory_on.result ||
+        memory_on.terminal_count != 1 || memory_off.terminal_count != 0) {
+        return -1;
+    }
+    if (run_delivery_compare_memory_case(0, 1, &retained_off) != 0 ||
+        run_delivery_compare_memory_case(1, 1, &retained_on) != 0 ||
+        !delivery_compare_requests_equal(&retained_off, &retained_on) ||
+        retained_off.done_count != retained_on.done_count ||
+        retained_off.result != retained_on.result ||
+        retained_on.terminal_count != 1 || retained_off.terminal_count != 0 ||
+        retained_on.retained_count != 1 || retained_on.scheduled_count != 1) {
+        return -2;
+    }
+    if (run_delivery_compare_persistent_case(0, &wal_off) != 0 ||
+        run_delivery_compare_persistent_case(1, &wal_on) != 0 ||
+        !delivery_compare_requests_equal(&wal_off, &wal_on) ||
+        wal_off.done_count != wal_on.done_count || wal_off.result != wal_on.result ||
+        wal_off.acked_log_id != wal_on.acked_log_id ||
+        wal_off.durable_acked_log_id != wal_on.durable_acked_log_id ||
+        wal_on.acked_log_id != 1 ||
+        wal_on.terminal_count != 1 || wal_off.terminal_count != 0 ||
+        wal_on.retained_count != 1 || wal_on.scheduled_count != 1) {
+        return -3;
+    }
+    return 0;
+}
+
+static int run_transient_http_sender_case(
+    int32_t retry_transient_http_errors,
+    int32_t http_code,
+    const char * error_code,
+    int failures,
+    int expected_calls,
+    ve_tls_result expected_result
+) {
+    memset(&g_delivery_diag, 0, sizeof(g_delivery_diag));
+    g_delivery_done = 0;
+    g_delivery_result = VE_TLS_INVALID;
+    g_transient_http_code = http_code;
+    g_transient_error_code = error_code;
+    g_transient_failures = failures;
+    g_transient_http_calls = 0;
+
+    ve_tls_config cfg;
+    ve_tls_config_init(&cfg);
+    g_real_platform = cfg.platform;
+    g_fake_time = 5000;
+    cfg.platform.time_ms = test_fake_time_ms;
+    cfg.platform.sleep_ms = test_fake_sleep_ms;
+    cfg.platform.cond_timedwait_ms = test_fake_cond_timedwait_ms;
+    cfg.endpoint = "https://example.com";
+    cfg.region = "cn-beijing";
+    cfg.topic_id = "t";
+    cfg.access_key_id = "ak";
+    cfg.access_key_secret = "sk";
+    cfg.compress_type = "none";
+    cfg.retry_policy.max_attempts = 4;
+    cfg.retry_policy.total_timeout_ms = 100;
+    cfg.retry_policy.initial_interval_ms = 1;
+    cfg.retry_policy.max_interval_ms = 1;
+    cfg.retry_policy.randomization_factor = 0;
+    cfg.retry_transient_http_errors = retry_transient_http_errors;
+    cfg.http_client.do_request = test_http_transient_response_do;
+    cfg.http_client.free_response = test_http_free;
+
+    ve_tls_producer producer;
+    if (init_fake_sender_producer(&producer, &cfg) != 0) return -1;
+    producer.config.retry_transient_http_errors = retry_transient_http_errors;
+    producer.config.bound_request_timeout_to_retry_budget = g_transient_bound_budget;
+    producer.send_done_v2 = on_delivery_done_v2;
+    producer.delivery_diagnostic = test_delivery_diagnostic;
+    producer.delivery_diagnostic_param = &g_delivery_diag;
+    if (enqueue_delivery_test_task(&producer, "k1", 1) != 0 ||
+        ve_tls_sender_step(&producer) != 1) {
+        destroy_fake_sender_producer(&producer);
+        return -2;
+    }
+    int ok = g_transient_http_calls == expected_calls &&
+        g_delivery_done == 1 && g_delivery_result == expected_result;
+    destroy_fake_sender_producer(&producer);
+    return ok ? 0 : -3;
+}
+
+static int test_sender_transient_http_default_terminal(void) {
+    if (run_transient_http_sender_case(0, 400, "BadRequest", 4, 1, VE_TLS_DROP_ERROR) != 0) return -1;
+    if (run_transient_http_sender_case(0, 408, "Timeout", 4, 1, VE_TLS_DROP_ERROR) != 0) return -2;
+    if (run_transient_http_sender_case(0, 499, "ClientCanceled", 4, 1, VE_TLS_DROP_ERROR) != 0) return -3;
+    return 0;
+}
+
+static int test_sender_transient_http_enabled_retries_selected_codes(void) {
+    const char * codes[] = {"ClientCanceled", "Timeout", "RequestTimeout", "ConnectionClosed"};
+    for (size_t i = 0; i < sizeof(codes) / sizeof(codes[0]); i++) {
+        if (run_transient_http_sender_case(1, 400, codes[i], 3, 4, VE_TLS_OK) != 0) return -1;
+    }
+    if (run_transient_http_sender_case(1, 408, NULL, 3, 4, VE_TLS_OK) != 0) return -2;
+    if (run_transient_http_sender_case(1, 499, NULL, 3, 4, VE_TLS_OK) != 0) return -3;
+    if (run_transient_http_sender_case(1, 400, "InvalidArgument", 4, 1, VE_TLS_DROP_ERROR) != 0) return -4;
+    if (run_transient_http_sender_case(1, 400, "InvalidArguments", 4, 1, VE_TLS_DROP_ERROR) != 0) return -5;
+    if (run_transient_http_sender_case(1, 400, "BadRequest", 4, 1, VE_TLS_DROP_ERROR) != 0) return -6;
+    return 0;
+}
+
+static int test_sender_http_error_code_collision_does_not_mask_retry(void) {
+    const char * codes[] = {"RetryBudgetExceeded", "RetryRetentionExpired"};
+    for (int bound_flag = 0; bound_flag <= 1; bound_flag++) {
+        g_transient_bound_budget = bound_flag;
+        for (size_t i = 0; i < sizeof(codes) / sizeof(codes[0]); i++) {
+            if (run_transient_http_sender_case(
+                    0,
+                    500,
+                    codes[i],
+                    3,
+                    4,
+                    VE_TLS_OK) != 0) {
+                g_transient_bound_budget = 0;
+                return -1;
+            }
+        }
+    }
+    g_transient_bound_budget = 0;
     return 0;
 }
 
@@ -9434,6 +11005,52 @@ static int test_http_sleep_do(ve_tls_http_client * client, const ve_tls_http_req
 }
 
 static int g_takeover_http_started = 0;
+static pthread_t g_takeover_main_thread;
+static int g_takeover_time_frozen = 0;
+static pthread_mutex_t g_takeover_http_gate_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_takeover_http_gate_cond = PTHREAD_COND_INITIALIZER;
+static int g_takeover_http_released = 0;
+
+static int64_t test_takeover_time_ms(void) {
+    if (g_takeover_time_frozen && pthread_equal(pthread_self(), g_takeover_main_thread)) {
+        return g_fake_time;
+    }
+    return 1000;
+}
+
+static void test_takeover_http_reset(void) {
+    pthread_mutex_lock(&g_takeover_http_gate_mutex);
+    g_takeover_http_released = 0;
+    g_takeover_http_started = 0;
+    pthread_mutex_unlock(&g_takeover_http_gate_mutex);
+}
+
+static int test_takeover_http_wait_started(void) {
+    int rc = 0;
+    pthread_mutex_lock(&g_takeover_http_gate_mutex);
+    while (!g_takeover_http_started) {
+        struct timespec deadline;
+        if (clock_gettime(CLOCK_REALTIME, &deadline) != 0) {
+            rc = -1;
+            break;
+        }
+        deadline.tv_sec += 3;
+        if (pthread_cond_timedwait(&g_takeover_http_gate_cond,
+                &g_takeover_http_gate_mutex, &deadline) == ETIMEDOUT) {
+            rc = -1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_takeover_http_gate_mutex);
+    return rc;
+}
+
+static void test_takeover_http_release(void) {
+    pthread_mutex_lock(&g_takeover_http_gate_mutex);
+    g_takeover_http_released = 1;
+    pthread_cond_broadcast(&g_takeover_http_gate_cond);
+    pthread_mutex_unlock(&g_takeover_http_gate_mutex);
+}
 
 static int test_http_takeover_block_do(ve_tls_http_client * client, const ve_tls_http_request * req, ve_tls_http_response * resp) {
     (void)client;
@@ -9441,8 +11058,13 @@ static int test_http_takeover_block_do(ve_tls_http_client * client, const ve_tls
     if (!resp) {
         return -1;
     }
-    __atomic_store_n(&g_takeover_http_started, 1, __ATOMIC_RELEASE);
-    usleep(500 * 1000);
+    pthread_mutex_lock(&g_takeover_http_gate_mutex);
+    g_takeover_http_started = 1;
+    pthread_cond_broadcast(&g_takeover_http_gate_cond);
+    while (!g_takeover_http_released) {
+        pthread_cond_wait(&g_takeover_http_gate_cond, &g_takeover_http_gate_mutex);
+    }
+    pthread_mutex_unlock(&g_takeover_http_gate_mutex);
     resp->status_code = 200;
     resp->request_id = strdup("rid-takeover");
     return 0;
@@ -10560,7 +12182,8 @@ static void cleanup_persistent_dir(const char * dir) {
         "manifest",
         "manifest.tmp",
         "checkpoint",
-        "lease"
+        "lease",
+        "lease.lock"
     };
     if (!dir || dir[0] == 0) {
         return;
@@ -10574,6 +12197,20 @@ static void cleanup_persistent_dir(const char * dir) {
         snprintf(name, sizeof(name), "seg-%06u.log", segment_id);
         join_path(path, sizeof(path), dir, name);
         unlink(path);
+    }
+    {
+        DIR * entries = opendir(dir);
+        struct dirent * entry;
+        if (entries) {
+            while ((entry = readdir(entries)) != NULL) {
+                if (strncmp(entry->d_name, "lease.tmp.", strlen("lease.tmp.")) == 0 ||
+                    strncmp(entry->d_name, "manifest.tmp.", strlen("manifest.tmp.")) == 0) {
+                    join_path(path, sizeof(path), dir, entry->d_name);
+                    unlink(path);
+                }
+            }
+            closedir(entries);
+        }
     }
     rmdir(dir);
 }
@@ -13171,8 +14808,9 @@ static int test_persistent_retry_exhausted_recovers_in_live_producer(void) {
     cfg.access_key_id = "ak";
     cfg.access_key_secret = "sk";
     cfg.retry_policy.max_attempts = 1;
-    cfg.retry_policy.initial_interval_ms = 5;
-    cfg.retry_policy.max_interval_ms = 5;
+    cfg.retry_policy.initial_interval_ms = 100000;
+    cfg.retry_policy.max_interval_ms = 100000;
+    cfg.retry_policy.randomization_factor = 0;
     cfg.flush_interval_ms = 0;
     cfg.agg_strategy = 0;
     cfg.compress_type = "none";
@@ -13211,6 +14849,19 @@ static int test_persistent_retry_exhausted_recovers_in_live_producer(void) {
         goto cleanup;
     }
 
+    int delayed = 0;
+    for (int i = 0; i < 100; i++) {
+        producer->config.platform.mutex_lock(producer->mutex);
+        delayed = producer->delayed_head != NULL;
+        producer->config.platform.mutex_unlock(producer->mutex);
+        if (delayed) break;
+        cfg.platform.sleep_ms(10);
+    }
+    if (!delayed ||
+        ve_tls_producer_notify_network_recovered(producer) != VE_TLS_OK) {
+        failed = 1;
+        goto cleanup;
+    }
     __atomic_store_n(
         &g_persistent_live_retry_allow_success, 1, __ATOMIC_RELEASE);
     for (int i = 0; i < 500; i++) {
@@ -13744,7 +15395,7 @@ static int test_persistent_mutation_rejects_invalid_clock_without_lease_write(vo
     return failed ? -1 : 0;
 }
 
-static int test_persistent_heartbeat_before_due_skips_lease_reload(void) {
+static int test_persistent_heartbeat_before_due_validates_without_renewal(void) {
     char dir[PATH_MAX];
     ve_tls_persistent_options opt;
     ve_tls_persistent persistent;
@@ -13758,6 +15409,7 @@ static int test_persistent_heartbeat_before_due_skips_lease_reload(void) {
     cfg.platform.time_ms = test_fake_time_ms;
     cfg.platform.sleep_ms = test_fake_sleep_ms;
     cfg.platform.file_open = test_track_file_open;
+    cfg.platform.path_rename = test_track_path_rename;
     memset(&opt, 0, sizeof(opt));
     memset(&persistent, 0, sizeof(persistent));
     test_track_reset(dir);
@@ -13781,7 +15433,9 @@ static int test_persistent_heartbeat_before_due_skips_lease_reload(void) {
         return -1;
     }
     test_track_reset(dir);
-    if (ve_tls_persistent_heartbeat_if_due(&persistent, 0) != 0 || g_track_lease_opens != 0) {
+    if (ve_tls_persistent_heartbeat_if_due(&persistent, 0) != 0 ||
+        g_track_lease_opens < 1 || g_track_lease_temp_opens != 0 ||
+        g_track_lease_renames != 0) {
         ve_tls_persistent_close(&persistent);
         cleanup_persistent_dir(dir);
         return -1;
@@ -13791,7 +15445,7 @@ static int test_persistent_heartbeat_before_due_skips_lease_reload(void) {
     return 0;
 }
 
-static int test_persistent_append_before_due_skips_lease_reload(void) {
+static int test_persistent_append_before_due_validates_without_renewal(void) {
     char dir[PATH_MAX];
     ve_tls_persistent_options opt;
     ve_tls_persistent persistent;
@@ -13806,6 +15460,7 @@ static int test_persistent_append_before_due_skips_lease_reload(void) {
     cfg.platform.time_ms = test_fake_time_ms;
     cfg.platform.sleep_ms = test_fake_sleep_ms;
     cfg.platform.file_open = test_track_file_open;
+    cfg.platform.path_rename = test_track_path_rename;
     memset(&opt, 0, sizeof(opt));
     memset(&persistent, 0, sizeof(persistent));
     test_track_reset(dir);
@@ -13830,7 +15485,8 @@ static int test_persistent_append_before_due_skips_lease_reload(void) {
     }
     test_track_reset(dir);
     if (ve_tls_persistent_append(&persistent, 1, NULL, payload, sizeof(payload) - 1) != 0 ||
-        g_track_lease_opens != 0) {
+        g_track_lease_opens < 1 || g_track_lease_temp_opens != 0 ||
+        g_track_lease_renames != 0) {
         ve_tls_persistent_close(&persistent);
         cleanup_persistent_dir(dir);
         return -1;
@@ -13840,7 +15496,7 @@ static int test_persistent_append_before_due_skips_lease_reload(void) {
     return 0;
 }
 
-static int test_persistent_append_after_heartbeat_due_uses_valid_lease_window(void) {
+static int test_persistent_append_after_heartbeat_due_validates_without_renewal(void) {
     char dir[PATH_MAX];
     ve_tls_persistent_options opt;
     ve_tls_persistent persistent;
@@ -13855,6 +15511,7 @@ static int test_persistent_append_after_heartbeat_due_uses_valid_lease_window(vo
     cfg.platform.time_ms = test_fake_time_ms;
     cfg.platform.sleep_ms = test_fake_sleep_ms;
     cfg.platform.file_open = test_track_file_open;
+    cfg.platform.path_rename = test_track_path_rename;
     memset(&opt, 0, sizeof(opt));
     memset(&persistent, 0, sizeof(persistent));
     test_track_reset(dir);
@@ -13880,7 +15537,8 @@ static int test_persistent_append_after_heartbeat_due_uses_valid_lease_window(vo
     g_fake_time = 1101;
     test_track_reset(dir);
     if (ve_tls_persistent_append(&persistent, 1, NULL, payload, sizeof(payload) - 1) != 0 ||
-        g_track_lease_opens != 0) {
+        g_track_lease_opens < 1 || g_track_lease_temp_opens != 0 ||
+        g_track_lease_renames != 0) {
         ve_tls_persistent_close(&persistent);
         cleanup_persistent_dir(dir);
         return -1;
@@ -15497,7 +17155,7 @@ static void * heartbeat_append_thread(void * arg) {
     return NULL;
 }
 
-static int test_blocked_background_heartbeat_does_not_block_append(void) {
+static int test_blocked_background_heartbeat_blocks_append_until_release(void) {
     char dir[PATH_MAX];
     ve_tls_config cfg;
     ve_tls_producer * producer = NULL;
@@ -15515,6 +17173,10 @@ static int test_blocked_background_heartbeat_does_not_block_append(void) {
     }
     g_real_platform = cfg.platform;
     cfg.platform.path_rename = test_blocking_lease_path_rename;
+    cfg.platform.mutex_create = test_track_mutex_create;
+    cfg.platform.mutex_destroy = test_track_mutex_destroy;
+    cfg.platform.mutex_lock = test_track_mutex_lock;
+    cfg.platform.mutex_unlock = test_track_mutex_unlock;
     cfg.endpoint = "https://example.com";
     cfg.region = "cn-beijing";
     cfg.topic_id = "heartbeat-concurrency";
@@ -15543,11 +17205,12 @@ static int test_blocked_background_heartbeat_does_not_block_append(void) {
     __atomic_store_n(&g_lease_rename_entered, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&g_release_lease_rename, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&g_block_lease_rename, 1, __ATOMIC_RELEASE);
-    for (int i = 0; i < 500 &&
-            !__atomic_load_n(&g_lease_rename_entered, __ATOMIC_ACQUIRE); i++) {
-        cfg.platform.sleep_ms(1);
-    }
-    if (!__atomic_load_n(&g_lease_rename_entered, __ATOMIC_ACQUIRE)) {
+    __atomic_store_n(&g_track_producer_mutex, producer->persistent_mutex, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_observe_persistent_mutex, producer->persistent_mutex, __ATOMIC_RELEASE);
+    pthread_mutex_lock(&g_observe_persistent_event_mutex);
+    g_observe_persistent_lock = 0;
+    pthread_mutex_unlock(&g_observe_persistent_event_mutex);
+    if (test_wait_lease_rename_entered() != 0) {
         failed = 1;
         goto done;
     }
@@ -15556,19 +17219,21 @@ static int test_blocked_background_heartbeat_does_not_block_append(void) {
         failed = 1;
         goto done;
     }
-    for (int i = 0; i < 200 &&
-            !__atomic_load_n(&append_state.completed, __ATOMIC_ACQUIRE); i++) {
-        cfg.platform.sleep_ms(1);
+    if (test_wait_observed_persistent_lock() != 0) {
+        failed = 1;
+        goto done;
     }
     completed_before_release = __atomic_load_n(&append_state.completed, __ATOMIC_ACQUIRE);
 
 done:
-    __atomic_store_n(&g_release_lease_rename, 1, __ATOMIC_RELEASE);
+    test_release_lease_rename_gate();
     __atomic_store_n(&g_block_lease_rename, 0, __ATOMIC_RELEASE);
     if (append_thread) {
         cfg.platform.thread_join(append_thread);
     }
-    failed = failed || !completed_before_release ||
+    __atomic_store_n(&g_observe_persistent_mutex, NULL, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_track_producer_mutex, NULL, __ATOMIC_RELEASE);
+    failed = failed || completed_before_release ||
         append_state.result != VE_TLS_OK;
     ve_tls_producer_destroy(producer);
     cleanup_persistent_dir(dir);
@@ -16053,17 +17718,20 @@ static int test_producer_takeover_recovers_and_invalidates_old_writer(void) {
     unsigned char * buf = NULL;
     size_t size = 0;
     uint32_t count = 0;
+    int failed = 0;
     if (make_temp_dir(dir, sizeof(dir)) != 0) {
         return -1;
     }
     if (ve_tls_config_init_versioned(
             &cfg, sizeof(cfg), VE_TLS_CONFIG_VERSION_CURRENT) != VE_TLS_OK) {
-        cleanup_persistent_dir(dir);
-        return -1;
+        failed = 1;
+        goto done;
     }
     g_real_platform = cfg.platform;
     g_fake_time = 1000;
-    cfg.platform.time_ms = test_fake_time_ms;
+    g_takeover_main_thread = pthread_self();
+    g_takeover_time_frozen = 1;
+    cfg.platform.time_ms = test_takeover_time_ms;
     cfg.endpoint = "https://example.com";
     cfg.region = "cn-beijing";
     cfg.topic_id = "t";
@@ -16083,67 +17751,63 @@ static int test_producer_takeover_recovers_and_invalidates_old_writer(void) {
     cfg.persistent_open_mode = VE_TLS_POPEN_TAKEOVER_IF_STALE;
     cfg.http_client.do_request = test_http_takeover_block_do;
     cfg.http_client.free_response = test_http_sleep_free;
-    __atomic_store_n(&g_takeover_http_started, 0, __ATOMIC_RELEASE);
+    test_takeover_http_reset();
 
     p1 = ve_tls_producer_create_versioned(
         &cfg, sizeof(cfg), VE_TLS_CONFIG_VERSION_CURRENT);
     if (!p1 || !p1->persistent) {
-        cleanup_persistent_dir(dir);
-        return -1;
+        failed = 1;
+        goto done;
     }
     if (ve_tls_producer_add_log_raw(p1, "{\"a\":1}", strlen("{\"a\":1}"), 1) != VE_TLS_OK) {
-        ve_tls_producer_destroy(p1);
-        cleanup_persistent_dir(dir);
-        return -1;
+        failed = 1;
+        goto done;
     }
-    for (int i = 0; i < 500 &&
-            !__atomic_load_n(&g_takeover_http_started, __ATOMIC_ACQUIRE); i++) {
-        cfg.platform.sleep_ms(1);
-    }
-    if (!__atomic_load_n(&g_takeover_http_started, __ATOMIC_ACQUIRE)) {
-        ve_tls_producer_destroy(p1);
-        cleanup_persistent_dir(dir);
-        return -1;
+    if (test_takeover_http_wait_started() != 0) {
+        failed = 1;
+        goto done;
     }
     g_fake_time = 1100;
 
     p2 = ve_tls_producer_create_versioned(
         &cfg, sizeof(cfg), VE_TLS_CONFIG_VERSION_CURRENT);
     if (!p2 || !p2->persistent) {
-        ve_tls_producer_destroy(p1);
-        cleanup_persistent_dir(dir);
-        return -1;
+        failed = 1;
+        goto done;
     }
     if (ve_tls_producer_recover(p2) != VE_TLS_OK) {
-        ve_tls_producer_destroy(p2);
-        ve_tls_producer_destroy(p1);
-        cleanup_persistent_dir(dir);
-        return -1;
+        failed = 1;
+        goto done;
     }
     if (ve_tls_producer_export_raw_buffer(p2, &buf, &size) != VE_TLS_OK) {
-        ve_tls_producer_destroy(p2);
-        ve_tls_producer_destroy(p1);
-        cleanup_persistent_dir(dir);
-        return -1;
+        failed = 1;
+        goto done;
     }
     if (exported_buffer_count_and_first_hash_key(buf, size, &count, NULL, 0) != 0 || count != 1) {
-        ve_tls_producer_free_raw_buffer(buf);
-        ve_tls_producer_destroy(p2);
-        ve_tls_producer_destroy(p1);
-        cleanup_persistent_dir(dir);
-        return -1;
+        failed = 1;
+        goto done;
     }
     ve_tls_producer_free_raw_buffer(buf);
+    buf = NULL;
     if (ve_tls_producer_add_log_raw(p1, "{\"b\":2}", strlen("{\"b\":2}"), 0) == VE_TLS_OK) {
-        ve_tls_producer_destroy(p2);
-        ve_tls_producer_destroy(p1);
-        cleanup_persistent_dir(dir);
-        return -1;
+        failed = 1;
+        goto done;
     }
-    ve_tls_producer_destroy(p2);
-    ve_tls_producer_destroy(p1);
+done:
+    if (buf) {
+        ve_tls_producer_free_raw_buffer(buf);
+    }
+    /* Release the blocked sender before destroying either producer. */
+    test_takeover_http_release();
+    if (p2) {
+        ve_tls_producer_destroy(p2);
+    }
+    if (p1) {
+        ve_tls_producer_destroy(p1);
+    }
+    g_takeover_time_frozen = 0;
     cleanup_persistent_dir(dir);
-    return 0;
+    return failed ? -1 : 0;
 }
 
 /* === BEGIN coverage-uplift tests (TDD Guide) === */
@@ -18335,6 +19999,9 @@ static int t_p9_global_env_create(void) {
 #include "test_builder_sign_regressions.inc"
 #include "test_producer_admission_regressions.inc"
 #include "test_persistent_reader_regressions.inc"
+#include "test_delivery_thread_cases.inc"
+#include "test_config_version_contract.inc"
+#include "test_lease_fencing_regressions.inc"
 
 int main(void) {
     int rc = 0;
@@ -18345,6 +20012,24 @@ int main(void) {
     RUN(2002, test_builder_sign_regressions());
     RUN(2003, test_producer_admission_regressions());
     RUN(2004, test_persistent_reader_regressions());
+    RUN(1501, test_lease_fencing_heartbeat_gate());
+    RUN(1502, test_lease_fencing_append_gate());
+    RUN(1503, test_lease_fencing_close_gate());
+    RUN(1504, test_lease_fencing_same_process_one_winner());
+    RUN(1505, test_lease_fencing_fork_kill_releases_guard());
+    RUN(1506, test_lease_fencing_recover_callback_reentry());
+    RUN(1507, test_lease_fencing_guard_error_paths());
+    RUN(1530, test_exclusive_persistence_factory_contract());
+    RUN(1531, test_exclusive_persistence_lifetime_takeover());
+    RUN(1532, test_exclusive_persistence_hot_path_recovery());
+    RUN(1533, test_exclusive_persistence_concurrent_append_recovery());
+    RUN(1534, test_exclusive_persistence_recovery_reentry());
+    RUN(1535, test_exclusive_persistence_fork_close_preserves_lock());
+    RUN(1508, test_producer_aba_owner_identity());
+    RUN(1509, test_lease_owner_identity_helper());
+    RUN(1510, test_lease_fencing_persistent_shared_fd());
+    RUN(1511, test_lease_fencing_persistent_fork_fd());
+    RUN(1512, test_lease_fencing_persistent_fd_lifecycle());
     RUN(1, test_sha256());
     RUN(2, test_proto());
     RUN(3, test_proto_log_group_list_multi_groups());
@@ -18403,6 +20088,28 @@ int main(void) {
     RUN(94, test_sender_step_credentials_provider_failure_drops());
     RUN(95, test_sender_step_retries_transport_then_ok());
     RUN(103, test_sender_step_retry_total_timeout_caps_delay());
+    RUN(346, test_delivery_config_v2_layout_compatibility());
+    RUN(347, test_sender_step_bound_timeout_clips_request_and_stops_at_budget());
+    RUN(348, test_sender_step_memory_retry_notify_recovery());
+    RUN(349, test_sender_step_memory_retry_expiry_and_close_terminal());
+    RUN(350, test_sender_transient_http_default_terminal());
+    RUN(351, test_sender_transient_http_enabled_retries_selected_codes());
+    RUN(352, test_sender_step_memory_retry_expiry_before_rate_limited_send());
+    RUN(353, test_notify_network_recovery_stable_delayed_iteration());
+    RUN(354, test_sender_step_memory_requeue_terminal_guards());
+    RUN(355, test_sender_step_budget_recheck_after_credentials_provider());
+    RUN(356, test_sender_step_persistent_retry_diagnostic());
+    RUN(357, test_sender_step_deadline_includes_request_preparation());
+    RUN(358, test_sender_http_error_code_collision_does_not_mask_retry());
+    RUN(359, test_sender_diagnostics_toggle_preserves_transport_and_wal_observations());
+    RUN(360, test_sender_thread_memory_retry_expiry());
+    RUN(361, test_sender_thread_memory_retry_close_discards());
+    RUN(362, test_sender_thread_credentials_expire_before_http());
+    RUN(363, test_sender_thread_memory_retry_requeue_oom());
+    RUN(364, test_sender_step_retention_elapsed_is_cumulative());
+    RUN(365, test_sender_thread_keyed_retention_elapsed_is_cumulative());
+    RUN(366, test_config_version_initialization_contract());
+    RUN(367, test_sender_thread_persistent_close_preserves_wal());
     RUN(96, test_sender_step_compress_unsupported_drops());
     RUN(97, test_sender_step_breaker_half_open_curl_nonretry_drops());
     RUN(98, test_sender_step_http_non200_plain_message());
@@ -18558,9 +20265,9 @@ int main(void) {
     RUN(335, test_persistent_heartbeat_fsync_matches_durability());
     RUN(343, test_persistent_open_rejects_invalid_lease_clock_config());
     RUN(344, test_persistent_mutation_rejects_invalid_clock_without_lease_write());
-    RUN(148, test_persistent_heartbeat_before_due_skips_lease_reload());
-    RUN(159, test_persistent_append_before_due_skips_lease_reload());
-    RUN(336, test_persistent_append_after_heartbeat_due_uses_valid_lease_window());
+    RUN(148, test_persistent_heartbeat_before_due_validates_without_renewal());
+    RUN(159, test_persistent_append_before_due_validates_without_renewal());
+    RUN(336, test_persistent_append_after_heartbeat_due_validates_without_renewal());
     RUN(341, test_persistent_failed_heartbeat_uses_bounded_retry());
     RUN(137, test_persistent_takeover_invalidates_old_writer());
     RUN(149, test_persistent_ack_range_reclaims_without_rescanning_segments());
@@ -18573,6 +20280,7 @@ int main(void) {
     RUN(192, test_persistent_high_watermark_preserves_and_revisits_replay_segment());
     RUN(193, test_persistent_watermark_config_validation());
     RUN(340, test_persistent_lease_config_validation());
+    RUN(345, test_sender_thread_persistent_close_heartbeat_wakeup());
     RUN(194, test_persistent_drop_newest_sample_never_deletes_old_wal());
     RUN(195, test_persistent_ack_range_rejects_hole());
     RUN(197, test_persistent_concurrent_append_ack_and_reclaim());
@@ -18587,7 +20295,7 @@ int main(void) {
     RUN(144, test_persistent_kv_path_batches_multiple_logs_into_single_request());
     RUN(150, test_persistent_append_releases_producer_mutex_for_disk_write());
     RUN(339, test_background_heartbeat_does_not_hold_persistent_mutex());
-    RUN(342, test_blocked_background_heartbeat_does_not_block_append());
+    RUN(342, test_blocked_background_heartbeat_blocks_append_until_release());
     RUN(322, test_persistent_ordered_add_avoids_secondary_ingress_allocation());
     RUN(324, test_persistent_ordered_add_reuses_single_log_builder());
     RUN(325, test_log_builder_shrink_releases_large_allocation_safely());

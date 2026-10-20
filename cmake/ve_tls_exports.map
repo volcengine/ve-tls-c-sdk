@@ -20,6 +20,9 @@ VE_TLS_0.3 {
         ve_tls_config_init_versioned;
         ve_tls_producer_create;
         ve_tls_producer_create_versioned;
+        ve_tls_producer_create_with_api_key;
+        ve_tls_producer_create_with_api_key_versioned;
+        ve_tls_producer_update_api_key;
         ve_tls_producer_update_endpoint;
         ve_tls_producer_update_static_credentials;
         ve_tls_producer_close;
@@ -49,6 +52,7 @@ VE_TLS_0.3 {
         ve_tls_template_add_values;
         ve_tls_template_destroy;
         ve_tls_producer_flush;
+        ve_tls_producer_notify_network_recovered;
         ve_tls_producer_recover;
         ve_tls_producer_export_raw_buffer;
         ve_tls_producer_import_raw_buffer;

@@ -79,6 +79,37 @@ int main(void) {
 
 `time_ms=0` 时由 SDK 使用当前时间。需要亚毫秒精度时，设置 `enable_time_ns=1`，并使用 `*_time_parts` 或 template API 写入 `timeNs`；它是当前毫秒之后 `0..999999` 的纳秒余数，不是完整纳秒时间戳。
 
+## 配置版本、回调与关闭边界
+
+上面的最小示例只使用 legacy 配置前缀。`ve_tls_config_init()` 只初始化
+`VE_TLS_CONFIG_LEGACY_SIZE` 范围，`ve_tls_producer_create()` 也只消费该前缀；
+如果设置 Version 3 的 memory retry、timeout binding 或 delivery diagnostic
+字段，必须使用完全匹配的版本化初始化和创建：
+
+```c
+ve_tls_config cfg;
+if (ve_tls_config_init_versioned(
+        &cfg, VE_TLS_CONFIG_VERSION_3_SIZE, VE_TLS_CONFIG_VERSION_3) != VE_TLS_OK) {
+    return 1;
+}
+/* Fill endpoint, region, topic_id and credentials as in the example above. */
+ve_tls_producer * producer = ve_tls_producer_create_versioned(
+    &cfg, VE_TLS_CONFIG_VERSION_3_SIZE, VE_TLS_CONFIG_VERSION_3);
+```
+
+诊断和发送回调由 SDK 同步调用，包含 builder/sender 工作线程，多个线程之间可能并发，
+SDK 不替调用方串行化。回调必须线程安全、尽快返回，不能在回调中 close、destroy
+或调用可能等待同一 Producer 的操作。事件、request ID、错误字符串、raw buffer 和
+v2 error 字段只在回调期间借用；需要留存时请自行复制。sender delivery 事件的
+`elapsed_ms` 从首次 delivery 开始累计，`BATCH_SEALED` 尚未进入 sender 且该字段
+不可用时为 `-1`。
+
+`ve_tls_producer_close()` 会结束非持久化模式中已经保留的内存重试批次，并可能收到
+`VE_TLS_CLOSED`/`ProducerClosed` 回调；close 的等待时间不保证为它们再发起最后一次
+网络尝试。持久化模式的延迟重试会保留未确认 WAL，交给后续 `recover`，不与内存批次
+使用相同的终止回调语义。iOS 进入后台也不等于调用 close；应用需要按自己的生命周期
+策略显式安排 flush/close 和后续恢复。
+
 ## 真实发送 demo
 
 仓库内有三个常用入口：

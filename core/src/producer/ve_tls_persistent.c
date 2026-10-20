@@ -6,6 +6,7 @@
 #include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 
 #define VE_TLS_PERSISTENT_OVERFLOW_BLOCK 1
 #define VE_TLS_PERSISTENT_OVERFLOW_DROP_OLDEST_UNACKED 2
@@ -54,6 +55,26 @@ static int64_t persistent_now_ms(ve_tls_persistent * persistent) {
         return 0;
     }
     return persistent->platform->time_ms();
+}
+
+static int persistent_get_pid(int32_t * pid_out) {
+    pid_t pid;
+    if (!pid_out) {
+        return -1;
+    }
+    pid = getpid();
+    if (pid <= 0 || (uint64_t)pid > INT32_MAX) {
+        *pid_out = 0;
+        return -1;
+    }
+    *pid_out = (int32_t)pid;
+    return 0;
+}
+
+static int persistent_is_creator_process(const ve_tls_persistent * persistent) {
+    int32_t current_pid;
+    return persistent && persistent->creator_pid > 0 &&
+        persistent_get_pid(&current_pid) == 0 && current_pid == persistent->creator_pid;
 }
 
 static int64_t persistent_add_ms_saturating(int64_t now_ms, int64_t delta_ms) {
@@ -298,14 +319,14 @@ static int read_manifest_version(const ve_tls_persistent_options * options, int 
     return validate_manifest_body(body, offset, out_version);
 }
 
-static int ensure_manifest(const ve_tls_persistent_options * options) {
+static int ensure_manifest(const ve_tls_persistent_options * options, int allow_write) {
     int version = 0;
     int exists = 0;
     if (read_manifest_version(options, &version, &exists) != 0) {
         return -1;
     }
     if (!exists || version == 1) {
-        return write_manifest(options);
+        return allow_write ? write_manifest(options) : 0;
     }
     return version == VE_TLS_PERSISTENT_MANIFEST_VERSION_CURRENT ? 0 : -1;
 }
@@ -457,51 +478,16 @@ static int is_soft_limit_above(uint64_t current, uint64_t max, int32_t pct) {
 }
 
 static int validate_current_lease_locked(ve_tls_persistent * persistent) {
-    ve_tls_lease_state current;
     if (!persistent || !persistent->platform) {
         return -1;
     }
-    if (ve_tls_lease_load(persistent->platform, persistent->lease_path, &current) != 0) {
-        return -1;
-    }
-    if (current.fencing_token != persistent->lease.fencing_token ||
-        current.owner_pid != persistent->owner_pid ||
-        strcmp(current.owner_id, persistent->owner_id) != 0 ||
-        strcmp(current.owner_process_name, persistent->owner_process_name) != 0) {
-        return -1;
-    }
-    return 0;
+    return ve_tls_lease_validate_locked(
+        persistent->platform, persistent->lease_path, &persistent->lease);
 }
 
-static int validate_current_lease(ve_tls_persistent * persistent) {
-    int rc;
-    if (!persistent || !persistent->platform) {
-        return -1;
-    }
-    persistent_heartbeat_lock(persistent);
-    rc = validate_current_lease_locked(persistent);
-    persistent_heartbeat_unlock(persistent);
-    return rc;
-}
-
-static int validate_current_lease_if_needed_locked(ve_tls_persistent * persistent) {
-    int64_t now_ms;
-    if (!persistent) {
-        return -1;
-    }
-    if (persistent->heartbeat_interval_ms <= 0 ||
-        persistent->lease_timeout_ms <= 0 ||
-        persistent->heartbeat_interval_ms >= persistent->lease_timeout_ms) {
-        return validate_current_lease_locked(persistent);
-    }
-    now_ms = persistent_now_ms(persistent);
-    if (now_ms <= 0 || atomic_load_explicit(&persistent->next_heartbeat_ms, memory_order_relaxed) <= 0 ||
-        now_ms >= atomic_load_explicit(&persistent->next_heartbeat_ms, memory_order_relaxed)) {
-        return validate_current_lease_locked(persistent);
-    }
-    return 0;
-}
-
+/* Caller holds heartbeat_mutex through the complete heartbeat mutation. The
+   default mode also holds the retained lease.lock operation guard; exclusive
+   mode already owns that lock for the instance lifetime. */
 static int ve_tls_persistent_heartbeat_if_due_locked(ve_tls_persistent * persistent, int force) {
     ve_tls_lease_options options;
     int64_t now_ms;
@@ -513,10 +499,6 @@ static int ve_tls_persistent_heartbeat_if_due_locked(ve_tls_persistent * persist
         now_ms < atomic_load_explicit(&persistent->next_heartbeat_ms, memory_order_relaxed)) {
         return 0;
     }
-    if (validate_current_lease_locked(persistent) != 0) {
-        persistent_schedule_heartbeat_retry(persistent, now_ms);
-        return -1;
-    }
     memset(&options, 0, sizeof(options));
     options.platform = persistent->platform;
     options.lease_path = persistent->lease_path;
@@ -527,7 +509,7 @@ static int ve_tls_persistent_heartbeat_if_due_locked(ve_tls_persistent * persist
     options.lease_timeout_ms = persistent->lease_timeout_ms;
     options.mode = persistent->open_mode;
     options.sync_on_heartbeat = persistent->durability == VE_TLS_PDURABILITY_SYNC_WAL ? 1 : 0;
-    if (ve_tls_lease_heartbeat(&options, &persistent->lease) != 0) {
+    if (ve_tls_lease_heartbeat_locked(&options, &persistent->lease) != 0) {
         persistent_schedule_heartbeat_retry(persistent, now_ms);
         return -1;
     }
@@ -549,18 +531,15 @@ static int persistent_validate_lease_for_mutation(ve_tls_persistent * persistent
     if (!persistent || !persistent->platform) {
         return -1;
     }
+    /* The default guard freshly validates the owner on every operation.
+       Exclusive mode owns lease.lock for the instance lifetime. The cached
+       window controls heartbeat frequency; a due heartbeat still validates
+       the owner and preserves fencing. */
     now_ms = persistent_now_ms(persistent);
     if (persistent_lease_window_is_valid(persistent, now_ms)) {
-        return 0;
-    }
-    persistent_heartbeat_lock(persistent);
-    now_ms = persistent_now_ms(persistent);
-    if (persistent_lease_window_is_valid(persistent, now_ms)) {
-        persistent_heartbeat_unlock(persistent);
         return 0;
     }
     rc = ve_tls_persistent_heartbeat_if_due_locked(persistent, 1);
-    persistent_heartbeat_unlock(persistent);
     return rc;
 }
 
@@ -569,23 +548,64 @@ static int persistent_heartbeat_and_validate_if_needed(ve_tls_persistent * persi
     if (!persistent || !persistent->platform) {
         return -1;
     }
-    persistent_heartbeat_lock(persistent);
     rc = ve_tls_persistent_heartbeat_if_due_locked(persistent, force);
-    if (rc == 0) {
-        rc = validate_current_lease_if_needed_locked(persistent);
-    }
-    persistent_heartbeat_unlock(persistent);
     return rc;
 }
 
-int ve_tls_persistent_heartbeat_if_due(ve_tls_persistent * persistent, int force) {
-    int rc;
-    if (!persistent || !persistent->platform) {
+/* Held through file mutation, never through a recovery/user callback. Default
+   mode takes the retained lease.lock per operation and validates its owner;
+   exclusive mode keeps that ownership lock from open through close and takes
+   only the instance mutex here. */
+static int persistent_guard_enter(ve_tls_persistent * persistent, int * fd) {
+    if (!persistent || !persistent->platform || !fd ||
+        !persistent_is_creator_process(persistent) || persistent->lease_fd < 0) {
+        return -1;
+    }
+    if (persistent->exclusive_lifetime_lock != 0 &&
+        persistent->exclusive_lifetime_lock != 1) {
         return -1;
     }
     persistent_heartbeat_lock(persistent);
-    rc = ve_tls_persistent_heartbeat_if_due_locked(persistent, force);
+    if (persistent->exclusive_lifetime_lock == 1) {
+        *fd = persistent->lease_fd;
+        return 0;
+    }
+    /* Default persistent operations take the instance mutex first, then flock
+       the retained descriptor and validate the current owner. */
+    if (ve_tls_lease_guard_lock(persistent->lease_fd, 1) != 0) {
+        persistent_heartbeat_unlock(persistent);
+        return -1;
+    }
+    if (validate_current_lease_locked(persistent) != 0) {
+        (void)ve_tls_lease_guard_unlock(persistent->lease_fd);
+        persistent_heartbeat_unlock(persistent);
+        return -1;
+    }
+    *fd = persistent->lease_fd;
+    return 0;
+}
+
+static void persistent_guard_leave(ve_tls_persistent * persistent, int fd) {
+    if (!persistent || persistent->exclusive_lifetime_lock != 1) {
+        (void)ve_tls_lease_guard_unlock(fd);
+    }
     persistent_heartbeat_unlock(persistent);
+}
+
+int ve_tls_persistent_heartbeat_if_due(ve_tls_persistent * persistent, int force) {
+    int guard_fd = -1;
+    int rc;
+    if (persistent_guard_enter(persistent, &guard_fd) != 0) {
+        int32_t current_pid = 0;
+        if (persistent && persistent->platform &&
+            persistent_get_pid(&current_pid) == 0 &&
+            current_pid == persistent->creator_pid) {
+            persistent_schedule_heartbeat_retry(persistent, persistent_now_ms(persistent));
+        }
+        return -1;
+    }
+    rc = ve_tls_persistent_heartbeat_if_due_locked(persistent, force);
+    persistent_guard_leave(persistent, guard_fd);
     return rc;
 }
 
@@ -940,15 +960,21 @@ static int ensure_capacity_for_append(ve_tls_persistent * persistent, int64_t lo
     return VE_TLS_PERSISTENT_APPEND_REJECT_NEW;
 }
 
+static int persistent_flush_locked(ve_tls_persistent * persistent);
+static void persistent_close_locked(ve_tls_persistent * persistent, int lease_locked);
+static void persistent_reset(ve_tls_persistent * persistent);
+
 int ve_tls_persistent_open(ve_tls_persistent * persistent, const ve_tls_persistent_options * options) {
     ve_tls_path_info info;
     ve_tls_lease_options lease_options;
     ve_tls_segment_store_options store_options;
+    int guard_fd = -1;
     int32_t high_watermark_pct;
     int32_t low_watermark_pct;
     if (!persistent || !options || !options->platform || !options->platform->time_ms ||
         !options->dir_path || options->dir_path[0] == 0 || options->now_ms <= 0 ||
-        options->heartbeat_interval_ms <= 0 || options->lease_timeout_ms <= 0) {
+        options->heartbeat_interval_ms <= 0 || options->lease_timeout_ms <= 0 ||
+        (options->exclusive_lifetime_lock != 0 && options->exclusive_lifetime_lock != 1)) {
         return -1;
     }
     high_watermark_pct = options->high_watermark_pct;
@@ -965,6 +991,10 @@ int ve_tls_persistent_open(ve_tls_persistent * persistent, const ve_tls_persiste
     }
     VE_TLS_ALLOC_SITE("persistent_open");
     memset(persistent, 0, sizeof(*persistent));
+    persistent->lease_fd = -1;
+    if (persistent_get_pid(&persistent->creator_pid) != 0) {
+        return -1;
+    }
     if (strlen(options->dir_path) >= sizeof(persistent->dir_path)) {
         return -1;
     }
@@ -984,6 +1014,7 @@ int ve_tls_persistent_open(ve_tls_persistent * persistent, const ve_tls_persiste
     persistent->lease_timeout_ms = options->lease_timeout_ms;
     persistent->heartbeat_interval_ms = options->heartbeat_interval_ms;
     persistent->open_mode = options->open_mode;
+    persistent->exclusive_lifetime_lock = options->exclusive_lifetime_lock;
     persistent->durability = options->durability == VE_TLS_PDURABILITY_DEFAULT
         ? VE_TLS_PDURABILITY_BUFFERED_WAL
         : options->durability;
@@ -994,30 +1025,19 @@ int ve_tls_persistent_open(ve_tls_persistent * persistent, const ve_tls_persiste
     if (persistent->platform->path_mkdirs(persistent->dir_path, 0700) != 0) {
         return -1;
     }
-    if (ensure_manifest(options) != 0) {
-        ve_tls_persistent_close(persistent);
-        return -1;
-    }
     if (path_join(persistent->checkpoint_path, sizeof(persistent->checkpoint_path), persistent->dir_path, "checkpoint") != 0 ||
         path_join(persistent->lease_path, sizeof(persistent->lease_path), persistent->dir_path, "lease") != 0) {
-        ve_tls_persistent_close(persistent);
-        return -1;
+        goto fail;
     }
-    if (persistent->platform->path_stat(persistent->checkpoint_path, &info) != 0) {
-        ve_tls_persistent_close(persistent);
-        return -1;
+    if (ve_tls_lease_guard_enter(persistent->lease_path, 0, &guard_fd) != 0) {
+        goto fail;
     }
-    if (!info.exists) {
-        if (ve_tls_checkpoint_save(persistent->platform, persistent->checkpoint_path, &persistent->checkpoint) != 0) {
-            ve_tls_persistent_close(persistent);
-            return -1;
-        }
-    } else if (ve_tls_checkpoint_load(persistent->platform, persistent->checkpoint_path, &persistent->checkpoint) != 0) {
-        memset(&persistent->checkpoint, 0, sizeof(persistent->checkpoint));
-        if (ve_tls_checkpoint_save(persistent->platform, persistent->checkpoint_path, &persistent->checkpoint) != 0) {
-            ve_tls_persistent_close(persistent);
-            return -1;
-        }
+    persistent->lease_fd = guard_fd;
+    guard_fd = -1;
+    /* Reject unsupported metadata without writing; only the acquired owner may
+       create/migrate the manifest or repair the checkpoint. */
+    if (ensure_manifest(options, 0) != 0) {
+        goto fail;
     }
     memset(&lease_options, 0, sizeof(lease_options));
     lease_options.platform = persistent->platform;
@@ -1028,9 +1048,24 @@ int ve_tls_persistent_open(ve_tls_persistent * persistent, const ve_tls_persiste
     lease_options.now_ms = options->now_ms;
     lease_options.lease_timeout_ms = options->lease_timeout_ms;
     lease_options.mode = options->open_mode;
-    if (ve_tls_lease_acquire(&lease_options, &persistent->lease) != 0) {
-        ve_tls_persistent_close(persistent);
-        return -1;
+    if (ve_tls_lease_acquire_locked(&lease_options, &persistent->lease) != 0) {
+        goto fail;
+    }
+    if (ensure_manifest(options, 1) != 0) {
+        goto fail;
+    }
+    if (persistent->platform->path_stat(persistent->checkpoint_path, &info) != 0) {
+        goto fail;
+    }
+    if (!info.exists) {
+        if (ve_tls_checkpoint_save(persistent->platform, persistent->checkpoint_path, &persistent->checkpoint) != 0) {
+            goto fail;
+        }
+    } else if (ve_tls_checkpoint_load(persistent->platform, persistent->checkpoint_path, &persistent->checkpoint) != 0) {
+        memset(&persistent->checkpoint, 0, sizeof(persistent->checkpoint));
+        if (ve_tls_checkpoint_save(persistent->platform, persistent->checkpoint_path, &persistent->checkpoint) != 0) {
+            goto fail;
+        }
     }
     memset(&store_options, 0, sizeof(store_options));
     store_options.platform = persistent->platform;
@@ -1042,12 +1077,10 @@ int ve_tls_persistent_open(ve_tls_persistent * persistent, const ve_tls_persiste
         : 0;
     store_options.sync_on_append = persistent->durability == VE_TLS_PDURABILITY_SYNC_WAL ? 1 : 0;
     if (ve_tls_segment_store_open(&persistent->store, &store_options) != 0) {
-        ve_tls_persistent_close(persistent);
-        return -1;
+        goto fail;
     }
     if (refresh_usage(persistent) != 0) {
-        ve_tls_persistent_close(persistent);
-        return -1;
+        goto fail;
     }
     persistent->durable_checkpoint_acked_log_id = persistent->checkpoint.acked_log_id;
     persistent->last_checkpoint_save_ms = options->now_ms > 0 ? options->now_ms : persistent_now_ms(persistent);
@@ -1058,18 +1091,15 @@ int ve_tls_persistent_open(ve_tls_persistent * persistent, const ve_tls_persiste
     persistent->reclaim_pending = persistent->durable_checkpoint_acked_log_id > 0 ? 1 : 0;
     advance_reclaim_cursor(persistent);
     if (persistent->reclaim_pending && reclaim_acked_segments(persistent, 1) != 0) {
-        ve_tls_persistent_close(persistent);
-        return -1;
+        goto fail;
     }
     if (!persistent->platform->mutex_create || !persistent->platform->mutex_destroy ||
         !persistent->platform->mutex_lock || !persistent->platform->mutex_unlock) {
-        ve_tls_persistent_close(persistent);
-        return -1;
+        goto fail;
     }
     persistent->heartbeat_mutex = persistent->platform->mutex_create();
     if (!persistent->heartbeat_mutex) {
-        ve_tls_persistent_close(persistent);
-        return -1;
+        goto fail;
     }
     atomic_store_explicit(
         &persistent->next_heartbeat_ms,
@@ -1078,35 +1108,98 @@ int ve_tls_persistent_open(ve_tls_persistent * persistent, const ve_tls_persiste
             : options->now_ms,
         memory_order_relaxed);
     persistent_publish_lease_window(persistent, persistent->lease.last_heartbeat_ms);
+    if (persistent->exclusive_lifetime_lock == 0) {
+        (void)ve_tls_lease_guard_unlock(persistent->lease_fd);
+    }
     return 0;
+
+fail:
+    persistent_close_locked(persistent, persistent->lease_fd >= 0 || guard_fd >= 0);
+    if (guard_fd >= 0) {
+        ve_tls_lease_guard_leave(guard_fd);
+    }
+    persistent_reset(persistent);
+    return -1;
 }
 
-void ve_tls_persistent_close(ve_tls_persistent * persistent) {
+/* Close normally holds the instance mutex. The open-failure path has no
+   published mutex or users yet, but still holds the retained lease.lock while
+   validating, flushing, and removing. Exclusive instances already hold the
+   lifetime lock; default instances reacquire it for close. A stale instance
+   must close descriptors without flushing or removing data. */
+static void persistent_close_locked(ve_tls_persistent * persistent, int lease_locked) {
+    ve_tls_platform * platform = persistent->platform;
+    int owned = lease_locked && persistent->lease_fd >= 0 &&
+        persistent->lease.fencing_token != 0 &&
+        validate_current_lease_locked(persistent) == 0;
+    if (owned) {
+        (void)persistent_flush_locked(persistent);
+        ve_tls_segment_store_close(&persistent->store);
+        (void)ve_tls_lease_release_owned_locked(
+            platform, persistent->lease_path, &persistent->lease);
+    } else if (persistent->store.active_file) {
+        platform->file_close(persistent->store.active_file);
+        persistent->store.active_file = NULL;
+    }
+    ve_tls_free(persistent->segment_meta);
+    persistent->segment_meta = NULL;
+    ve_tls_free(persistent->append_buf);
+    persistent->append_buf = NULL;
+    if (persistent->lease_fd >= 0) {
+        if (lease_locked) {
+            (void)ve_tls_lease_guard_unlock(persistent->lease_fd);
+        }
+        ve_tls_lease_guard_close(persistent->lease_fd);
+        persistent->lease_fd = -1;
+    }
+}
+
+static void persistent_reset(ve_tls_persistent * persistent) {
     ve_tls_platform * platform;
     ve_tls_mutex * heartbeat_mutex;
-    if (!persistent || !persistent->platform) {
+    if (!persistent) {
         return;
     }
     platform = persistent->platform;
     heartbeat_mutex = persistent->heartbeat_mutex;
-    (void)ve_tls_persistent_flush(persistent);
-    ve_tls_segment_store_close(&persistent->store);
-    ve_tls_free(persistent->segment_meta);
-    persistent->segment_meta = NULL;
-    persistent->segment_meta_cap = 0;
-    ve_tls_free(persistent->append_buf);
-    persistent->append_buf = NULL;
-    persistent->append_buf_cap = 0;
-    if (persistent->lease_path[0] != 0 && validate_current_lease(persistent) == 0) {
-        (void)ve_tls_lease_release(persistent->platform, persistent->lease_path);
-    }
-    if (heartbeat_mutex && platform->mutex_destroy) {
+    if (heartbeat_mutex && platform && platform->mutex_destroy) {
         platform->mutex_destroy(heartbeat_mutex);
     }
     memset(persistent, 0, sizeof(*persistent));
+    persistent->lease_fd = -1;
 }
 
-int ve_tls_persistent_flush(ve_tls_persistent * persistent) {
+void ve_tls_persistent_close(ve_tls_persistent * persistent) {
+    int lease_locked = 0;
+    if (!persistent) {
+        return;
+    }
+    if (!persistent->platform) {
+        return;
+    }
+    if (!persistent_is_creator_process(persistent)) {
+        /* A fork child must never touch the inherited mutex or lease lock.
+           Closing its duplicate descriptor leaves the parent's lock and
+           instance untouched; fork users must create a new producer. */
+        if (persistent->creator_pid > 0 && persistent->lease_fd >= 0) {
+            ve_tls_lease_guard_close(persistent->lease_fd);
+            persistent->lease_fd = -1;
+        }
+        return;
+    }
+    persistent_heartbeat_lock(persistent);
+    if (persistent->exclusive_lifetime_lock == 1) {
+        lease_locked = persistent->lease_fd >= 0;
+    } else if (persistent->lease_fd >= 0 &&
+               ve_tls_lease_guard_lock(persistent->lease_fd, 1) == 0) {
+        lease_locked = 1;
+    }
+    persistent_close_locked(persistent, lease_locked);
+    persistent_heartbeat_unlock(persistent);
+    persistent_reset(persistent);
+}
+
+static int persistent_flush_locked(ve_tls_persistent * persistent) {
     if (!persistent || !persistent->platform) {
         return -1;
     }
@@ -1126,7 +1219,18 @@ int ve_tls_persistent_flush(ve_tls_persistent * persistent) {
     return 0;
 }
 
-int ve_tls_persistent_append(ve_tls_persistent * persistent, int64_t log_id, const char * hash_key, const unsigned char * payload, size_t payload_size) {
+int ve_tls_persistent_flush(ve_tls_persistent * persistent) {
+    int guard_fd = -1;
+    int rc;
+    if (persistent_guard_enter(persistent, &guard_fd) != 0) {
+        return -1;
+    }
+    rc = persistent_flush_locked(persistent);
+    persistent_guard_leave(persistent, guard_fd);
+    return rc;
+}
+
+static int persistent_append_locked(ve_tls_persistent * persistent, int64_t log_id, const char * hash_key, const unsigned char * payload, size_t payload_size) {
     ve_tls_persistent_record_view view;
     ve_tls_segment_record_ref ref;
     unsigned char stack_buf[512];
@@ -1218,6 +1322,51 @@ int ve_tls_persistent_append(ve_tls_persistent * persistent, int64_t log_id, con
     return rc;
 }
 
+int ve_tls_persistent_append(ve_tls_persistent * persistent, int64_t log_id, const char * hash_key, const unsigned char * payload, size_t payload_size) {
+    int guard_fd = -1;
+    int rc;
+    if (persistent_guard_enter(persistent, &guard_fd) != 0) {
+        return -1;
+    }
+    rc = persistent_append_locked(persistent, log_id, hash_key, payload, payload_size);
+    persistent_guard_leave(persistent, guard_fd);
+    return rc;
+}
+
+/* Read/decode and any tail repair share the owner's guard. The decoded record
+   owns its memory and may be delivered after releasing the guard. */
+static int persistent_recover_next_locked(
+    ve_tls_persistent * persistent,
+    uint32_t segment_id,
+    ve_tls_segment_reader * reader,
+    ve_tls_persistent_record * record
+) {
+    unsigned char * record_buf = NULL;
+    size_t record_size = 0;
+    int read_rc = ve_tls_segment_store_reader_next(
+        &persistent->store, reader, &record_buf, &record_size);
+    int decode_rc = 0;
+    if (read_rc == 0) {
+        return 0;
+    }
+    if (read_rc == 1) {
+        decode_rc = ve_tls_persistent_record_decode(record_buf, record_size, record);
+        ve_tls_segment_store_read_free(record_buf);
+        if (decode_rc == 0) {
+            return 1;
+        }
+        if (decode_rc == VE_TLS_PERSISTENT_RECORD_UNSUPPORTED_VERSION) {
+            return -1;
+        }
+    }
+    ve_tls_segment_store_reader_close(&persistent->store, reader);
+    if (ve_tls_segment_store_repair_tail(&persistent->store, segment_id, NULL) != 0 ||
+        refresh_segment_meta(persistent, segment_id) != 0 || refresh_usage(persistent) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
 int ve_tls_persistent_recover(
     ve_tls_persistent * persistent,
     int (*on_record)(
@@ -1231,92 +1380,77 @@ int ve_tls_persistent_recover(
     void * user
 ) {
     uint32_t last_segment;
-    if (!persistent || !persistent->platform || !on_record) {
+    int guard_fd = -1;
+    if (!on_record || persistent_guard_enter(persistent, &guard_fd) != 0) {
         return -1;
     }
     if (persistent_heartbeat_and_validate_if_needed(persistent, 1) != 0) {
+        persistent_guard_leave(persistent, guard_fd);
         return -1;
     }
     last_segment = persistent->store.active_segment_id;
+    persistent_guard_leave(persistent, guard_fd);
     for (uint32_t segment_id = 1; segment_id <= last_segment; segment_id++) {
         char path[640];
         ve_tls_path_info info;
         ve_tls_segment_reader reader;
+        int open_rc = 0;
         memset(&reader, 0, sizeof(reader));
-        if (ve_tls_segment_store_get_segment_path(&persistent->store, segment_id, path, sizeof(path)) != 0) {
+        if (persistent_guard_enter(persistent, &guard_fd) != 0) {
             return -1;
         }
-        if (persistent->platform->path_stat(path, &info) != 0) {
+        if (ve_tls_segment_store_get_segment_path(&persistent->store, segment_id, path, sizeof(path)) != 0 ||
+            persistent->platform->path_stat(path, &info) != 0) {
+            open_rc = -1;
+        } else if (info.exists &&
+            (persistent_heartbeat_and_validate_if_needed(persistent, 0) != 0 ||
+             ve_tls_segment_store_reader_open(&persistent->store, segment_id, info.size, &reader) != 0)) {
+            open_rc = -1;
+        }
+        persistent_guard_leave(persistent, guard_fd);
+        if (open_rc != 0) {
             return -1;
         }
         if (!info.exists) {
             continue;
         }
-        if (persistent_heartbeat_and_validate_if_needed(persistent, 0) != 0) {
-            return -1;
-        }
-        if (ve_tls_segment_store_reader_open(&persistent->store, segment_id, info.size, &reader) != 0) {
-            return -1;
-        }
         while (1) {
-            unsigned char * record_buf = NULL;
-            size_t record_size = 0;
             ve_tls_persistent_record record;
             int read_rc;
-            int decode_rc;
+            int deliver;
             memset(&record, 0, sizeof(record));
-            read_rc = ve_tls_segment_store_reader_next(&persistent->store, &reader, &record_buf, &record_size);
-            if (read_rc == 0) {
-                break;
+            if (persistent_guard_enter(persistent, &guard_fd) != 0) {
+                ve_tls_segment_store_reader_close(&persistent->store, &reader);
+                return -1;
             }
+            read_rc = persistent_recover_next_locked(persistent, segment_id, &reader, &record);
+            deliver = read_rc == 1 && record.log_id > persistent->checkpoint.acked_log_id;
+            persistent_guard_leave(persistent, guard_fd);
             if (read_rc != 1) {
+                ve_tls_persistent_record_free(&record);
                 ve_tls_segment_store_reader_close(&persistent->store, &reader);
-                if (ve_tls_segment_store_repair_tail(&persistent->store, segment_id, NULL) != 0) {
-                    return -1;
-                }
-                if (refresh_segment_meta(persistent, segment_id) != 0 || refresh_usage(persistent) != 0) {
+                if (read_rc < 0) {
                     return -1;
                 }
                 break;
             }
-            decode_rc = ve_tls_persistent_record_decode(record_buf, record_size, &record);
-            if (decode_rc != 0) {
-                ve_tls_segment_store_read_free(record_buf);
+            /* The callback may enqueue, ACK or flush. Never hold the operation
+               guard or heartbeat_mutex while invoking it. Default mode releases
+               its operation flock here; exclusive mode retains its lifetime
+               ownership lock. Revalidate before the next I/O. */
+            if (deliver && on_record(record.log_id, record.enqueue_time_ms,
+                    record.hash_key, record.payload, record.payload_size, user) != 0) {
+                ve_tls_persistent_record_free(&record);
                 ve_tls_segment_store_reader_close(&persistent->store, &reader);
-                if (decode_rc == VE_TLS_PERSISTENT_RECORD_UNSUPPORTED_VERSION) {
-                    return -1;
-                }
-                if (ve_tls_segment_store_repair_tail(&persistent->store, segment_id, NULL) != 0) {
-                    return -1;
-                }
-                if (refresh_segment_meta(persistent, segment_id) != 0 || refresh_usage(persistent) != 0) {
-                    return -1;
-                }
-                break;
-            }
-            ve_tls_segment_store_read_free(record_buf);
-            record_buf = NULL;
-            if (record.log_id > persistent->checkpoint.acked_log_id) {
-                if (on_record(
-                        record.log_id,
-                        record.enqueue_time_ms,
-                        record.hash_key,
-                        record.payload,
-                        record.payload_size,
-                        user) != 0) {
-                    ve_tls_persistent_record_free(&record);
-                    ve_tls_segment_store_reader_close(&persistent->store, &reader);
-                    return -1;
-                }
+                return -1;
             }
             ve_tls_persistent_record_free(&record);
         }
-        ve_tls_segment_store_reader_close(&persistent->store, &reader);
     }
     return 0;
 }
 
-int ve_tls_persistent_ack_range(ve_tls_persistent * persistent, int64_t start_id, int64_t end_id) {
+static int persistent_ack_range_locked(ve_tls_persistent * persistent, int64_t start_id, int64_t end_id) {
     if (!persistent || !persistent->platform || start_id <= 0 || end_id <= 0 || end_id < start_id) {
         return -1;
     }
@@ -1336,4 +1470,15 @@ int ve_tls_persistent_ack_range(ve_tls_persistent * persistent, int64_t start_id
         return -1;
     }
     return 0;
+}
+
+int ve_tls_persistent_ack_range(ve_tls_persistent * persistent, int64_t start_id, int64_t end_id) {
+    int guard_fd = -1;
+    int rc;
+    if (persistent_guard_enter(persistent, &guard_fd) != 0) {
+        return -1;
+    }
+    rc = persistent_ack_range_locked(persistent, start_id, end_id);
+    persistent_guard_leave(persistent, guard_fd);
+    return rc;
 }

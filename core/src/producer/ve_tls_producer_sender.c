@@ -153,8 +153,35 @@ static void ve_tls_breaker_release_half_open_guard(ve_tls_producer * producer) {
     producer->config.platform.mutex_unlock(producer->mutex);
 }
 
-static int ve_tls_is_retryable_http(int32_t code) {
+static int ve_tls_is_retryable_http_default(int32_t code) {
     return code == 429 || code == 500 || code == 502 || code == 503 || code == 504;
+}
+
+static int ve_tls_is_retryable_transient_http_error_code(const char * error_code) {
+    if (!error_code) {
+        return 0;
+    }
+    return strcmp(error_code, "ClientCanceled") == 0 ||
+        strcmp(error_code, "Timeout") == 0 ||
+        strcmp(error_code, "RequestTimeout") == 0 ||
+        strcmp(error_code, "ConnectionClosed") == 0;
+}
+
+static int ve_tls_is_retryable_http(
+    const ve_tls_producer * producer,
+    int32_t code,
+    const char * error_code
+) {
+    if (ve_tls_is_retryable_http_default(code)) {
+        return 1;
+    }
+    if (!producer || !producer->config.retry_transient_http_errors) {
+        return 0;
+    }
+    if (code == 408 || code == 499) {
+        return 1;
+    }
+    return code == 400 && ve_tls_is_retryable_transient_http_error_code(error_code);
 }
 
 static int ve_tls_is_authentication_error_code(const char * error_code) {
@@ -457,12 +484,16 @@ static void ve_tls_error_set_client(ve_tls_error * out, const char * msg) {
     out->error_message = msg ? ve_tls_strdup(msg) : NULL;
 }
 
-static void ve_tls_error_set_http(ve_tls_error * out, int32_t http_code) {
+static void ve_tls_error_set_http(
+    const ve_tls_producer * producer,
+    ve_tls_error * out,
+    int32_t http_code
+) {
     if (!out) {
         return;
     }
     out->http_code = http_code;
-    out->retryable = ve_tls_is_retryable_http(http_code) ? 1 : 0;
+    out->retryable = ve_tls_is_retryable_http(producer, http_code, NULL) ? 1 : 0;
 }
 
 static void ve_tls_error_parse_body_fields(ve_tls_error * out, const unsigned char * body, size_t body_size) {
@@ -526,6 +557,7 @@ typedef struct {
     char * access_key_id;
     char * access_key_secret;
     char * security_token;
+    char * api_key;
 } ve_tls_owned_credentials;
 
 typedef struct {
@@ -545,6 +577,7 @@ static void ve_tls_owned_credentials_free(ve_tls_owned_credentials * owned) {
     ve_tls_secure_free_str(&owned->access_key_id);
     ve_tls_secure_free_str(&owned->access_key_secret);
     ve_tls_secure_free_str(&owned->security_token);
+    ve_tls_secure_free_str(&owned->api_key);
     memset(owned, 0, sizeof(*owned));
 }
 
@@ -744,6 +777,19 @@ static int ve_tls_get_signing_credentials(
     *out_static_cred_version = 0;
     memset(owned, 0, sizeof(*owned));
 
+    producer->config.platform.mutex_lock(producer->mutex);
+    if (producer->cfg_api_key && producer->cfg_api_key[0] != 0) {
+        owned->api_key = ve_tls_strdup(producer->cfg_api_key);
+        *out_static_cred_version = __atomic_load_n(&producer->static_cred_version, __ATOMIC_ACQUIRE);
+        producer->config.platform.mutex_unlock(producer->mutex);
+        if (!owned->api_key) {
+            ve_tls_owned_credentials_free(owned);
+            return -1;
+        }
+        return 0;
+    }
+    producer->config.platform.mutex_unlock(producer->mutex);
+
     if (!producer->config.credentials_provider) {
         int64_t version = __atomic_load_n(&producer->static_cred_version, __ATOMIC_ACQUIRE);
         *out_static_cred_version = version;
@@ -771,6 +817,7 @@ static int ve_tls_is_sensitive_header_key(const char * key, size_t n) {
     if (n == strlen("x-security-token") && strncasecmp(key, "x-security-token", n) == 0) return 1;
     if (n == strlen("x-date") && strncasecmp(key, "x-date", n) == 0) return 1;
     if (n == strlen("x-content-sha256") && strncasecmp(key, "x-content-sha256", n) == 0) return 1;
+    if (n == strlen("x-tls-anonymous-identity") && strncasecmp(key, "x-tls-anonymous-identity", n) == 0) return 1;
     return 0;
 }
 
@@ -997,6 +1044,144 @@ static ve_tls_send_callbacks ve_tls_capture_callbacks(ve_tls_producer * producer
     return out;
 }
 
+void ve_tls_diagnostic_emit(
+    ve_tls_producer * producer,
+    const ve_tls_delivery_diagnostic * diagnostic
+) {
+    if (!producer || !diagnostic) {
+        return;
+    }
+    ve_tls_delivery_diagnostic_fn callback = producer->delivery_diagnostic;
+    if (callback) {
+        callback(diagnostic, producer->delivery_diagnostic_param);
+    }
+}
+
+static void ve_tls_sender_emit_diagnostic(
+    ve_tls_producer * producer,
+    ve_tls_delivery_diagnostic_event_type event_type,
+    ve_tls_delivery_diagnostic_reason reason,
+    const ve_tls_send_task * task,
+    const ve_tls_error * error,
+    size_t raw_bytes,
+    size_t compressed_bytes,
+    int64_t elapsed_ms,
+    int64_t delay_ms
+) {
+    if (!producer || !task) {
+        return;
+    }
+    ve_tls_delivery_diagnostic_fn callback = producer->delivery_diagnostic;
+    void * callback_param = producer->delivery_diagnostic_param;
+    if (!callback) {
+        return;
+    }
+    if (elapsed_ms < 0) {
+        int64_t now_ms = producer->config.platform.time_ms
+            ? producer->config.platform.time_ms()
+            : task->delivery_start_ms;
+        elapsed_ms = task->delivery_started && now_ms >= task->delivery_start_ms
+            ? now_ms - task->delivery_start_ms
+            : 0;
+    }
+    ve_tls_delivery_diagnostic diagnostic;
+    memset(&diagnostic, 0, sizeof(diagnostic));
+    diagnostic.event = event_type;
+    diagnostic.reason = reason;
+    diagnostic.start_id = task->start_id;
+    diagnostic.end_id = task->end_id;
+    diagnostic.attempt_count = task->delivery_attempt_count;
+    diagnostic.cycle_attempt_count = task->delivery_cycle_attempt_count;
+    diagnostic.elapsed_ms = elapsed_ms;
+    diagnostic.delay_ms = delay_ms;
+    diagnostic.log_count = task->log_count;
+    diagnostic.raw_bytes = raw_bytes > 0 ? raw_bytes : task->raw_body_size;
+    diagnostic.compressed_bytes = compressed_bytes > 0 ? compressed_bytes : task->body_size;
+    diagnostic.attempt_id = task->diagnostic_attempt_id;
+    diagnostic.attempt_elapsed_ms = -1;
+    diagnostic.queue_wait_ms = task->diagnostic_queue_wait_ms;
+    if (diagnostic.attempt_id == 0 && diagnostic.queue_wait_ms == 0) {
+        diagnostic.queue_wait_ms = -1;
+    }
+    diagnostic.disposition = VE_TLS_DELIVERY_DIAGNOSTIC_DISPOSITION_UNKNOWN;
+    diagnostic.metadata_version = VE_TLS_DELIVERY_DIAGNOSTIC_METADATA_VERSION_1;
+    diagnostic.metadata_size = (uint32_t)sizeof(diagnostic);
+    if (task->diagnostic_attempt_id > 0 && task->diagnostic_attempt_elapsed_ms >= 0) {
+        diagnostic.attempt_elapsed_ms = task->diagnostic_attempt_elapsed_ms;
+    }
+    if (event_type == VE_TLS_DELIVERY_DIAGNOSTIC_BATCH_RETAINED) {
+        diagnostic.disposition = producer->persistent
+            ? VE_TLS_DELIVERY_DIAGNOSTIC_DISPOSITION_RETAINED_WAL
+            : VE_TLS_DELIVERY_DIAGNOSTIC_DISPOSITION_RETAINED_MEMORY;
+    } else if (event_type == VE_TLS_DELIVERY_DIAGNOSTIC_BATCH_TERMINAL) {
+        if (reason == VE_TLS_DELIVERY_DIAGNOSTIC_REASON_SUCCESS) {
+            diagnostic.disposition = VE_TLS_DELIVERY_DIAGNOSTIC_DISPOSITION_SUCCESS;
+        } else if (!producer->persistent) {
+            /* This path releases a memory-only task after the callback. */
+            diagnostic.disposition = VE_TLS_DELIVERY_DIAGNOSTIC_DISPOSITION_DISCARD;
+        }
+    }
+    if (error) {
+        diagnostic.http_code = error->http_code;
+        diagnostic.transport_code = error->transport_code;
+        diagnostic.retryable = error->retryable;
+        diagnostic.request_id = error->request_id;
+        diagnostic.error_code = error->error_code;
+    }
+    (void)callback_param;
+    ve_tls_diagnostic_emit(producer, &diagnostic);
+}
+
+static void ve_tls_sender_set_synthetic_error(
+    ve_tls_error * error,
+    const char * error_code,
+    const char * error_message,
+    int32_t retryable
+) {
+    if (!error) {
+        return;
+    }
+    ve_tls_error_free_fields(error);
+    memset(error, 0, sizeof(*error));
+    error->http_code = -1;
+    error->transport_kind = VE_TLS_TRANSPORT_GENERIC;
+    error->transport_code = 0;
+    error->retryable = retryable;
+    error->error_code = error_code ? ve_tls_strdup(error_code) : NULL;
+    error->error_message = error_message ? ve_tls_strdup(error_message) : NULL;
+}
+
+enum {
+    VE_TLS_SEND_PUT_LOGS_RC_RETRY_BUDGET = -3,
+    VE_TLS_SEND_PUT_LOGS_RC_RETENTION_EXPIRED = -4
+};
+
+static int64_t ve_tls_sender_deadline_from_duration(
+    int64_t start_ms,
+    int64_t duration_ms
+) {
+    if (duration_ms <= 0) {
+        return 0;
+    }
+    if (start_ms > INT64_MAX - duration_ms) {
+        return INT64_MAX;
+    }
+    return start_ms + duration_ms;
+}
+
+static int64_t ve_tls_sender_deadline_remaining(
+    int64_t deadline_ms,
+    int64_t now_ms
+) {
+    if (deadline_ms <= 0 || now_ms >= deadline_ms) {
+        return 0;
+    }
+    if (now_ms < 0 && deadline_ms > INT64_MAX + now_ms) {
+        return INT64_MAX;
+    }
+    return deadline_ms - now_ms;
+}
+
 /* The popped task stays owned by the sender until push_front succeeds. A
  * concurrent enqueue can fill its former slot and force a failing allocation.
  * Persistent tasks remain unacknowledged for recovery; memory-only tasks get
@@ -1117,6 +1302,136 @@ static void ve_tls_report_send_failure(
     ve_tls_free(msg);
 }
 
+static void ve_tls_report_send_closed(
+    ve_tls_producer * producer,
+    const ve_tls_send_task * task,
+    const ve_tls_error * error,
+    size_t send_body_size
+) {
+    if (!producer || !task || !error) {
+        return;
+    }
+    ve_tls_send_callbacks cbs = ve_tls_capture_callbacks(producer);
+    char * msg = ve_tls_error_build_message(error);
+    if (cbs.cb) {
+        cbs.cb(
+            VE_TLS_CLOSED,
+            task->batch_bytes,
+            send_body_size,
+            error->request_id,
+            msg,
+            NULL,
+            cbs.cb_param,
+            task->start_id,
+            task->end_id);
+    }
+    if (cbs.cb2) {
+        cbs.cb2(
+            VE_TLS_CLOSED,
+            task->batch_bytes,
+            send_body_size,
+            error,
+            NULL,
+            cbs.cb2_param,
+            task->start_id,
+            task->end_id);
+    }
+    ve_tls_free(msg);
+}
+
+static void ve_tls_sender_report_memory_terminal(
+    ve_tls_producer * producer,
+    const ve_tls_send_task * task,
+    ve_tls_delivery_diagnostic_reason reason,
+    size_t send_body_size
+) {
+    if (!producer || !task) {
+        return;
+    }
+    ve_tls_error error;
+    memset(&error, 0, sizeof(error));
+    if (reason == VE_TLS_DELIVERY_DIAGNOSTIC_REASON_CLOSED) {
+        ve_tls_sender_set_synthetic_error(
+            &error, "ProducerClosed", "producer closed", 0);
+    } else {
+        ve_tls_sender_set_synthetic_error(
+            &error, "RetryRetentionExpired", "memory retry retention expired", 0);
+    }
+    int64_t elapsed_ms = -1;
+    if (task->delivery_started && producer->config.platform.time_ms) {
+        int64_t now_ms = producer->config.platform.time_ms();
+        elapsed_ms = now_ms >= task->delivery_start_ms
+            ? now_ms - task->delivery_start_ms
+            : 0;
+    }
+    ve_tls_sender_emit_diagnostic(
+        producer,
+        VE_TLS_DELIVERY_DIAGNOSTIC_BATCH_TERMINAL,
+        reason,
+        task,
+        &error,
+        task->raw_body_size,
+        send_body_size > 0 ? send_body_size : task->body_size,
+        elapsed_ms,
+        0);
+    if (reason == VE_TLS_DELIVERY_DIAGNOSTIC_REASON_CLOSED) {
+        ve_tls_report_send_closed(producer, task, &error, send_body_size);
+    } else {
+        ve_tls_report_send_failure(producer, task, &error, send_body_size, elapsed_ms >= 0 ? elapsed_ms : 0);
+    }
+    ve_tls_error_free_fields(&error);
+}
+
+static void ve_tls_sender_report_memory_requeue_failure(
+    ve_tls_producer * producer,
+    const ve_tls_send_task * task,
+    int closing,
+    size_t send_body_size,
+    int64_t total_ms
+) {
+    if (!producer || !task) {
+        return;
+    }
+    ve_tls_error error;
+    memset(&error, 0, sizeof(error));
+    /* These literals are borrowed deliberately: this path includes allocator
+     * exhaustion, so reporting must not require another allocation. */
+    error.http_code = -1;
+    error.transport_kind = VE_TLS_TRANSPORT_GENERIC;
+    error.transport_code = 0;
+    error.retryable = 0;
+    error.error_code = closing ? "ProducerClosed" : "OutOfMemory";
+    error.error_message = closing
+        ? "producer closed while retaining memory batch"
+        : "failed to retain memory batch";
+    int64_t elapsed_ms = total_ms >= 0 ? total_ms : 0;
+    if (task->delivery_started && producer->config.platform.time_ms) {
+        int64_t now_ms = producer->config.platform.time_ms();
+        elapsed_ms = now_ms >= task->delivery_start_ms
+            ? now_ms - task->delivery_start_ms
+            : 0;
+    }
+    ve_tls_delivery_diagnostic_reason reason = closing
+        ? VE_TLS_DELIVERY_DIAGNOSTIC_REASON_CLOSED
+        : VE_TLS_DELIVERY_DIAGNOSTIC_REASON_NON_RETRYABLE;
+    ve_tls_sender_emit_diagnostic(
+        producer,
+        VE_TLS_DELIVERY_DIAGNOSTIC_BATCH_TERMINAL,
+        reason,
+        task,
+        &error,
+        task->raw_body_size,
+        send_body_size > 0 ? send_body_size : task->body_size,
+        elapsed_ms,
+        0);
+    if (closing) {
+        ve_tls_report_send_closed(producer, task, &error, send_body_size);
+    } else {
+        ve_tls_report_send_failure(
+            producer, task, &error, send_body_size, elapsed_ms);
+    }
+}
+
 /* A retryable failure exhausts only the current bounded attempt budget for a
  * persistent batch. Keep the live task in the keyed queue, leave the WAL
  * unacknowledged, and schedule another cycle with jittered exponential
@@ -1177,11 +1492,24 @@ static int ve_tls_handle_persistent_retry_cycle_failure(
         ? INT64_MAX
         : now_ms + delay_ms;
 
+    ve_tls_send_task retained_snapshot = *task;
     producer->config.platform.mutex_lock(producer->mutex);
     if (producer->closing || producer->stop ||
         ve_tls_key_queue_push_front_task(kq, task) != 0) {
         int closing = producer->closing || producer->stop;
         producer->config.platform.mutex_unlock(producer->mutex);
+        ve_tls_sender_emit_diagnostic(
+            producer,
+            VE_TLS_DELIVERY_DIAGNOSTIC_BATCH_RETAINED,
+            closing
+                ? VE_TLS_DELIVERY_DIAGNOSTIC_REASON_CLOSED
+                : VE_TLS_DELIVERY_DIAGNOSTIC_REASON_NON_RETRYABLE,
+            &retained_snapshot,
+            error,
+            retained_snapshot.raw_body_size,
+            retained_snapshot.body_size,
+            -1,
+            0);
         ve_tls_metrics_emit(
             producer,
             closing
@@ -1201,9 +1529,138 @@ static int ve_tls_handle_persistent_retry_cycle_failure(
     producer->config.platform.mutex_unlock(producer->mutex);
     ve_tls_metrics_emit(
         producer, "persistent_retry_cycle_delayed", delay_ms, 0);
+    ve_tls_sender_emit_diagnostic(
+        producer,
+        VE_TLS_DELIVERY_DIAGNOSTIC_RETRY_SCHEDULED,
+        VE_TLS_DELIVERY_DIAGNOSTIC_REASON_NONE,
+        &retained_snapshot,
+        error,
+        retained_snapshot.raw_body_size,
+        retained_snapshot.body_size,
+        -1,
+        delay_ms);
+    ve_tls_sender_emit_diagnostic(
+        producer,
+        VE_TLS_DELIVERY_DIAGNOSTIC_BATCH_RETAINED,
+        VE_TLS_DELIVERY_DIAGNOSTIC_REASON_NONE,
+        &retained_snapshot,
+        error,
+        retained_snapshot.raw_body_size,
+        retained_snapshot.body_size,
+        -1,
+        delay_ms);
     if (producer->use_global_env) {
         ve_tls_env_notify(producer);
     }
+    return 1;
+}
+
+static int ve_tls_handle_memory_retry_cycle_failure(
+    ve_tls_producer * producer,
+    ve_tls_key_queue * kq,
+    ve_tls_send_task * task,
+    const ve_tls_error * error,
+    int64_t total_ms,
+    int entered_breaker,
+    int half_open_guard
+) {
+    if (!producer || !kq || !task || !error || producer->persistent ||
+        producer->config.memory_retry_retention_ms <= 0 || !error->retryable) {
+        return 0;
+    }
+
+    int64_t now_ms = producer->config.platform.time_ms
+        ? producer->config.platform.time_ms()
+        : 0;
+    if (!task->delivery_started) {
+        task->delivery_started = 1;
+        task->delivery_start_ms = now_ms;
+    }
+    if (task->memory_retry_deadline_ms <= 0) {
+        int64_t retention_ms = producer->config.memory_retry_retention_ms;
+        task->memory_retry_deadline_ms = task->delivery_start_ms > INT64_MAX - retention_ms
+            ? INT64_MAX
+            : task->delivery_start_ms + retention_ms;
+    }
+    if (now_ms >= task->memory_retry_deadline_ms) {
+        return 0;
+    }
+
+    if (task->memory_retry_cycle < VE_TLS_PERSISTENT_RETRY_CYCLE_EXPONENT_CAP) {
+        task->memory_retry_cycle++;
+    }
+    ve_tls_retry_policy cycle_policy = producer->config.retry_policy;
+    if (cycle_policy.initial_interval_ms <= 0) {
+        cycle_policy.initial_interval_ms = 1;
+    }
+    if (cycle_policy.max_interval_ms <= 0 ||
+        cycle_policy.max_interval_ms > VE_TLS_PERSISTENT_RETRY_CYCLE_MAX_DELAY_MS) {
+        cycle_policy.max_interval_ms = VE_TLS_PERSISTENT_RETRY_CYCLE_MAX_DELAY_MS;
+    }
+    int64_t delay_ms = ve_tls_retry_next_interval_ms(
+        &cycle_policy, task->memory_retry_cycle);
+    if (delay_ms < 1) {
+        delay_ms = 1;
+    }
+    int64_t remaining_ms = task->memory_retry_deadline_ms - now_ms;
+    if (delay_ms > remaining_ms) {
+        delay_ms = remaining_ms;
+    }
+    if (delay_ms < 1) {
+        return 0;
+    }
+    if (entered_breaker) {
+        if (half_open_guard) {
+            ve_tls_breaker_leave_half_open(producer, 0);
+        } else {
+            ve_tls_breaker_on_final_result(producer, 0);
+        }
+    }
+    ve_tls_key_breaker_on_final_result(producer, kq, 0);
+    int64_t next_ready_ms = now_ms > INT64_MAX - delay_ms
+        ? INT64_MAX
+        : now_ms + delay_ms;
+    task->memory_retry_retained = 1;
+    ve_tls_send_task retained_snapshot = *task;
+
+    producer->config.platform.mutex_lock(producer->mutex);
+    if (producer->closing || producer->stop) {
+        producer->config.platform.mutex_unlock(producer->mutex);
+        return -2;
+    }
+    if (ve_tls_key_queue_push_front_task(kq, task) != 0) {
+        producer->config.platform.mutex_unlock(producer->mutex);
+        return -1;
+    }
+    memset(task, 0, sizeof(*task));
+    kq->inflight = 0;
+    if (kq->breaker_open_until_ms > next_ready_ms) {
+        next_ready_ms = kq->breaker_open_until_ms;
+    }
+    ve_tls_delayed_add_sorted(producer, kq, next_ready_ms);
+    producer->config.platform.cond_broadcast(producer->send_cond);
+    producer->config.platform.mutex_unlock(producer->mutex);
+    ve_tls_metrics_emit(producer, "memory_retry_cycle_delayed", delay_ms, total_ms);
+    ve_tls_sender_emit_diagnostic(
+        producer,
+        VE_TLS_DELIVERY_DIAGNOSTIC_RETRY_SCHEDULED,
+        VE_TLS_DELIVERY_DIAGNOSTIC_REASON_NONE,
+        &retained_snapshot,
+        error,
+        retained_snapshot.raw_body_size,
+        retained_snapshot.body_size,
+        -1,
+        delay_ms);
+    ve_tls_sender_emit_diagnostic(
+        producer,
+        VE_TLS_DELIVERY_DIAGNOSTIC_BATCH_RETAINED,
+        VE_TLS_DELIVERY_DIAGNOSTIC_REASON_NONE,
+        &retained_snapshot,
+        error,
+        retained_snapshot.raw_body_size,
+        retained_snapshot.body_size,
+        -1,
+        delay_ms);
     return 1;
 }
 
@@ -1255,7 +1712,26 @@ static int ve_tls_sender_resolve_payload(ve_tls_producer * producer, const ve_tl
     return 0;
 }
 
-static int ve_tls_send_put_logs(ve_tls_producer * producer, const char * access_key_id, const char * access_key_secret, const char * security_token, const char * actual_compress_type, const unsigned char * body, size_t body_size, size_t raw_body_size, int32_t log_count, int64_t earliest, int64_t latest, const char * hash_key, ve_tls_error * out_error) {
+static int ve_tls_send_put_logs(
+    ve_tls_producer * producer,
+    const char * access_key_id,
+    const char * access_key_secret,
+    const char * security_token,
+    const char * api_key,
+    const char * actual_compress_type,
+    const unsigned char * body,
+    size_t body_size,
+    size_t raw_body_size,
+    int32_t log_count,
+    int64_t earliest,
+    int64_t latest,
+    const char * hash_key,
+    int64_t request_timeout_cap_ms,
+    int64_t retry_budget_deadline_ms,
+    int64_t retention_deadline_ms,
+    ve_tls_send_task * diagnostic_task,
+    ve_tls_error * out_error
+) {
     if (out_error) {
         ve_tls_error_free_fields(out_error);
     }
@@ -1324,32 +1800,62 @@ static int ve_tls_send_put_logs(ve_tls_producer * producer, const char * access_
 
     char * signed_headers = NULL;
     int signed_pooled = 0;
-    int sign_ok = ve_tls_sign_v4_append(
-        access_key_id,
-        access_key_secret,
-        security_token,
-        cfg->region ? cfg->region : "",
-        "TLS",
-        "POST",
-        cfg->host ? cfg->host : "",
-        "/PutLogs",
-        cfg->query ? cfg->query : "",
-        body,
-        body_size,
-        headers,
-        &signed_headers
-    );
-    if (sign_ok != 0) {
-        ve_tls_header_buf_release(producer, headers, headers_pooled);
-        ve_tls_error_set_client(out_error, "sign request failed");
-        return -1;
+    size_t signed_len = 0;
+    size_t signed_cap = 0;
+    int api_key_headers = api_key && api_key[0] != 0;
+    if (api_key_headers) {
+        signed_headers = headers;
+        signed_len = hlen;
+        signed_cap = hcap;
+        signed_pooled = headers_pooled;
+        headers = NULL;
+        hlen = 0;
+        hcap = 0;
+        headers_pooled = 0;
+    } else {
+        int sign_ok = ve_tls_sign_v4_append(
+            access_key_id,
+            access_key_secret,
+            security_token,
+            cfg->region ? cfg->region : "",
+            "TLS",
+            "POST",
+            cfg->host ? cfg->host : "",
+            "/PutLogs",
+            cfg->query ? cfg->query : "",
+            body,
+            body_size,
+            headers,
+            &signed_headers
+        );
+        if (sign_ok != 0) {
+            ve_tls_header_buf_release(producer, headers, headers_pooled);
+            ve_tls_error_set_client(out_error, "sign request failed");
+            return -1;
+        }
+        signed_len = signed_headers ? strlen(signed_headers) : 0;
+        signed_cap = signed_len + 1;
+        ve_tls_headers_try_use_pool(producer, &signed_headers, signed_len, &signed_cap, &signed_pooled);
     }
-    size_t signed_len = signed_headers ? strlen(signed_headers) : 0;
-    size_t signed_cap = signed_len + 1;
-    ve_tls_headers_try_use_pool(producer, &signed_headers, signed_len, &signed_cap, &signed_pooled);
     if (ve_tls_headers_append(producer, &signed_headers, &signed_len, &signed_cap, &signed_pooled, "log-count", count) != 0 ||
         ve_tls_headers_append(producer, &signed_headers, &signed_len, &signed_cap, &signed_pooled, "earliest-log-time", earliest_s) != 0 ||
         ve_tls_headers_append(producer, &signed_headers, &signed_len, &signed_cap, &signed_pooled, "latest-log-time", latest_s) != 0) {
+        ve_tls_header_buf_release(producer, headers, headers_pooled);
+        ve_tls_header_buf_release(producer, signed_headers, signed_pooled);
+        ve_tls_error_set_client(out_error, "build headers failed");
+        return -1;
+    }
+    if (api_key_headers && ve_tls_headers_append(
+            producer,
+            &signed_headers,
+            &signed_len,
+            &signed_cap,
+            &signed_pooled,
+            "x-tls-anonymous-identity",
+            api_key) != 0) {
+        /* The API key is appended last, so a failed allocation cannot have
+         * copied it into the request buffer. */
+        ve_tls_secure_zero(signed_headers, signed_len + 1);
         ve_tls_header_buf_release(producer, headers, headers_pooled);
         ve_tls_header_buf_release(producer, signed_headers, signed_pooled);
         ve_tls_error_set_client(out_error, "build headers failed");
@@ -1364,6 +1870,9 @@ static int ve_tls_send_put_logs(ve_tls_producer * producer, const char * access_
     req.body = body;
     req.body_size = body_size;
     req.timeout_ms = cfg->request_timeout_ms > 0 ? cfg->request_timeout_ms : 50000;
+    if (request_timeout_cap_ms > 0 && request_timeout_cap_ms < req.timeout_ms) {
+        req.timeout_ms = request_timeout_cap_ms;
+    }
     req.connect_timeout_ms = cfg->connect_timeout_ms > 0 ? cfg->connect_timeout_ms : 10000;
     req.tls_verify_peer = cfg->tls_verify_peer;
     req.tls_verify_host = cfg->tls_verify_host;
@@ -1373,15 +1882,98 @@ static int ve_tls_send_put_logs(ve_tls_producer * producer, const char * access_
     req.tcp_keepalive = cfg->tcp_keepalive;
     req.tcp_keepidle = cfg->tcp_keepidle;
     req.tcp_keepintvl = cfg->tcp_keepintvl;
-    req.debug_log = cfg->http_debug;
+    req.debug_log = api_key && api_key[0] != 0 ? 0 : cfg->http_debug;
     ve_tls_http_response resp;
     ve_tls_http_response_init(&resp);
     resp.transport_kind = VE_TLS_TRANSPORT_GENERIC;
     resp.transport_code = 0;
     resp.transport_retryable = 1;
 
+    /* Debug formatting is part of request preparation. Read the clock after
+     * it, immediately before the transport call, so signing/headers/debug
+     * time consumes the same absolute retry budget as the HTTP request. */
     ve_tls_http_debug_log_request(&req);
+    if (retention_deadline_ms > 0 || retry_budget_deadline_ms > 0) {
+        int64_t deadline_now = producer->config.platform.time_ms
+            ? producer->config.platform.time_ms()
+            : 0;
+        int64_t remaining_ms = ve_tls_sender_deadline_remaining(
+            retention_deadline_ms, deadline_now);
+        if (retention_deadline_ms > 0 && remaining_ms <= 0) {
+            ve_tls_sender_set_synthetic_error(
+                out_error,
+                "RetryRetentionExpired",
+                "memory retry retention expired",
+                0);
+            ve_tls_header_buf_release(producer, headers, headers_pooled);
+            ve_tls_header_buf_release(producer, signed_headers, signed_pooled);
+            return VE_TLS_SEND_PUT_LOGS_RC_RETENTION_EXPIRED;
+        }
+        if (remaining_ms > 0 &&
+            (request_timeout_cap_ms <= 0 || remaining_ms < request_timeout_cap_ms)) {
+            request_timeout_cap_ms = remaining_ms;
+        }
+        remaining_ms = ve_tls_sender_deadline_remaining(
+            retry_budget_deadline_ms, deadline_now);
+        if (retry_budget_deadline_ms > 0 && remaining_ms <= 0) {
+            ve_tls_sender_set_synthetic_error(
+                out_error,
+                "RetryBudgetExceeded",
+                "retry budget exhausted",
+                1);
+            ve_tls_header_buf_release(producer, headers, headers_pooled);
+            ve_tls_header_buf_release(producer, signed_headers, signed_pooled);
+            return VE_TLS_SEND_PUT_LOGS_RC_RETRY_BUDGET;
+        }
+        if (remaining_ms > 0 &&
+            (request_timeout_cap_ms <= 0 || remaining_ms < request_timeout_cap_ms)) {
+            request_timeout_cap_ms = remaining_ms;
+        }
+    }
+    if (request_timeout_cap_ms > 0 && request_timeout_cap_ms < req.timeout_ms) {
+        req.timeout_ms = request_timeout_cap_ms;
+    }
+
+    /* This is the only Core event that associates a diagnostic with an
+     * actual HTTP attempt. Keep it immediately adjacent to do_request and
+     * after the final deadline checks above; provider/budget failures must not
+     * fabricate an HTTP start. */
+    if (diagnostic_task && producer->delivery_diagnostic) {
+        uint64_t attempt_id = atomic_fetch_add_explicit(
+            &producer->diagnostic_attempt_counter, 1, memory_order_relaxed) + 1;
+        int64_t monotonic_ms = ve_tls_diagnostic_monotonic_ms();
+        diagnostic_task->diagnostic_attempt_id = attempt_id;
+        diagnostic_task->diagnostic_attempt_monotonic_ms = monotonic_ms;
+        diagnostic_task->diagnostic_attempt_elapsed_ms = monotonic_ms >= 0 ? 0 : -1;
+        diagnostic_task->diagnostic_queue_wait_ms = -1;
+        if (monotonic_ms >= 0 &&
+            diagnostic_task->diagnostic_batch_sealed_monotonic_ms > 0 &&
+            monotonic_ms >= diagnostic_task->diagnostic_batch_sealed_monotonic_ms) {
+            diagnostic_task->diagnostic_queue_wait_ms =
+                monotonic_ms - diagnostic_task->diagnostic_batch_sealed_monotonic_ms;
+        }
+        ve_tls_sender_emit_diagnostic(
+            producer,
+            VE_TLS_DELIVERY_DIAGNOSTIC_ATTEMPT_STARTED,
+            VE_TLS_DELIVERY_DIAGNOSTIC_REASON_NONE,
+            diagnostic_task,
+            NULL,
+            raw_body_size,
+            body_size,
+            -1,
+            0);
+    }
     int rc = producer->config.http_client.do_request(&producer->config.http_client, &req, &resp);
+    if (diagnostic_task && producer->delivery_diagnostic && diagnostic_task->diagnostic_attempt_id > 0) {
+        int64_t finished_ms = ve_tls_diagnostic_monotonic_ms();
+        diagnostic_task->diagnostic_attempt_elapsed_ms =
+            diagnostic_task->diagnostic_attempt_monotonic_ms >= 0 &&
+            finished_ms >= diagnostic_task->diagnostic_attempt_monotonic_ms
+                ? finished_ms - diagnostic_task->diagnostic_attempt_monotonic_ms : -1;
+    }
+    if (api_key_headers && signed_headers) {
+        ve_tls_secure_zero(signed_headers, signed_len + 1);
+    }
     ve_tls_header_buf_release(producer, headers, headers_pooled);
     ve_tls_header_buf_release(producer, signed_headers, signed_pooled);
 
@@ -1404,10 +1996,12 @@ static int ve_tls_send_put_logs(ve_tls_producer * producer, const char * access_
     }
 
     if (out_error) {
-        ve_tls_error_set_http(out_error, resp.status_code);
+        ve_tls_error_set_http(producer, out_error, resp.status_code);
         out_error->transport_kind = resp.transport_kind;
         out_error->transport_code = resp.transport_code;
         out_error->request_id = resp.request_id ? ve_tls_strdup(resp.request_id) : NULL;
+        out_error->error_code = resp.error_code ? ve_tls_strdup(resp.error_code) : NULL;
+        out_error->error_message = resp.error_message ? ve_tls_strdup(resp.error_message) : NULL;
         ve_tls_error_parse_body_fields(out_error, resp.body, resp.body_size);
         if (resp.status_code != 200) {
             if (!out_error->error_code) {
@@ -1420,6 +2014,10 @@ static int ve_tls_send_put_logs(ve_tls_producer * producer, const char * access_
                 out_error->error_message = resp.body ? ve_tls_dup_body_limited(resp.body, resp.body_size) : ve_tls_strdup("non-200 response");
             }
         }
+        out_error->retryable = ve_tls_is_retryable_http(
+            producer,
+            out_error->http_code,
+            out_error->error_code) ? 1 : 0;
     }
     if (resp.status_code != 200) {
         ve_tls_http_debug_log_failure(&req, &resp);
@@ -1449,12 +2047,32 @@ int ve_tls_sender_step(ve_tls_producer * producer) {
     int64_t now0 = producer->config.platform.time_ms ? producer->config.platform.time_ms() : 0;
     ve_tls_delayed_promote_due(
         producer,
-        (producer->closing || producer->stop) && producer->persistent
+        (producer->closing || producer->stop)
             ? INT64_MAX
             : now0);
     kq = ve_tls_ready_pop(producer);
     if (kq) {
         (void)ve_tls_key_queue_pop_task(kq, &task);
+        int closing_memory_task = (producer->closing || producer->stop) &&
+            !producer->persistent && task.memory_retry_retained;
+        int expired_memory_task = !producer->closing && !producer->stop &&
+            !producer->persistent && task.memory_retry_retained &&
+            task.memory_retry_deadline_ms > 0 && now0 >= task.memory_retry_deadline_ms;
+        if (closing_memory_task || expired_memory_task) {
+            ve_tls_delivery_diagnostic_reason terminal_reason = closing_memory_task
+                ? VE_TLS_DELIVERY_DIAGNOSTIC_REASON_CLOSED
+                : VE_TLS_DELIVERY_DIAGNOSTIC_REASON_RETENTION_EXPIRED;
+            producer->config.platform.mutex_unlock(producer->mutex);
+            ve_tls_sender_report_memory_terminal(producer, &task, terminal_reason, 0);
+            ve_tls_sender_release_task(producer, &task);
+            producer->config.platform.mutex_lock(producer->mutex);
+            ve_tls_key_queue_finish(producer, kq);
+            producer->config.platform.mutex_unlock(producer->mutex);
+            if (producer->use_global_env) {
+                ve_tls_env_notify(producer);
+            }
+            return 1;
+        }
         if ((producer->closing || producer->stop) && producer->persistent &&
             task.persistent_retry_cycle > 0) {
             producer->config.platform.mutex_unlock(producer->mutex);
@@ -1510,6 +2128,7 @@ int ve_tls_sender_step(ve_tls_producer * producer) {
     return 0;
 
 have_task: {
+    task.delivery_cycle_attempt_count = 0;
     const unsigned char * send_body_data = NULL;
     size_t send_body_size = 0;
     size_t raw_body_size = 0;
@@ -1547,12 +2166,40 @@ have_task: {
     ve_tls_error err;
     memset(&err, 0, sizeof(err));
     int sent_ok = 0;
+    ve_tls_delivery_diagnostic_reason terminal_reason = VE_TLS_DELIVERY_DIAGNOSTIC_REASON_NONE;
     int entered_breaker = 0;
     int half_open_guard = 0;
     int64_t credential_version = 0;
     for (;;) {
         attempt++;
         ve_tls_error_free_fields(&err);
+
+        if (!producer->persistent && task.memory_retry_retained &&
+            task.memory_retry_deadline_ms > 0 &&
+            producer->config.platform.time_ms &&
+            producer->config.platform.time_ms() >= task.memory_retry_deadline_ms) {
+            ve_tls_sender_set_synthetic_error(
+                &err, "RetryRetentionExpired", "memory retry retention expired", 0);
+            terminal_reason = VE_TLS_DELIVERY_DIAGNOSTIC_REASON_RETENTION_EXPIRED;
+            break;
+        }
+
+        if (producer->config.bound_request_timeout_to_retry_budget &&
+            producer->config.retry_policy.total_timeout_ms > 0) {
+            int64_t budget_now = producer->config.platform.time_ms
+                ? producer->config.platform.time_ms()
+                : start_time;
+            int64_t budget_elapsed = budget_now - start_time;
+            if (budget_elapsed < 0) {
+                budget_elapsed = 0;
+            }
+            if (budget_elapsed >= producer->config.retry_policy.total_timeout_ms) {
+                ve_tls_sender_set_synthetic_error(
+                    &err, "RetryBudgetExceeded", "retry budget exhausted", 1);
+                terminal_reason = VE_TLS_DELIVERY_DIAGNOSTIC_REASON_RETRY_BUDGET;
+                break;
+            }
+        }
 
         int64_t gate_now = producer->config.platform.time_ms ? producer->config.platform.time_ms() : 0;
         int64_t next_bk = 0;
@@ -1563,6 +2210,11 @@ have_task: {
             int64_t next = next_bk > next_rl ? next_bk : next_rl;
             if (next <= 0) {
                 next = gate_now + 10;
+            }
+            if (!producer->persistent && task.memory_retry_retained &&
+                task.memory_retry_deadline_ms > 0 &&
+                next > task.memory_retry_deadline_ms) {
+                next = task.memory_retry_deadline_ms;
             }
             ve_tls_sender_defer_task(producer, kq, &task, next);
             ve_tls_error_free_fields(&err);
@@ -1591,9 +2243,31 @@ have_task: {
         }
 
         ve_tls_rate_limit_wait(producer, send_body_size);
+        if (!producer->persistent && task.memory_retry_retained &&
+            task.memory_retry_deadline_ms > 0 &&
+            producer->config.platform.time_ms &&
+            producer->config.platform.time_ms() >= task.memory_retry_deadline_ms) {
+            ve_tls_sender_set_synthetic_error(
+                &err, "RetryRetentionExpired", "memory retry retention expired", 0);
+            terminal_reason = VE_TLS_DELIVERY_DIAGNOSTIC_REASON_RETENTION_EXPIRED;
+            break;
+        }
+        int64_t request_timeout_cap_ms = 0;
         ve_tls_metric_inc_u64(&producer->m_requests_total, 1);
         ve_tls_metrics_emit(producer, "request_attempt", 1, 0);
         int64_t attempt_start = producer->config.platform.time_ms ? producer->config.platform.time_ms() : 0;
+        if (!task.delivery_started) {
+            task.delivery_started = 1;
+            task.delivery_start_ms = attempt_start;
+        }
+        task.delivery_attempt_count++;
+        task.delivery_cycle_attempt_count++;
+        if (producer->delivery_diagnostic) {
+            task.diagnostic_attempt_id = 0;
+            task.diagnostic_attempt_monotonic_ms = -1;
+            task.diagnostic_attempt_elapsed_ms = -1;
+            task.diagnostic_queue_wait_ms = -1;
+        }
         const char * ak = NULL;
         const char * sk = NULL;
         const char * token = NULL;
@@ -1610,7 +2284,71 @@ have_task: {
             err.error_message = ve_tls_strdup("credentials refresh failed");
             break;
         }
-        int rc = ve_tls_send_put_logs(producer, ak, sk, token, send_compress_type, send_body_data, send_body_size, raw_body_size, task.log_count, task.earliest, task.latest, task.hash_key, &err);
+        /* A credentials provider may block or refresh the clock. Recheck the
+         * retention and retry budget after it returns, immediately before the
+         * transport call, so no request starts past either deadline. */
+        if (!producer->persistent && task.memory_retry_retained &&
+            task.memory_retry_deadline_ms > 0 &&
+            producer->config.platform.time_ms &&
+            producer->config.platform.time_ms() >= task.memory_retry_deadline_ms) {
+            ve_tls_owned_credentials_free(&owned_creds);
+            ve_tls_sender_set_synthetic_error(
+                &err, "RetryRetentionExpired", "memory retry retention expired", 0);
+            terminal_reason = VE_TLS_DELIVERY_DIAGNOSTIC_REASON_RETENTION_EXPIRED;
+            break;
+        }
+        if (producer->config.bound_request_timeout_to_retry_budget &&
+            producer->config.retry_policy.total_timeout_ms > 0) {
+            int64_t cap_now = producer->config.platform.time_ms
+                ? producer->config.platform.time_ms()
+                : start_time;
+            int64_t cap_elapsed = cap_now - start_time;
+            if (cap_elapsed < 0) {
+                cap_elapsed = 0;
+            }
+            if (cap_elapsed >= producer->config.retry_policy.total_timeout_ms) {
+                ve_tls_owned_credentials_free(&owned_creds);
+                ve_tls_sender_set_synthetic_error(
+                    &err, "RetryBudgetExceeded", "retry budget exhausted", 1);
+                terminal_reason = VE_TLS_DELIVERY_DIAGNOSTIC_REASON_RETRY_BUDGET;
+                break;
+            }
+            request_timeout_cap_ms = producer->config.retry_policy.total_timeout_ms - cap_elapsed;
+            if (request_timeout_cap_ms <= 0) {
+                ve_tls_owned_credentials_free(&owned_creds);
+                ve_tls_sender_set_synthetic_error(
+                    &err, "RetryBudgetExceeded", "retry budget exhausted", 1);
+                terminal_reason = VE_TLS_DELIVERY_DIAGNOSTIC_REASON_RETRY_BUDGET;
+                break;
+            }
+        }
+        task.diagnostic_attempt_id = 0;
+        task.diagnostic_attempt_monotonic_ms = -1;
+        task.diagnostic_queue_wait_ms = -1;
+        int rc = ve_tls_send_put_logs(
+            producer,
+            ak,
+            sk,
+            token,
+            owned_creds.api_key,
+            send_compress_type,
+            send_body_data,
+            send_body_size,
+            raw_body_size,
+            task.log_count,
+            task.earliest,
+            task.latest,
+            task.hash_key,
+            request_timeout_cap_ms,
+            producer->config.bound_request_timeout_to_retry_budget
+                ? ve_tls_sender_deadline_from_duration(
+                    start_time, producer->config.retry_policy.total_timeout_ms)
+                : 0,
+            !producer->persistent && task.memory_retry_retained
+                ? task.memory_retry_deadline_ms
+                : 0,
+            &task,
+            &err);
         ve_tls_owned_credentials_free(&owned_creds);
         int64_t attempt_end = producer->config.platform.time_ms ? producer->config.platform.time_ms() : 0;
         int64_t attempt_ms = attempt_end - attempt_start;
@@ -1622,25 +2360,109 @@ have_task: {
         ve_tls_metrics_emit(producer, "request_latency_ms", attempt_ms, err.http_code);
         if (rc == 0) {
             sent_ok = 1;
+            terminal_reason = VE_TLS_DELIVERY_DIAGNOSTIC_REASON_SUCCESS;
+            ve_tls_sender_emit_diagnostic(
+                producer,
+                VE_TLS_DELIVERY_DIAGNOSTIC_ATTEMPT_FINISHED,
+                VE_TLS_DELIVERY_DIAGNOSTIC_REASON_SUCCESS,
+                &task,
+                &err,
+                raw_body_size,
+                send_body_size,
+                -1,
+                0);
+            break;
+        }
+        ve_tls_delivery_diagnostic_reason deadline_reason =
+            rc == VE_TLS_SEND_PUT_LOGS_RC_RETRY_BUDGET
+                ? VE_TLS_DELIVERY_DIAGNOSTIC_REASON_RETRY_BUDGET
+                : rc == VE_TLS_SEND_PUT_LOGS_RC_RETENTION_EXPIRED
+                    ? VE_TLS_DELIVERY_DIAGNOSTIC_REASON_RETENTION_EXPIRED
+                    : VE_TLS_DELIVERY_DIAGNOSTIC_REASON_NONE;
+        if (deadline_reason != VE_TLS_DELIVERY_DIAGNOSTIC_REASON_NONE) {
+            terminal_reason = deadline_reason;
+            ve_tls_sender_emit_diagnostic(
+                producer,
+                VE_TLS_DELIVERY_DIAGNOSTIC_ATTEMPT_FINISHED,
+                terminal_reason,
+                &task,
+                &err,
+                raw_body_size,
+                send_body_size,
+                -1,
+                0);
             break;
         }
         int64_t now2 = producer->config.platform.time_ms ? producer->config.platform.time_ms() : 0;
         int64_t elapsed = now2 - start_time;
         if (!err.retryable) {
+            terminal_reason = VE_TLS_DELIVERY_DIAGNOSTIC_REASON_NON_RETRYABLE;
+            ve_tls_sender_emit_diagnostic(
+                producer,
+                VE_TLS_DELIVERY_DIAGNOSTIC_ATTEMPT_FINISHED,
+                terminal_reason,
+                &task,
+                &err,
+                raw_body_size,
+                send_body_size,
+                -1,
+                0);
             break;
         }
         if (producer->config.retry_policy.max_attempts > 0 && attempt >= producer->config.retry_policy.max_attempts) {
+            terminal_reason = VE_TLS_DELIVERY_DIAGNOSTIC_REASON_MAX_ATTEMPTS;
+            ve_tls_sender_emit_diagnostic(
+                producer,
+                VE_TLS_DELIVERY_DIAGNOSTIC_ATTEMPT_FINISHED,
+                terminal_reason,
+                &task,
+                &err,
+                raw_body_size,
+                send_body_size,
+                -1,
+                0);
             break;
         }
         if (producer->config.retry_policy.total_timeout_ms > 0 && elapsed >= producer->config.retry_policy.total_timeout_ms) {
+            terminal_reason = VE_TLS_DELIVERY_DIAGNOSTIC_REASON_RETRY_BUDGET;
+            ve_tls_sender_emit_diagnostic(
+                producer,
+                VE_TLS_DELIVERY_DIAGNOSTIC_ATTEMPT_FINISHED,
+                terminal_reason,
+                &task,
+                &err,
+                raw_body_size,
+                send_body_size,
+                -1,
+                0);
             break;
         }
+        ve_tls_sender_emit_diagnostic(
+            producer,
+            VE_TLS_DELIVERY_DIAGNOSTIC_ATTEMPT_FINISHED,
+            VE_TLS_DELIVERY_DIAGNOSTIC_REASON_NONE,
+            &task,
+            &err,
+            raw_body_size,
+            send_body_size,
+            -1,
+            0);
         ve_tls_metric_inc_u64(&producer->m_retries_total, 1);
         ve_tls_metrics_emit(producer, "retry", attempt, err.http_code);
         int64_t delay = ve_tls_retry_next_interval_ms(&producer->config.retry_policy, attempt);
         if (producer->config.retry_policy.total_timeout_ms > 0 && elapsed + delay > producer->config.retry_policy.total_timeout_ms) {
             delay = producer->config.retry_policy.total_timeout_ms - elapsed;
         }
+        ve_tls_sender_emit_diagnostic(
+            producer,
+            VE_TLS_DELIVERY_DIAGNOSTIC_RETRY_SCHEDULED,
+            VE_TLS_DELIVERY_DIAGNOSTIC_REASON_NONE,
+            &task,
+            &err,
+            raw_body_size,
+            send_body_size,
+            -1,
+            delay);
         producer->config.platform.sleep_ms(delay);
     }
     int64_t total_end = producer->config.platform.time_ms ? producer->config.platform.time_ms() : 0;
@@ -1678,6 +2500,43 @@ have_task: {
         return 1;
     }
     if (!sent_ok) {
+        int memory_retry = ve_tls_handle_memory_retry_cycle_failure(
+            producer,
+            kq,
+            &task,
+            &err,
+            total_ms,
+            entered_breaker,
+            half_open_guard);
+        if (memory_retry != 0) {
+            if (memory_retry < 0) {
+                ve_tls_sender_report_memory_requeue_failure(
+                    producer,
+                    &task,
+                    memory_retry == -2,
+                    send_body_size,
+                    total_ms);
+            }
+            ve_tls_error_free_fields(&err);
+            if (memory_retry < 0) {
+                ve_tls_sender_release_task(producer, &task);
+                producer->config.platform.mutex_lock(producer->mutex);
+                ve_tls_key_queue_finish(producer, kq);
+                producer->config.platform.mutex_unlock(producer->mutex);
+            }
+            if (producer->use_global_env) {
+                ve_tls_env_notify(producer);
+            }
+            return 1;
+        }
+        if (task.memory_retry_retained && task.memory_retry_deadline_ms > 0) {
+            int64_t terminal_now = producer->config.platform.time_ms
+                ? producer->config.platform.time_ms()
+                : 0;
+            if (terminal_now >= task.memory_retry_deadline_ms) {
+                terminal_reason = VE_TLS_DELIVERY_DIAGNOSTIC_REASON_RETENTION_EXPIRED;
+            }
+        }
         int persistent_retry = ve_tls_handle_persistent_retry_cycle_failure(
             producer,
             kq,
@@ -1711,9 +2570,32 @@ have_task: {
         if (cbs.cb2) {
             cbs.cb2(VE_TLS_OK, task.batch_bytes, send_body_size, &err, NULL, cbs.cb2_param, task.start_id, task.end_id);
         }
+        ve_tls_sender_emit_diagnostic(
+            producer,
+            VE_TLS_DELIVERY_DIAGNOSTIC_BATCH_TERMINAL,
+            VE_TLS_DELIVERY_DIAGNOSTIC_REASON_SUCCESS,
+            &task,
+            &err,
+            raw_body_size,
+            send_body_size,
+            -1,
+            0);
     } else {
         ve_tls_report_send_failure(
             producer, &task, &err, send_body_size, total_ms);
+        if (terminal_reason == VE_TLS_DELIVERY_DIAGNOSTIC_REASON_NONE) {
+            terminal_reason = VE_TLS_DELIVERY_DIAGNOSTIC_REASON_NON_RETRYABLE;
+        }
+        ve_tls_sender_emit_diagnostic(
+            producer,
+            VE_TLS_DELIVERY_DIAGNOSTIC_BATCH_TERMINAL,
+            terminal_reason,
+            &task,
+            &err,
+            raw_body_size,
+            send_body_size,
+            -1,
+            0);
     }
     if (entered_breaker) {
         if (half_open_guard) {
@@ -1779,6 +2661,7 @@ static void * ve_tls_sender_main_fast(void * arg) {
         ve_tls_error err;
         memset(&err, 0, sizeof(err));
         int sent_ok;
+        ve_tls_delivery_diagnostic_reason terminal_reason;
         int64_t credential_version;
 retry_fast_after_auth_update:
         attempt = 0;
@@ -1786,13 +2669,43 @@ retry_fast_after_auth_update:
             ? producer->config.platform.time_ms()
             : 0;
         sent_ok = 0;
+        terminal_reason = VE_TLS_DELIVERY_DIAGNOSTIC_REASON_NONE;
         credential_version = 0;
         for (;;) {
             attempt++;
             ve_tls_error_free_fields(&err);
+            if (producer->config.bound_request_timeout_to_retry_budget &&
+                producer->config.retry_policy.total_timeout_ms > 0) {
+                int64_t budget_now = producer->config.platform.time_ms
+                    ? producer->config.platform.time_ms()
+                    : start_time;
+                int64_t budget_elapsed = budget_now - start_time;
+                if (budget_elapsed < 0) {
+                    budget_elapsed = 0;
+                }
+                if (budget_elapsed >= producer->config.retry_policy.total_timeout_ms) {
+                    ve_tls_sender_set_synthetic_error(
+                        &err, "RetryBudgetExceeded", "retry budget exhausted", 1);
+                    terminal_reason = VE_TLS_DELIVERY_DIAGNOSTIC_REASON_RETRY_BUDGET;
+                    break;
+                }
+            }
+            int64_t request_timeout_cap_ms = 0;
             ve_tls_metric_inc_u64(&producer->m_requests_total, 1);
             ve_tls_metrics_emit(producer, "request_attempt", 1, 0);
             int64_t attempt_start = producer->config.platform.time_ms ? producer->config.platform.time_ms() : 0;
+            if (!task.delivery_started) {
+                task.delivery_started = 1;
+                task.delivery_start_ms = attempt_start;
+            }
+            task.delivery_attempt_count++;
+            task.delivery_cycle_attempt_count++;
+            if (producer->delivery_diagnostic) {
+                task.diagnostic_attempt_id = 0;
+                task.diagnostic_attempt_monotonic_ms = -1;
+                task.diagnostic_attempt_elapsed_ms = -1;
+                task.diagnostic_queue_wait_ms = -1;
+            }
             const char * ak = NULL;
             const char * sk = NULL;
             const char * token = NULL;
@@ -1809,7 +2722,56 @@ retry_fast_after_auth_update:
                 err.error_message = ve_tls_strdup("credentials refresh failed");
                 break;
             }
-            int rc = ve_tls_send_put_logs(producer, ak, sk, token, send_compress_type, send_body_data, send_body_size, raw_body_size, task.log_count, task.earliest, task.latest, task.hash_key, &err);
+            if (producer->config.bound_request_timeout_to_retry_budget &&
+                producer->config.retry_policy.total_timeout_ms > 0) {
+                int64_t cap_now = producer->config.platform.time_ms
+                    ? producer->config.platform.time_ms()
+                    : start_time;
+                int64_t cap_elapsed = cap_now - start_time;
+                if (cap_elapsed < 0) {
+                    cap_elapsed = 0;
+                }
+                if (cap_elapsed >= producer->config.retry_policy.total_timeout_ms) {
+                    ve_tls_owned_credentials_free(&owned_creds);
+                    ve_tls_sender_set_synthetic_error(
+                        &err, "RetryBudgetExceeded", "retry budget exhausted", 1);
+                    terminal_reason = VE_TLS_DELIVERY_DIAGNOSTIC_REASON_RETRY_BUDGET;
+                    break;
+                }
+                request_timeout_cap_ms = producer->config.retry_policy.total_timeout_ms - cap_elapsed;
+                if (request_timeout_cap_ms <= 0) {
+                    ve_tls_owned_credentials_free(&owned_creds);
+                    ve_tls_sender_set_synthetic_error(
+                        &err, "RetryBudgetExceeded", "retry budget exhausted", 1);
+                    terminal_reason = VE_TLS_DELIVERY_DIAGNOSTIC_REASON_RETRY_BUDGET;
+                    break;
+                }
+            }
+            task.diagnostic_attempt_id = 0;
+            task.diagnostic_attempt_monotonic_ms = -1;
+            task.diagnostic_queue_wait_ms = -1;
+            int rc = ve_tls_send_put_logs(
+                producer,
+                ak,
+                sk,
+                token,
+                owned_creds.api_key,
+                send_compress_type,
+                send_body_data,
+                send_body_size,
+                raw_body_size,
+                task.log_count,
+                task.earliest,
+                task.latest,
+                task.hash_key,
+                request_timeout_cap_ms,
+                producer->config.bound_request_timeout_to_retry_budget
+                    ? ve_tls_sender_deadline_from_duration(
+                        start_time, producer->config.retry_policy.total_timeout_ms)
+                    : 0,
+                0, /* fast_send excludes memory retry retention. */
+                &task,
+                &err);
             ve_tls_owned_credentials_free(&owned_creds);
             int64_t attempt_end = producer->config.platform.time_ms ? producer->config.platform.time_ms() : 0;
             int64_t attempt_ms = attempt_end - attempt_start;
@@ -1821,25 +2783,109 @@ retry_fast_after_auth_update:
             ve_tls_metrics_emit(producer, "request_latency_ms", attempt_ms, err.http_code);
             if (rc == 0) {
                 sent_ok = 1;
+                terminal_reason = VE_TLS_DELIVERY_DIAGNOSTIC_REASON_SUCCESS;
+                ve_tls_sender_emit_diagnostic(
+                    producer,
+                    VE_TLS_DELIVERY_DIAGNOSTIC_ATTEMPT_FINISHED,
+                    VE_TLS_DELIVERY_DIAGNOSTIC_REASON_SUCCESS,
+                    &task,
+                    &err,
+                    raw_body_size,
+                    send_body_size,
+                    -1,
+                    0);
+                break;
+            }
+            ve_tls_delivery_diagnostic_reason deadline_reason =
+                rc == VE_TLS_SEND_PUT_LOGS_RC_RETRY_BUDGET
+                    ? VE_TLS_DELIVERY_DIAGNOSTIC_REASON_RETRY_BUDGET
+                    : rc == VE_TLS_SEND_PUT_LOGS_RC_RETENTION_EXPIRED
+                        ? VE_TLS_DELIVERY_DIAGNOSTIC_REASON_RETENTION_EXPIRED
+                        : VE_TLS_DELIVERY_DIAGNOSTIC_REASON_NONE;
+            if (deadline_reason != VE_TLS_DELIVERY_DIAGNOSTIC_REASON_NONE) {
+                terminal_reason = deadline_reason;
+                ve_tls_sender_emit_diagnostic(
+                    producer,
+                    VE_TLS_DELIVERY_DIAGNOSTIC_ATTEMPT_FINISHED,
+                    terminal_reason,
+                    &task,
+                    &err,
+                    raw_body_size,
+                    send_body_size,
+                    -1,
+                    0);
                 break;
             }
             int64_t now2 = producer->config.platform.time_ms ? producer->config.platform.time_ms() : 0;
             int64_t elapsed = now2 - start_time;
             if (!err.retryable) {
+                terminal_reason = VE_TLS_DELIVERY_DIAGNOSTIC_REASON_NON_RETRYABLE;
+                ve_tls_sender_emit_diagnostic(
+                    producer,
+                    VE_TLS_DELIVERY_DIAGNOSTIC_ATTEMPT_FINISHED,
+                    terminal_reason,
+                    &task,
+                    &err,
+                    raw_body_size,
+                    send_body_size,
+                    -1,
+                    0);
                 break;
             }
             if (producer->config.retry_policy.max_attempts > 0 && attempt >= producer->config.retry_policy.max_attempts) {
+                terminal_reason = VE_TLS_DELIVERY_DIAGNOSTIC_REASON_MAX_ATTEMPTS;
+                ve_tls_sender_emit_diagnostic(
+                    producer,
+                    VE_TLS_DELIVERY_DIAGNOSTIC_ATTEMPT_FINISHED,
+                    terminal_reason,
+                    &task,
+                    &err,
+                    raw_body_size,
+                    send_body_size,
+                    -1,
+                    0);
                 break;
             }
             if (producer->config.retry_policy.total_timeout_ms > 0 && elapsed >= producer->config.retry_policy.total_timeout_ms) {
+                terminal_reason = VE_TLS_DELIVERY_DIAGNOSTIC_REASON_RETRY_BUDGET;
+                ve_tls_sender_emit_diagnostic(
+                    producer,
+                    VE_TLS_DELIVERY_DIAGNOSTIC_ATTEMPT_FINISHED,
+                    terminal_reason,
+                    &task,
+                    &err,
+                    raw_body_size,
+                    send_body_size,
+                    -1,
+                    0);
                 break;
             }
+            ve_tls_sender_emit_diagnostic(
+                producer,
+                VE_TLS_DELIVERY_DIAGNOSTIC_ATTEMPT_FINISHED,
+                VE_TLS_DELIVERY_DIAGNOSTIC_REASON_NONE,
+                &task,
+                &err,
+                raw_body_size,
+                send_body_size,
+                -1,
+                0);
             ve_tls_metric_inc_u64(&producer->m_retries_total, 1);
             ve_tls_metrics_emit(producer, "retry", attempt, err.http_code);
             int64_t delay = ve_tls_retry_next_interval_ms(&producer->config.retry_policy, attempt);
             if (producer->config.retry_policy.total_timeout_ms > 0 && elapsed + delay > producer->config.retry_policy.total_timeout_ms) {
                 delay = producer->config.retry_policy.total_timeout_ms - elapsed;
             }
+            ve_tls_sender_emit_diagnostic(
+                producer,
+                VE_TLS_DELIVERY_DIAGNOSTIC_RETRY_SCHEDULED,
+                VE_TLS_DELIVERY_DIAGNOSTIC_REASON_NONE,
+                &task,
+                &err,
+                raw_body_size,
+                send_body_size,
+                -1,
+                delay);
             producer->config.platform.sleep_ms(delay);
         }
         int64_t total_end = producer->config.platform.time_ms ? producer->config.platform.time_ms() : 0;
@@ -1873,9 +2919,32 @@ retry_fast_after_auth_update:
             if (cbs.cb2) {
                 cbs.cb2(VE_TLS_OK, task.batch_bytes, send_body_size, &err, NULL, cbs.cb2_param, task.start_id, task.end_id);
             }
+            ve_tls_sender_emit_diagnostic(
+                producer,
+                VE_TLS_DELIVERY_DIAGNOSTIC_BATCH_TERMINAL,
+                VE_TLS_DELIVERY_DIAGNOSTIC_REASON_SUCCESS,
+                &task,
+                &err,
+                raw_body_size,
+                send_body_size,
+                -1,
+                0);
         } else {
             ve_tls_report_send_failure(
                 producer, &task, &err, send_body_size, total_ms);
+            if (terminal_reason == VE_TLS_DELIVERY_DIAGNOSTIC_REASON_NONE) {
+                terminal_reason = VE_TLS_DELIVERY_DIAGNOSTIC_REASON_NON_RETRYABLE;
+            }
+            ve_tls_sender_emit_diagnostic(
+                producer,
+                VE_TLS_DELIVERY_DIAGNOSTIC_BATCH_TERMINAL,
+                terminal_reason,
+                &task,
+                &err,
+                raw_body_size,
+                send_body_size,
+                -1,
+                0);
         }
         ve_tls_error_free_fields(&err);
         ve_tls_sender_release_task(producer, &task);
@@ -1904,12 +2973,29 @@ next_task:
             int wait_sendq_ms = 0;
             ve_tls_delayed_promote_due(
                 producer,
-                (producer->closing || producer->stop) && producer->persistent
+                (producer->closing || producer->stop)
                     ? INT64_MAX
                     : now0);
             kq = ve_tls_ready_pop(producer);
             if (kq) {
                 (void)ve_tls_key_queue_pop_task(kq, &task);
+                int closing_memory_task = (producer->closing || producer->stop) &&
+                    !producer->persistent && task.memory_retry_retained;
+                int expired_memory_task = !producer->closing && !producer->stop &&
+                    !producer->persistent && task.memory_retry_retained &&
+                    task.memory_retry_deadline_ms > 0 && now0 >= task.memory_retry_deadline_ms;
+                if (closing_memory_task || expired_memory_task) {
+                    ve_tls_delivery_diagnostic_reason terminal_reason = closing_memory_task
+                        ? VE_TLS_DELIVERY_DIAGNOSTIC_REASON_CLOSED
+                        : VE_TLS_DELIVERY_DIAGNOSTIC_REASON_RETENTION_EXPIRED;
+                    producer->config.platform.mutex_unlock(producer->mutex);
+                    ve_tls_sender_report_memory_terminal(producer, &task, terminal_reason, 0);
+                    ve_tls_sender_release_task(producer, &task);
+                    producer->config.platform.mutex_lock(producer->mutex);
+                    ve_tls_key_queue_finish(producer, kq);
+                    producer->config.platform.mutex_unlock(producer->mutex);
+                    goto next_task;
+                }
                 if ((producer->closing || producer->stop) && producer->persistent &&
                     task.persistent_retry_cycle > 0) {
                     producer->config.platform.mutex_unlock(producer->mutex);
@@ -1969,6 +3055,11 @@ next_task:
             }
             ve_tls_sender_heartbeat_persistent(producer);
             producer->config.platform.mutex_lock(producer->mutex);
+            /* close may have signaled while heartbeat ran without this mutex.
+               Revisit retained work before sleeping on its old retry deadline. */
+            if ((producer->closing || producer->stop) && producer->delayed_head) {
+                continue;
+            }
             if (producer->stop && !producer->ready_head) {
                 int pending = 0;
                 if (producer->key_buckets) {
@@ -2046,6 +3137,7 @@ next_task:
         }
         producer->config.platform.mutex_unlock(producer->mutex);
 
+        task.delivery_cycle_attempt_count = 0;
         const unsigned char * send_body_data = NULL;
         size_t send_body_size = 0;
         size_t raw_body_size = 0;
@@ -2082,6 +3174,7 @@ next_task:
         int sent_ok;
         int entered_breaker;
         int half_open_guard;
+        ve_tls_delivery_diagnostic_reason terminal_reason;
         int64_t credential_version;
 retry_keyed_after_auth_update:
         attempt = 0;
@@ -2091,10 +3184,28 @@ retry_keyed_after_auth_update:
         sent_ok = 0;
         entered_breaker = 0;
         half_open_guard = 0;
+        terminal_reason = VE_TLS_DELIVERY_DIAGNOSTIC_REASON_NONE;
         credential_version = 0;
         for (;;) {
             attempt++;
             ve_tls_error_free_fields(&err);
+
+            if (producer->config.bound_request_timeout_to_retry_budget &&
+                producer->config.retry_policy.total_timeout_ms > 0) {
+                int64_t budget_now = producer->config.platform.time_ms
+                    ? producer->config.platform.time_ms()
+                    : start_time;
+                int64_t budget_elapsed = budget_now - start_time;
+                if (budget_elapsed < 0) {
+                    budget_elapsed = 0;
+                }
+                if (budget_elapsed >= producer->config.retry_policy.total_timeout_ms) {
+                    ve_tls_sender_set_synthetic_error(
+                        &err, "RetryBudgetExceeded", "retry budget exhausted", 1);
+                    terminal_reason = VE_TLS_DELIVERY_DIAGNOSTIC_REASON_RETRY_BUDGET;
+                    break;
+                }
+            }
 
             int64_t gate_now = producer->config.platform.time_ms ? producer->config.platform.time_ms() : 0;
             int64_t next_bk = 0;
@@ -2105,6 +3216,11 @@ retry_keyed_after_auth_update:
                 int64_t next = next_bk > next_rl ? next_bk : next_rl;
                 if (next <= 0) {
                     next = gate_now + 10;
+                }
+                if (!producer->persistent && task.memory_retry_retained &&
+                    task.memory_retry_deadline_ms > 0 &&
+                    next > task.memory_retry_deadline_ms) {
+                    next = task.memory_retry_deadline_ms;
                 }
                 ve_tls_sender_defer_task(producer, kq, &task, next);
                 ve_tls_error_free_fields(&err);
@@ -2130,9 +3246,31 @@ retry_keyed_after_auth_update:
             }
 
             ve_tls_rate_limit_wait(producer, send_body_size);
+            if (!producer->persistent && task.memory_retry_retained &&
+                task.memory_retry_deadline_ms > 0 &&
+                producer->config.platform.time_ms &&
+                producer->config.platform.time_ms() >= task.memory_retry_deadline_ms) {
+                ve_tls_sender_set_synthetic_error(
+                    &err, "RetryRetentionExpired", "memory retry retention expired", 0);
+                terminal_reason = VE_TLS_DELIVERY_DIAGNOSTIC_REASON_RETENTION_EXPIRED;
+                break;
+            }
+            int64_t request_timeout_cap_ms = 0;
             ve_tls_metric_inc_u64(&producer->m_requests_total, 1);
             ve_tls_metrics_emit(producer, "request_attempt", 1, 0);
             int64_t attempt_start = producer->config.platform.time_ms ? producer->config.platform.time_ms() : 0;
+            if (!task.delivery_started) {
+                task.delivery_started = 1;
+                task.delivery_start_ms = attempt_start;
+            }
+            task.delivery_attempt_count++;
+            task.delivery_cycle_attempt_count++;
+            if (producer->delivery_diagnostic) {
+                task.diagnostic_attempt_id = 0;
+                task.diagnostic_attempt_monotonic_ms = -1;
+                task.diagnostic_attempt_elapsed_ms = -1;
+                task.diagnostic_queue_wait_ms = -1;
+            }
             const char * ak = NULL;
             const char * sk = NULL;
             const char * token = NULL;
@@ -2149,7 +3287,68 @@ retry_keyed_after_auth_update:
                 err.error_message = ve_tls_strdup("credentials refresh failed");
                 break;
             }
-            int rc = ve_tls_send_put_logs(producer, ak, sk, token, send_compress_type, send_body_data, send_body_size, raw_body_size, task.log_count, task.earliest, task.latest, task.hash_key, &err);
+            if (!producer->persistent && task.memory_retry_retained &&
+                task.memory_retry_deadline_ms > 0 &&
+                producer->config.platform.time_ms &&
+                producer->config.platform.time_ms() >= task.memory_retry_deadline_ms) {
+                ve_tls_owned_credentials_free(&owned_creds);
+                ve_tls_sender_set_synthetic_error(
+                    &err, "RetryRetentionExpired", "memory retry retention expired", 0);
+                terminal_reason = VE_TLS_DELIVERY_DIAGNOSTIC_REASON_RETENTION_EXPIRED;
+                break;
+            }
+            if (producer->config.bound_request_timeout_to_retry_budget &&
+                producer->config.retry_policy.total_timeout_ms > 0) {
+                int64_t cap_now = producer->config.platform.time_ms
+                    ? producer->config.platform.time_ms()
+                    : start_time;
+                int64_t cap_elapsed = cap_now - start_time;
+                if (cap_elapsed < 0) {
+                    cap_elapsed = 0;
+                }
+                if (cap_elapsed >= producer->config.retry_policy.total_timeout_ms) {
+                    ve_tls_owned_credentials_free(&owned_creds);
+                    ve_tls_sender_set_synthetic_error(
+                        &err, "RetryBudgetExceeded", "retry budget exhausted", 1);
+                    terminal_reason = VE_TLS_DELIVERY_DIAGNOSTIC_REASON_RETRY_BUDGET;
+                    break;
+                }
+                request_timeout_cap_ms = producer->config.retry_policy.total_timeout_ms - cap_elapsed;
+                if (request_timeout_cap_ms <= 0) {
+                    ve_tls_owned_credentials_free(&owned_creds);
+                    ve_tls_sender_set_synthetic_error(
+                        &err, "RetryBudgetExceeded", "retry budget exhausted", 1);
+                    terminal_reason = VE_TLS_DELIVERY_DIAGNOSTIC_REASON_RETRY_BUDGET;
+                    break;
+                }
+            }
+            task.diagnostic_attempt_id = 0;
+            task.diagnostic_attempt_monotonic_ms = -1;
+            task.diagnostic_queue_wait_ms = -1;
+            int rc = ve_tls_send_put_logs(
+                producer,
+                ak,
+                sk,
+                token,
+                owned_creds.api_key,
+                send_compress_type,
+                send_body_data,
+                send_body_size,
+                raw_body_size,
+                task.log_count,
+                task.earliest,
+                task.latest,
+                task.hash_key,
+                request_timeout_cap_ms,
+                producer->config.bound_request_timeout_to_retry_budget
+                    ? ve_tls_sender_deadline_from_duration(
+                        start_time, producer->config.retry_policy.total_timeout_ms)
+                    : 0,
+                !producer->persistent && task.memory_retry_retained
+                    ? task.memory_retry_deadline_ms
+                    : 0,
+                &task,
+                &err);
             ve_tls_owned_credentials_free(&owned_creds);
             int64_t attempt_end = producer->config.platform.time_ms ? producer->config.platform.time_ms() : 0;
             int64_t attempt_ms = attempt_end - attempt_start;
@@ -2161,25 +3360,109 @@ retry_keyed_after_auth_update:
             ve_tls_metrics_emit(producer, "request_latency_ms", attempt_ms, err.http_code);
             if (rc == 0) {
                 sent_ok = 1;
+                terminal_reason = VE_TLS_DELIVERY_DIAGNOSTIC_REASON_SUCCESS;
+                ve_tls_sender_emit_diagnostic(
+                    producer,
+                    VE_TLS_DELIVERY_DIAGNOSTIC_ATTEMPT_FINISHED,
+                    VE_TLS_DELIVERY_DIAGNOSTIC_REASON_SUCCESS,
+                    &task,
+                    &err,
+                    raw_body_size,
+                    send_body_size,
+                    -1,
+                    0);
+                break;
+            }
+            ve_tls_delivery_diagnostic_reason deadline_reason =
+                rc == VE_TLS_SEND_PUT_LOGS_RC_RETRY_BUDGET
+                    ? VE_TLS_DELIVERY_DIAGNOSTIC_REASON_RETRY_BUDGET
+                    : rc == VE_TLS_SEND_PUT_LOGS_RC_RETENTION_EXPIRED
+                        ? VE_TLS_DELIVERY_DIAGNOSTIC_REASON_RETENTION_EXPIRED
+                        : VE_TLS_DELIVERY_DIAGNOSTIC_REASON_NONE;
+            if (deadline_reason != VE_TLS_DELIVERY_DIAGNOSTIC_REASON_NONE) {
+                terminal_reason = deadline_reason;
+                ve_tls_sender_emit_diagnostic(
+                    producer,
+                    VE_TLS_DELIVERY_DIAGNOSTIC_ATTEMPT_FINISHED,
+                    terminal_reason,
+                    &task,
+                    &err,
+                    raw_body_size,
+                    send_body_size,
+                    -1,
+                    0);
                 break;
             }
             int64_t now2 = producer->config.platform.time_ms ? producer->config.platform.time_ms() : 0;
             int64_t elapsed = now2 - start_time;
             if (!err.retryable) {
+                terminal_reason = VE_TLS_DELIVERY_DIAGNOSTIC_REASON_NON_RETRYABLE;
+                ve_tls_sender_emit_diagnostic(
+                    producer,
+                    VE_TLS_DELIVERY_DIAGNOSTIC_ATTEMPT_FINISHED,
+                    terminal_reason,
+                    &task,
+                    &err,
+                    raw_body_size,
+                    send_body_size,
+                    -1,
+                    0);
                 break;
             }
             if (producer->config.retry_policy.max_attempts > 0 && attempt >= producer->config.retry_policy.max_attempts) {
+                terminal_reason = VE_TLS_DELIVERY_DIAGNOSTIC_REASON_MAX_ATTEMPTS;
+                ve_tls_sender_emit_diagnostic(
+                    producer,
+                    VE_TLS_DELIVERY_DIAGNOSTIC_ATTEMPT_FINISHED,
+                    terminal_reason,
+                    &task,
+                    &err,
+                    raw_body_size,
+                    send_body_size,
+                    -1,
+                    0);
                 break;
             }
             if (producer->config.retry_policy.total_timeout_ms > 0 && elapsed >= producer->config.retry_policy.total_timeout_ms) {
+                terminal_reason = VE_TLS_DELIVERY_DIAGNOSTIC_REASON_RETRY_BUDGET;
+                ve_tls_sender_emit_diagnostic(
+                    producer,
+                    VE_TLS_DELIVERY_DIAGNOSTIC_ATTEMPT_FINISHED,
+                    terminal_reason,
+                    &task,
+                    &err,
+                    raw_body_size,
+                    send_body_size,
+                    -1,
+                    0);
                 break;
             }
+            ve_tls_sender_emit_diagnostic(
+                producer,
+                VE_TLS_DELIVERY_DIAGNOSTIC_ATTEMPT_FINISHED,
+                VE_TLS_DELIVERY_DIAGNOSTIC_REASON_NONE,
+                &task,
+                &err,
+                raw_body_size,
+                send_body_size,
+                -1,
+                0);
             ve_tls_metric_inc_u64(&producer->m_retries_total, 1);
             ve_tls_metrics_emit(producer, "retry", attempt, err.http_code);
             int64_t delay = ve_tls_retry_next_interval_ms(&producer->config.retry_policy, attempt);
             if (producer->config.retry_policy.total_timeout_ms > 0 && elapsed + delay > producer->config.retry_policy.total_timeout_ms) {
                 delay = producer->config.retry_policy.total_timeout_ms - elapsed;
             }
+            ve_tls_sender_emit_diagnostic(
+                producer,
+                VE_TLS_DELIVERY_DIAGNOSTIC_RETRY_SCHEDULED,
+                VE_TLS_DELIVERY_DIAGNOSTIC_REASON_NONE,
+                &task,
+                &err,
+                raw_body_size,
+                send_body_size,
+                -1,
+                delay);
             producer->config.platform.sleep_ms(delay);
         }
         int64_t total_end = producer->config.platform.time_ms ? producer->config.platform.time_ms() : 0;
@@ -2207,6 +3490,40 @@ retry_keyed_after_auth_update:
             goto next_task;
         }
         if (!sent_ok) {
+            int memory_retry = ve_tls_handle_memory_retry_cycle_failure(
+                producer,
+                kq,
+                &task,
+                &err,
+                total_ms,
+                entered_breaker,
+                half_open_guard);
+            if (memory_retry != 0) {
+                if (memory_retry < 0) {
+                    ve_tls_sender_report_memory_requeue_failure(
+                        producer,
+                        &task,
+                        memory_retry == -2,
+                        send_body_size,
+                        total_ms);
+                }
+                ve_tls_error_free_fields(&err);
+                if (memory_retry < 0) {
+                    ve_tls_sender_release_task(producer, &task);
+                    producer->config.platform.mutex_lock(producer->mutex);
+                    ve_tls_key_queue_finish(producer, kq);
+                    producer->config.platform.mutex_unlock(producer->mutex);
+                }
+                goto next_task;
+            }
+            if (task.memory_retry_retained && task.memory_retry_deadline_ms > 0) {
+                int64_t terminal_now = producer->config.platform.time_ms
+                    ? producer->config.platform.time_ms()
+                    : 0;
+                if (terminal_now >= task.memory_retry_deadline_ms) {
+                    terminal_reason = VE_TLS_DELIVERY_DIAGNOSTIC_REASON_RETENTION_EXPIRED;
+                }
+            }
             int persistent_retry = ve_tls_handle_persistent_retry_cycle_failure(
                 producer,
                 kq,
@@ -2237,9 +3554,32 @@ retry_keyed_after_auth_update:
             if (cbs.cb2) {
                 cbs.cb2(VE_TLS_OK, task.batch_bytes, send_body_size, &err, NULL, cbs.cb2_param, task.start_id, task.end_id);
             }
+            ve_tls_sender_emit_diagnostic(
+                producer,
+                VE_TLS_DELIVERY_DIAGNOSTIC_BATCH_TERMINAL,
+                VE_TLS_DELIVERY_DIAGNOSTIC_REASON_SUCCESS,
+                &task,
+                &err,
+                raw_body_size,
+                send_body_size,
+                -1,
+                0);
         } else {
             ve_tls_report_send_failure(
                 producer, &task, &err, send_body_size, total_ms);
+            if (terminal_reason == VE_TLS_DELIVERY_DIAGNOSTIC_REASON_NONE) {
+                terminal_reason = VE_TLS_DELIVERY_DIAGNOSTIC_REASON_NON_RETRYABLE;
+            }
+            ve_tls_sender_emit_diagnostic(
+                producer,
+                VE_TLS_DELIVERY_DIAGNOSTIC_BATCH_TERMINAL,
+                terminal_reason,
+                &task,
+                &err,
+                raw_body_size,
+                send_body_size,
+                -1,
+                0);
         }
         if (entered_breaker) {
             if (half_open_guard) {

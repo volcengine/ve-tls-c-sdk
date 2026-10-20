@@ -38,6 +38,7 @@ typedef struct {
     int64_t lease_timeout_ms;
     int64_t heartbeat_interval_ms;
     int open_mode;
+    int exclusive_lifetime_lock;
     ve_tls_persistent_durability durability;
 } ve_tls_persistent_options;
 
@@ -70,8 +71,11 @@ struct ve_tls_persistent {
     int64_t lease_timeout_ms;
     int64_t heartbeat_interval_ms;
     int32_t open_mode;
+    int exclusive_lifetime_lock;
     ve_tls_persistent_durability durability;
     ve_tls_mutex * heartbeat_mutex;
+    int lease_fd;
+    int32_t creator_pid;
     _Atomic(int64_t) next_heartbeat_ms;
     _Atomic(int64_t) lease_valid_until_ms;
     uint64_t current_bytes;
@@ -94,6 +98,14 @@ struct ve_tls_persistent {
 
 typedef struct ve_tls_persistent ve_tls_persistent;
 
+/* Private persistence operations use two guard modes. The default mode takes
+   the instance mutex and the retained lease.lock descriptor for each
+   operation, while exclusive mode owns lease.lock for the instance lifetime
+   and takes only the instance mutex for normal operations. Recovery callbacks
+   run outside the instance mutex and may ACK/flush; exclusive mode retains
+   its lifetime ownership lock during callbacks. Callers must still stop/join
+   users of this object before closing it. A fork child fails closed and must
+   create a new producer instance. */
 int ve_tls_persistent_open(ve_tls_persistent * persistent, const ve_tls_persistent_options * options);
 void ve_tls_persistent_close(ve_tls_persistent * persistent);
 int ve_tls_persistent_append(ve_tls_persistent * persistent, int64_t log_id, const char * hash_key, const unsigned char * payload, size_t payload_size);
@@ -112,5 +124,12 @@ int ve_tls_persistent_recover(
 int ve_tls_persistent_ack_range(ve_tls_persistent * persistent, int64_t start_id, int64_t end_id);
 int ve_tls_persistent_heartbeat_if_due(ve_tls_persistent * persistent, int force);
 int ve_tls_persistent_flush(ve_tls_persistent * persistent);
+
+/* Private bridge factory. Only the current complete configuration with
+   persistence enabled is accepted; public factories remain mode 0. */
+ve_tls_producer * ve_tls_producer_create_exclusive_persistence(
+    const ve_tls_config * config,
+    size_t config_size
+);
 
 #endif

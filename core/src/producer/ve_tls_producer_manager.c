@@ -27,6 +27,44 @@ static ve_tls_send_callbacks ve_tls_capture_callbacks(ve_tls_producer * producer
     return out;
 }
 
+static void ve_tls_manager_emit_batch_sealed(
+    ve_tls_producer * producer,
+    ve_tls_send_task * task
+) {
+    if (!producer || !task || !producer->delivery_diagnostic) {
+        return;
+    }
+    task->diagnostic_batch_sealed_monotonic_ms = ve_tls_diagnostic_monotonic_ms();
+    task->diagnostic_attempt_id = 0;
+    task->diagnostic_attempt_monotonic_ms = -1;
+    task->diagnostic_attempt_elapsed_ms = -1;
+    task->diagnostic_queue_wait_ms = -1;
+
+    ve_tls_delivery_diagnostic diagnostic;
+    memset(&diagnostic, 0, sizeof(diagnostic));
+    diagnostic.event = VE_TLS_DELIVERY_DIAGNOSTIC_BATCH_SEALED;
+    diagnostic.reason = VE_TLS_DELIVERY_DIAGNOSTIC_REASON_NONE;
+    diagnostic.start_id = task->start_id;
+    diagnostic.end_id = task->end_id;
+    diagnostic.attempt_count = task->delivery_attempt_count;
+    diagnostic.cycle_attempt_count = task->delivery_cycle_attempt_count;
+    diagnostic.elapsed_ms = -1;
+    diagnostic.delay_ms = -1;
+    diagnostic.log_count = task->log_count;
+    diagnostic.raw_bytes = task->raw_body_size > 0 ? task->raw_body_size : task->body_size;
+    diagnostic.compressed_bytes = task->precompressed_size;
+    diagnostic.http_code = 0;
+    diagnostic.transport_code = 0;
+    diagnostic.retryable = 0;
+    diagnostic.attempt_id = 0;
+    diagnostic.attempt_elapsed_ms = -1;
+    diagnostic.queue_wait_ms = -1;
+    diagnostic.disposition = VE_TLS_DELIVERY_DIAGNOSTIC_DISPOSITION_UNKNOWN;
+    diagnostic.metadata_version = VE_TLS_DELIVERY_DIAGNOSTIC_METADATA_VERSION_1;
+    diagnostic.metadata_size = (uint32_t)sizeof(diagnostic);
+    ve_tls_diagnostic_emit(producer, &diagnostic);
+}
+
 static void ve_tls_manager_heartbeat_persistent(ve_tls_producer * producer) {
     if (producer && producer->persistent) {
         (void)ve_tls_persistent_heartbeat_if_due(producer->persistent, 0);
@@ -447,6 +485,7 @@ static void * ve_tls_worker_main_builder(void * arg) {
             t.hash_key = item.hash_key;
             item.data = NULL;
             item.hash_key = NULL;
+            ve_tls_manager_emit_batch_sealed(producer, &t);
             const char * err_code = NULL;
             const char * err_msg = NULL;
             if (ve_tls_manager_prepare_send_task(producer, &t, &err_code, &err_msg) != 0) {
@@ -468,6 +507,7 @@ static void * ve_tls_worker_main_builder(void * arg) {
             if (ve_tls_builder_move_to_send_task(producer, b, &t) != 0) {
                 ve_tls_manager_drop_range(producer, bytes_in_builder, b->start_id, b->end_id, "MemoryAllocFailed", "build body failed");
             } else {
+                ve_tls_manager_emit_batch_sealed(producer, &t);
                 const char * err_code = NULL;
                 const char * err_msg = NULL;
                 if (ve_tls_manager_prepare_send_task(producer, &t, &err_code, &err_msg) != 0) {

@@ -12,7 +12,8 @@
 
 #define VE_TLS_CONFIG_VERSION_1 1u
 #define VE_TLS_CONFIG_VERSION_2 2u
-#define VE_TLS_CONFIG_VERSION_CURRENT VE_TLS_CONFIG_VERSION_2
+#define VE_TLS_CONFIG_VERSION_3 3u
+#define VE_TLS_CONFIG_VERSION_CURRENT VE_TLS_CONFIG_VERSION_3
 
 VE_TLS_BEGIN_DECLS
 
@@ -80,6 +81,84 @@ typedef struct {
     void (*emit)(const char * name, int64_t v1, int64_t v2, void * user_param);
     void * user_param;
 } ve_tls_metrics_sink;
+
+typedef enum {
+    VE_TLS_DELIVERY_DIAGNOSTIC_ATTEMPT_FINISHED = 0,
+    VE_TLS_DELIVERY_DIAGNOSTIC_RETRY_SCHEDULED = 1,
+    VE_TLS_DELIVERY_DIAGNOSTIC_BATCH_RETAINED = 2,
+    VE_TLS_DELIVERY_DIAGNOSTIC_BATCH_TERMINAL = 3,
+    /* Keep the original 0..3 values stable for existing bridge consumers. */
+    VE_TLS_DELIVERY_DIAGNOSTIC_BATCH_SEALED = 4,
+    VE_TLS_DELIVERY_DIAGNOSTIC_ATTEMPT_STARTED = 5
+} ve_tls_delivery_diagnostic_event_type;
+
+typedef enum {
+    VE_TLS_DELIVERY_DIAGNOSTIC_REASON_NONE = 0,
+    VE_TLS_DELIVERY_DIAGNOSTIC_REASON_SUCCESS = 1,
+    VE_TLS_DELIVERY_DIAGNOSTIC_REASON_NON_RETRYABLE = 2,
+    VE_TLS_DELIVERY_DIAGNOSTIC_REASON_MAX_ATTEMPTS = 3,
+    VE_TLS_DELIVERY_DIAGNOSTIC_REASON_RETRY_BUDGET = 4,
+    VE_TLS_DELIVERY_DIAGNOSTIC_REASON_RETENTION_EXPIRED = 5,
+    VE_TLS_DELIVERY_DIAGNOSTIC_REASON_CLOSED = 6
+} ve_tls_delivery_diagnostic_reason;
+
+typedef enum {
+    VE_TLS_DELIVERY_DIAGNOSTIC_DISPOSITION_UNKNOWN = 0,
+    VE_TLS_DELIVERY_DIAGNOSTIC_DISPOSITION_SUCCESS = 1,
+    VE_TLS_DELIVERY_DIAGNOSTIC_DISPOSITION_DISCARD = 2,
+    VE_TLS_DELIVERY_DIAGNOSTIC_DISPOSITION_RETAINED_MEMORY = 3,
+    VE_TLS_DELIVERY_DIAGNOSTIC_DISPOSITION_RETAINED_WAL = 4
+} ve_tls_delivery_diagnostic_disposition;
+
+#define VE_TLS_DELIVERY_DIAGNOSTIC_METADATA_VERSION_1 1u
+
+typedef struct {
+    ve_tls_delivery_diagnostic_event_type event;
+    ve_tls_delivery_diagnostic_reason reason;
+    int64_t start_id;
+    int64_t end_id;
+    int32_t attempt_count;
+    int32_t cycle_attempt_count;
+    /* For sender delivery events, cumulative from first delivery start,
+     * including retained cycles; uses platform.time_ms, so wall-clock changes
+     * can affect the value. A sender event before delivery starts is 0;
+     * BATCH_SEALED is emitted before sender delivery and is -1 (unavailable). */
+    int64_t elapsed_ms;
+    int64_t delay_ms;
+    int32_t log_count;
+    size_t raw_bytes;
+    size_t compressed_bytes;
+    int32_t http_code;
+    int32_t transport_code;
+    int32_t retryable;
+    /* Borrowed strings; valid only during the diagnostic callback. */
+    const char * request_id;
+    const char * error_code;
+    /* Tail fields preserve the original 0..3 struct offsets. */
+    uint64_t attempt_id;
+    /* Monotonic duration of the actual HTTP attempt, or -1 if unknown. */
+    int64_t attempt_elapsed_ms;
+    /* Queue wait is independent of elapsed_ms, or -1 if unavailable. */
+    int64_t queue_wait_ms;
+    ve_tls_delivery_diagnostic_disposition disposition;
+    uint32_t metadata_version;
+    uint32_t metadata_size;
+} ve_tls_delivery_diagnostic;
+
+/*
+ * Delivery diagnostics are invoked synchronously by the SDK, including its
+ * builder/sender workers. Calls are not serialized to a fixed thread, so the
+ * handler must be thread-safe and must return promptly. Do not call close,
+ * destroy, or an operation that can wait for this producer from the handler.
+ *
+ * `event` and its request_id/error_code strings are borrowed and are valid
+ * only until the handler returns. Copy any data that must outlive the call.
+ * No callback reentrancy or serialization guarantee is provided.
+ */
+typedef void (*ve_tls_delivery_diagnostic_fn)(
+    const ve_tls_delivery_diagnostic * event,
+    void * user_param
+);
 
 typedef struct {
     const char * access_key_id;
@@ -185,13 +264,38 @@ typedef struct {
     int64_t persistent_max_log_delay_ms;
     ve_tls_persistent_expired_log_policy persistent_expired_log_policy;
     ve_tls_persistent_auth_failure_policy persistent_auth_failure_policy;
+    /* Version 3 tail. Zero disables memory retry retention; negative is invalid. */
+    int64_t memory_retry_retention_ms;
+    /* Zero preserves the legacy per-attempt HTTP timeout behavior. */
+    int32_t bound_request_timeout_to_retry_budget;
+    ve_tls_delivery_diagnostic_fn delivery_diagnostic;
+    void * delivery_diagnostic_param;
+    /* When enabled, retry transient HTTP 408/499 and selected HTTP 400 codes. */
+    int32_t retry_transient_http_errors;
 } ve_tls_config;
 
 /* Size of the pre-versioned layout consumed by the legacy init/create APIs. */
 #define VE_TLS_CONFIG_LEGACY_SIZE offsetof(ve_tls_config, persistent_durability)
 /* Exact layout size used by version 1 callers. */
 #define VE_TLS_CONFIG_VERSION_1_SIZE offsetof(ve_tls_config, persistent_max_log_delay_ms)
+/* Exact layout size used by version 2 callers. */
+#define VE_TLS_CONFIG_VERSION_2_SIZE offsetof(ve_tls_config, memory_retry_retention_ms)
+/* Exact layout size used by version 3 callers. */
+#define VE_TLS_CONFIG_VERSION_3_SIZE sizeof(ve_tls_config)
 
+/*
+ * Send callbacks are synchronous SDK calls, including on worker threads,
+ * and may run concurrently.
+ * req_id, error_message, raw_buffer, and the v2 error object/fields are
+ * borrowed for the duration of the callback; copy them before returning if
+ * needed later. The handler must not block or call close, destroy, or an
+ * operation that can wait for this producer. A retained memory batch ended by
+ * close may report VE_TLS_CLOSED (v2 error->error_code is ProducerClosed;
+ * v1 receives the corresponding error_message). close does not promise a
+ * final network attempt. A persistent delayed retry remains
+ * unacknowledged in WAL for later recovery and does not imply the same
+ * terminal callback.
+ */
 typedef void (*ve_tls_send_done_fn)(
     ve_tls_result result,
     size_t log_bytes,
@@ -228,6 +332,14 @@ typedef struct {
     uint64_t request_latency_buckets[8];
 } ve_tls_metrics;
 
+/*
+ * Legacy init initializes only the pre-versioned prefix through
+ * VE_TLS_CONFIG_LEGACY_SIZE; legacy create consumes only that prefix and does
+ * not enable any versioned tail. For V1/V2/V3 callers, pair the versioned
+ * initializer and constructor with the same exact size and version. Do not
+ * treat an uninitialized legacy tail as a versioned input or widen the legacy
+ * copy contract.
+ */
 VE_TLS_API void ve_tls_config_init(ve_tls_config * config);
 VE_TLS_API ve_tls_result ve_tls_config_init_versioned(
     ve_tls_config * config,
@@ -242,6 +354,36 @@ VE_TLS_API ve_tls_producer * ve_tls_producer_create_versioned(
     uint32_t config_version
 );
 /*
+ * Creates a producer that authenticates PutLogs requests with api_key by
+ * sending x-tls-anonymous-identity. A non-empty key is copied before worker
+ * threads or automatic WAL recovery start; AK/SK and credentials_provider are
+ * not required and are ignored while the key is active. ASCII control bytes
+ * (including CR/LF and DEL) are rejected. Each request attempt captures its
+ * key, so retries use a key rotated before that attempt. API-key requests
+ * disable HTTP debug logging to avoid leaking the key. NULL or an empty key
+ * selects the configured AK/SK or credentials provider mode.
+ *
+ * Example:
+ *   ve_tls_config cfg;
+ *   ve_tls_config_init(&cfg);
+ *   cfg.endpoint = "https://tls.example.com";
+ *   cfg.region = "cn-example";
+ *   cfg.topic_id = "topic-id";
+ *   ve_tls_producer * producer =
+ *       ve_tls_producer_create_with_api_key(&cfg, "api-key-value");
+ */
+VE_TLS_API ve_tls_producer * ve_tls_producer_create_with_api_key(
+    const ve_tls_config * config,
+    const char * api_key
+);
+/* Same authentication semantics with exact-size V1/V2/V3 config validation. */
+VE_TLS_API ve_tls_producer * ve_tls_producer_create_with_api_key_versioned(
+    const ve_tls_config * config,
+    size_t config_size,
+    uint32_t config_version,
+    const char * api_key
+);
+/*
  * Updates the active send target for subsequent requests. Requests that have already
  * entered the send path may still use the previously captured endpoint/region/topic.
  * The update is transactional: failure leaves config, version, and runtime snapshot
@@ -251,6 +393,19 @@ VE_TLS_API ve_tls_producer * ve_tls_producer_create_versioned(
 VE_TLS_API ve_tls_result ve_tls_producer_update_endpoint(ve_tls_producer * producer, const char * endpoint, const char * region, const char * topic_id);
 /* Transactional with the same rollback and old-or-new snapshot guarantee. */
 VE_TLS_API ve_tls_result ve_tls_producer_update_static_credentials(ve_tls_producer * producer, const char * access_key_id, const char * access_key_secret, const char * security_token);
+/*
+ * Transactionally rotates api_key. NULL or empty clears it and falls back to
+ * configured AK/SK/provider; if no fallback exists, later sends fail locally
+ * before network I/O. Rotation advances the credential generation and wakes
+ * persistent auth-failure waiters.
+ */
+VE_TLS_API ve_tls_result ve_tls_producer_update_api_key(ve_tls_producer * producer, const char * api_key);
+/*
+ * close ends already-retained memory-only batches; they may receive
+ * VE_TLS_CLOSED/ProducerClosed and do not receive a final attempt merely
+ * because close waits. Persistent delayed retries remain unacknowledged in
+ * WAL for later recovery. Backgrounding an iOS app is not equivalent to close.
+ */
 VE_TLS_API ve_tls_result ve_tls_producer_close(ve_tls_producer * producer, int32_t timeout_ms);
 VE_TLS_API ve_tls_result ve_tls_producer_close_split(ve_tls_producer * producer, int32_t flusher_timeout_ms, int32_t sender_timeout_ms);
 VE_TLS_API void ve_tls_producer_destroy(ve_tls_producer * producer);
@@ -280,6 +435,8 @@ VE_TLS_API ve_tls_log_template * ve_tls_template_create(ve_tls_producer * produc
 VE_TLS_API ve_tls_result ve_tls_template_add_values(ve_tls_log_template * tpl, int64_t time_ms, int32_t has_time_ns, uint32_t time_ns, const char * const * values, const size_t * value_lens, size_t value_count, int flush);
 VE_TLS_API void ve_tls_template_destroy(ve_tls_log_template * tpl);
 VE_TLS_API ve_tls_result ve_tls_producer_flush(ve_tls_producer * producer);
+/* Wake delayed retry batches early after network recovery. */
+VE_TLS_API ve_tls_result ve_tls_producer_notify_network_recovered(ve_tls_producer * producer);
 VE_TLS_API ve_tls_result ve_tls_producer_recover(ve_tls_producer * producer);
 VE_TLS_API ve_tls_result ve_tls_producer_export_raw_buffer(ve_tls_producer * producer, unsigned char ** out_buf, size_t * out_size);
 VE_TLS_API ve_tls_result ve_tls_producer_import_raw_buffer(ve_tls_producer * producer, const unsigned char * buf, size_t size);

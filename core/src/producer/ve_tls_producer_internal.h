@@ -12,6 +12,8 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdatomic.h>
+#include <limits.h>
+#include <time.h>
 
 typedef struct {
     int64_t id;
@@ -63,6 +65,20 @@ typedef struct {
      * process-local scheduling state only; the WAL remains the source of
      * truth across producer restarts. */
     int32_t persistent_retry_cycle;
+    /* Process-local delivery diagnostics and memory-retention scheduling. */
+    int32_t memory_retry_cycle;
+    int32_t delivery_attempt_count;
+    int32_t delivery_cycle_attempt_count;
+    int32_t delivery_started;
+    int32_t memory_retry_retained;
+    int64_t delivery_start_ms;
+    int64_t memory_retry_deadline_ms;
+    /* Diagnostic-only association. These fields never enter the HTTP request. */
+    uint64_t diagnostic_attempt_id;
+    int64_t diagnostic_attempt_monotonic_ms;
+    int64_t diagnostic_attempt_elapsed_ms;
+    int64_t diagnostic_batch_sealed_monotonic_ms;
+    int64_t diagnostic_queue_wait_ms;
     /* scratch 预算的"中转持有"：从 prepare 阶段的 scratch_bytes 占位，
      * 直到 push 阶段把它原子迁移到 send_queue_bytes 为止。任何分支
      * 在 task 销毁前未完成迁移时，必须由 send_task_free 兜底归还。 */
@@ -135,6 +151,8 @@ struct ve_tls_producer {
     void * send_done_param;
     ve_tls_send_done_v2_fn send_done_v2;
     void * send_done_v2_param;
+    ve_tls_delivery_diagnostic_fn delivery_diagnostic;
+    void * delivery_diagnostic_param;
     int32_t fast_send;
     int32_t fast_inflight;
     int32_t fast_builder;
@@ -215,6 +233,7 @@ struct ve_tls_producer {
     char * cfg_access_key_id;
     char * cfg_access_key_secret;
     char * cfg_security_token;
+    char * cfg_api_key;
     char * cfg_api_version;
     char * cfg_compress_type;
     char * cfg_ca_cert_path;
@@ -224,6 +243,7 @@ struct ve_tls_producer {
     ve_tls_persistent * persistent;
     _Alignas(8) int64_t send_cfg_version;
     _Alignas(8) int64_t static_cred_version;
+    _Alignas(8) _Atomic(uint64_t) diagnostic_attempt_counter;
     _Atomic(ve_tls_runtime_snapshot *) runtime_snapshot;
     ve_tls_obj_pool send_task_pool;
     ve_tls_obj_pool header_buf_pool;
@@ -250,6 +270,7 @@ struct ve_tls_producer {
 VE_TLS_ASSERT_ATOMIC64_ALIGNED(next_id);
 VE_TLS_ASSERT_ATOMIC64_ALIGNED(send_cfg_version);
 VE_TLS_ASSERT_ATOMIC64_ALIGNED(static_cred_version);
+VE_TLS_ASSERT_ATOMIC64_ALIGNED(diagnostic_attempt_counter);
 VE_TLS_ASSERT_ATOMIC64_ALIGNED(m_logs_enqueued_total);
 VE_TLS_ASSERT_ATOMIC64_ALIGNED(m_logs_dropped_total);
 VE_TLS_ASSERT_ATOMIC64_ALIGNED(m_bytes_enqueued_total);
@@ -281,6 +302,27 @@ void ve_tls_breaker_leave_half_open(ve_tls_producer * producer, int ok);
 void ve_tls_breaker_on_final_result(ve_tls_producer * producer, int ok);
 void ve_tls_metric_inc_u64(_Atomic(uint64_t) * p, uint64_t v);
 uint64_t ve_tls_metric_load_u64(_Atomic(uint64_t) * p);
+void ve_tls_diagnostic_emit(
+    ve_tls_producer * producer,
+    const ve_tls_delivery_diagnostic * diagnostic
+);
+
+/* Monotonic time is diagnostic-only; business scheduling continues to use
+ * the configured platform.time_ms callback. */
+static inline int64_t ve_tls_diagnostic_monotonic_ms(void) {
+#if defined(CLOCK_MONOTONIC)
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0 || ts.tv_sec < 0) {
+        return -1;
+    }
+    if ((uintmax_t)ts.tv_sec > (uintmax_t)INT64_MAX / 1000u) {
+        return INT64_MAX;
+    }
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+#else
+    return -1;
+#endif
+}
 void ve_tls_persistent_on_final_result(ve_tls_producer * producer, ve_tls_result result, int64_t start_id, int64_t end_id);
 int ve_tls_persistent_heartbeat_if_due(ve_tls_persistent * persistent, int force);
 

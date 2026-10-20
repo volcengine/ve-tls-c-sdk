@@ -13,6 +13,18 @@ static int ve_tls_str_empty(const char * s) {
     return !s || s[0] == 0;
 }
 
+static int ve_tls_valid_api_key(const char * api_key) {
+    if (ve_tls_str_empty(api_key)) {
+        return 1;
+    }
+    for (const unsigned char * p = (const unsigned char *)api_key; *p; p++) {
+        if (*p < 32 || *p == 127) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 /* The hash-key range is
  * [00000000000000000000000000000000, ffffffffffffffffffffffffffffffff).
  * Keep this check at the C boundary because callers can use the C API without
@@ -269,13 +281,14 @@ static int ve_tls_resolve_persistent_durability(
     return -1;
 }
 
-static int ve_tls_config_is_valid_for_create(const ve_tls_config * cfg) {
+static int ve_tls_config_is_valid_for_create(const ve_tls_config * cfg, const char * api_key) {
     if (!cfg) return 0;
     if (!ve_tls_is_http_url(cfg->endpoint)) return 0;
     if (ve_tls_str_empty(cfg->region)) return 0;
     if (ve_tls_str_empty(cfg->topic_id)) return 0;
     if (!ve_tls_valid_hash_key(cfg->hash_key)) return 0;
-    if (!cfg->credentials_provider) {
+    if (!ve_tls_valid_api_key(api_key)) return 0;
+    if (ve_tls_str_empty(api_key) && !cfg->credentials_provider) {
         if (ve_tls_str_empty(cfg->access_key_id) || ve_tls_str_empty(cfg->access_key_secret)) return 0;
     }
     if (cfg->use_persistent) {
@@ -294,6 +307,13 @@ static int ve_tls_config_is_valid_for_create(const ve_tls_config * cfg) {
             cfg->persistent_expired_log_policy != VE_TLS_PEXPIRED_DROP) return 0;
         if (cfg->persistent_auth_failure_policy != VE_TLS_PAUTH_RETAIN &&
             cfg->persistent_auth_failure_policy != VE_TLS_PAUTH_DROP) return 0;
+    }
+    if (cfg->memory_retry_retention_ms < 0 ||
+        (cfg->bound_request_timeout_to_retry_budget != 0 &&
+         cfg->bound_request_timeout_to_retry_budget != 1) ||
+        (cfg->retry_transient_http_errors != 0 &&
+         cfg->retry_transient_http_errors != 1)) {
+        return 0;
     }
     if (cfg->buffer_full_policy == VE_TLS_BUFFER_FULL_BLOCK) {
         if (cfg->max_buffer_bytes <= 0) return 0;
@@ -1657,7 +1677,11 @@ ve_tls_result ve_tls_config_init_versioned(
     }
     expected_size = config_version == VE_TLS_CONFIG_VERSION_1
         ? VE_TLS_CONFIG_VERSION_1_SIZE
-        : (config_version == VE_TLS_CONFIG_VERSION_2 ? sizeof(ve_tls_config) : 0);
+        : (config_version == VE_TLS_CONFIG_VERSION_2
+            ? VE_TLS_CONFIG_VERSION_2_SIZE
+            : (config_version == VE_TLS_CONFIG_VERSION_3
+                ? VE_TLS_CONFIG_VERSION_3_SIZE
+                : 0));
     if (expected_size == 0 || config_size != expected_size) {
         return VE_TLS_INVALID;
     }
@@ -1666,14 +1690,18 @@ ve_tls_result ve_tls_config_init_versioned(
     return VE_TLS_OK;
 }
 
-static ve_tls_producer * ve_tls_producer_create_current(const ve_tls_config * config) {
-    if (!config) {
+static ve_tls_producer * ve_tls_producer_create_current(
+    const ve_tls_config * config,
+    const char * api_key,
+    int exclusive_lifetime_lock
+) {
+    if (!config || (exclusive_lifetime_lock != 0 && exclusive_lifetime_lock != 1)) {
         return NULL;
     }
     VE_TLS_ALLOC_SITE("producer_create");
     ve_tls_config effective = *config;
     ve_tls_producer_config_apply_runtime_defaults(&effective);
-    if (!ve_tls_config_is_valid_for_create(&effective)) {
+    if (!ve_tls_config_is_valid_for_create(&effective, api_key)) {
         return NULL;
     }
     ve_tls_warn_risky_block_config(&effective);
@@ -1681,7 +1709,10 @@ static ve_tls_producer * ve_tls_producer_create_current(const ve_tls_config * co
     if (!producer) {
         return NULL;
     }
+    atomic_init(&producer->diagnostic_attempt_counter, 0);
     producer->config = *config;
+    producer->delivery_diagnostic = config->delivery_diagnostic;
+    producer->delivery_diagnostic_param = config->delivery_diagnostic_param;
     producer->cfg_endpoint = ve_tls_strdup(config->endpoint);
     producer->cfg_region = ve_tls_strdup(config->region);
     producer->cfg_project_id = ve_tls_dup_cstr(config->project_id);
@@ -1693,6 +1724,7 @@ static ve_tls_producer * ve_tls_producer_create_current(const ve_tls_config * co
     producer->cfg_access_key_id = config->access_key_id ? ve_tls_strdup(config->access_key_id) : NULL;
     producer->cfg_access_key_secret = config->access_key_secret ? ve_tls_strdup(config->access_key_secret) : NULL;
     producer->cfg_security_token = (config->security_token && config->security_token[0] != 0) ? ve_tls_strdup(config->security_token) : NULL;
+    producer->cfg_api_key = !ve_tls_str_empty(api_key) ? ve_tls_strdup(api_key) : NULL;
     producer->cfg_api_version = ve_tls_dup_cstr(config->api_version);
     producer->cfg_compress_type = ve_tls_dup_cstr(config->compress_type);
     producer->cfg_ca_cert_path = ve_tls_dup_cstr(config->ca_cert_path);
@@ -1707,7 +1739,8 @@ static ve_tls_producer * ve_tls_producer_create_current(const ve_tls_config * co
         ve_tls_producer_destroy(producer);
         return NULL;
     }
-    if (!producer->cfg_endpoint || !producer->cfg_region || !producer->cfg_topic_id) {
+    if (!producer->cfg_endpoint || !producer->cfg_region || !producer->cfg_topic_id ||
+        (!ve_tls_str_empty(api_key) && !producer->cfg_api_key)) {
         ve_tls_producer_destroy(producer);
         return NULL;
     }
@@ -1760,8 +1793,14 @@ static ve_tls_producer * ve_tls_producer_create_current(const ve_tls_config * co
     if (producer->config.use_persistent) {
         ve_tls_persistent_options popt;
         ve_tls_persistent_durability durability;
+        char owner_id[64];
+        int32_t owner_pid = 0;
         producer->persistent_mutex = producer->config.platform.mutex_create();
         if (!producer->persistent_mutex) {
+            ve_tls_producer_destroy(producer);
+            return NULL;
+        }
+        if (ve_tls_lease_create_owner(owner_id, sizeof(owner_id), &owner_pid) != 0) {
             ve_tls_producer_destroy(producer);
             return NULL;
         }
@@ -1774,9 +1813,9 @@ static ve_tls_producer * ve_tls_producer_create_current(const ve_tls_config * co
         popt.platform = &producer->config.platform;
         popt.dir_path = producer->cfg_persistent_file_path;
         popt.instance_id = producer->cfg_topic_id;
-        popt.owner_id = "ve-tls-producer";
+        popt.owner_id = owner_id;
         popt.owner_process_name = "ve-tls";
-        popt.owner_pid = 0;
+        popt.owner_pid = owner_pid;
         popt.segment_max_bytes = (uint64_t)producer->config.max_persistent_file_size;
         popt.segment_max_records = (uint64_t)producer->config.max_persistent_log_count;
         popt.max_bytes = producer->config.persistent_max_bytes > 0
@@ -1799,6 +1838,7 @@ static ve_tls_producer * ve_tls_producer_create_current(const ve_tls_config * co
         popt.open_mode = producer->config.persistent_open_mode == VE_TLS_POPEN_FAIL_IF_OWNED
             ? VE_TLS_LEASE_OPEN_FAIL_IF_OWNED
             : VE_TLS_LEASE_OPEN_TAKEOVER_IF_STALE;
+        popt.exclusive_lifetime_lock = exclusive_lifetime_lock;
         if (ve_tls_resolve_persistent_durability(&producer->config, &durability) != 0) {
             ve_tls_producer_destroy(producer);
             return NULL;
@@ -1813,6 +1853,7 @@ static ve_tls_producer * ve_tls_producer_create_current(const ve_tls_config * co
     producer->fast_send = 0;
     if (!producer->use_global_env &&
         !producer->persistent &&
+        producer->config.memory_retry_retention_ms <= 0 &&
         producer->config.ordered_send == 0 &&
         producer->config.rate_limit_rps <= 0 &&
         producer->config.rate_limit_bps <= 0 &&
@@ -1893,6 +1934,16 @@ static ve_tls_producer * ve_tls_producer_create_current(const ve_tls_config * co
     return producer;
 }
 
+ve_tls_producer * ve_tls_producer_create_exclusive_persistence(
+    const ve_tls_config * config,
+    size_t config_size
+) {
+    if (!config || config_size != sizeof(ve_tls_config) || !config->use_persistent) {
+        return NULL;
+    }
+    return ve_tls_producer_create_current(config, NULL, 1);
+}
+
 ve_tls_producer * ve_tls_producer_create(const ve_tls_config * config) {
     ve_tls_config current;
     if (!config) {
@@ -1900,7 +1951,7 @@ ve_tls_producer * ve_tls_producer_create(const ve_tls_config * config) {
     }
     ve_tls_producer_config_init(&current);
     memcpy(&current, config, VE_TLS_CONFIG_LEGACY_SIZE);
-    return ve_tls_producer_create_current(&current);
+    return ve_tls_producer_create_current(&current, NULL, 0);
 }
 
 ve_tls_producer * ve_tls_producer_create_versioned(
@@ -1911,16 +1962,58 @@ ve_tls_producer * ve_tls_producer_create_versioned(
     ve_tls_config current;
     size_t expected_size = config_version == VE_TLS_CONFIG_VERSION_1
         ? VE_TLS_CONFIG_VERSION_1_SIZE
-        : (config_version == VE_TLS_CONFIG_VERSION_2 ? sizeof(ve_tls_config) : 0);
+        : (config_version == VE_TLS_CONFIG_VERSION_2
+            ? VE_TLS_CONFIG_VERSION_2_SIZE
+            : (config_version == VE_TLS_CONFIG_VERSION_3
+                ? VE_TLS_CONFIG_VERSION_3_SIZE
+                : 0));
     if (!config || expected_size == 0 || config_size != expected_size) {
         return NULL;
     }
-    if (config_version == VE_TLS_CONFIG_VERSION_2) {
-        return ve_tls_producer_create_current(config);
+    if (config_version == VE_TLS_CONFIG_VERSION_3) {
+        return ve_tls_producer_create_current(config, NULL, 0);
     }
     ve_tls_producer_config_init(&current);
     memcpy(&current, config, expected_size);
-    return ve_tls_producer_create_current(&current);
+    return ve_tls_producer_create_current(&current, NULL, 0);
+}
+
+ve_tls_producer * ve_tls_producer_create_with_api_key(
+    const ve_tls_config * config,
+    const char * api_key
+) {
+    ve_tls_config current;
+    if (!config) {
+        return NULL;
+    }
+    ve_tls_producer_config_init(&current);
+    memcpy(&current, config, VE_TLS_CONFIG_LEGACY_SIZE);
+    return ve_tls_producer_create_current(&current, api_key, 0);
+}
+
+ve_tls_producer * ve_tls_producer_create_with_api_key_versioned(
+    const ve_tls_config * config,
+    size_t config_size,
+    uint32_t config_version,
+    const char * api_key
+) {
+    ve_tls_config current;
+    size_t expected_size = config_version == VE_TLS_CONFIG_VERSION_1
+        ? VE_TLS_CONFIG_VERSION_1_SIZE
+        : (config_version == VE_TLS_CONFIG_VERSION_2
+            ? VE_TLS_CONFIG_VERSION_2_SIZE
+            : (config_version == VE_TLS_CONFIG_VERSION_3
+                ? VE_TLS_CONFIG_VERSION_3_SIZE
+                : 0));
+    if (!config || expected_size == 0 || config_size != expected_size) {
+        return NULL;
+    }
+    if (config_version == VE_TLS_CONFIG_VERSION_3) {
+        return ve_tls_producer_create_current(config, api_key, 0);
+    }
+    ve_tls_producer_config_init(&current);
+    memcpy(&current, config, expected_size);
+    return ve_tls_producer_create_current(&current, api_key, 0);
 }
 
 static void ve_tls_runtime_update_finish(ve_tls_producer * producer) {
@@ -2159,6 +2252,66 @@ ve_tls_result ve_tls_producer_update_static_credentials(ve_tls_producer * produc
     return VE_TLS_OK;
 }
 
+ve_tls_result ve_tls_producer_update_api_key(ve_tls_producer * producer, const char * api_key) {
+    char * new_api_key = NULL;
+    char * old_api_key = NULL;
+    int64_t old_version = 0;
+    int64_t next_version = 0;
+    ve_tls_runtime_snapshot * next_snapshot = NULL;
+    ve_tls_runtime_snapshot_patch patch;
+    if (!producer) {
+        return VE_TLS_INVALID;
+    }
+    VE_TLS_ALLOC_SITE("update_api_key");
+    if (!ve_tls_valid_api_key(api_key)) {
+        return VE_TLS_INVALID;
+    }
+    if (!ve_tls_str_empty(api_key)) {
+        new_api_key = ve_tls_strdup(api_key);
+        if (!new_api_key) {
+            return VE_TLS_DROP_ERROR;
+        }
+    }
+    producer->config.platform.mutex_lock(producer->mutex);
+    if (producer->stop || producer->closing || !producer->accepting) {
+        producer->config.platform.mutex_unlock(producer->mutex);
+        ve_tls_secure_free_str(&new_api_key);
+        return VE_TLS_CLOSED;
+    }
+    producer->runtime_updates_inflight++;
+    old_version = __atomic_load_n(&producer->static_cred_version, __ATOMIC_ACQUIRE);
+    const ve_tls_runtime_snapshot * base = atomic_load_explicit(
+        &producer->runtime_snapshot, memory_order_acquire);
+    memset(&patch, 0, sizeof(patch));
+    next_version = old_version + 1;
+    patch.send_cfg_version = base ? base->send_cfg_version : 0;
+    patch.static_cred_version = next_version;
+    if (!base || ve_tls_runtime_snapshot_build_patched(base, &patch, &next_snapshot) != 0) {
+        producer->config.platform.mutex_unlock(producer->mutex);
+        ve_tls_secure_free_str(&new_api_key);
+        ve_tls_metrics_emit(producer, "snapshot_refresh_failed", 1, 0);
+        ve_tls_runtime_update_finish(producer);
+        return VE_TLS_DROP_ERROR;
+    }
+    old_api_key = producer->cfg_api_key;
+    producer->cfg_api_key = new_api_key;
+    new_api_key = NULL;
+    ve_tls_runtime_snapshot_publish_locked(producer, next_snapshot);
+    __atomic_store_n(&producer->static_cred_version, next_version, __ATOMIC_RELEASE);
+    ve_tls_key_queue_resume_auth_waiters_locked(producer, next_version);
+    if (producer->send_cond) {
+        producer->config.platform.cond_broadcast(producer->send_cond);
+    }
+    producer->config.platform.mutex_unlock(producer->mutex);
+    ve_tls_secure_free_str(&old_api_key);
+    ve_tls_metrics_emit(producer, "config_update_api_key", 1, 0);
+    if (producer->use_global_env) {
+        ve_tls_env_notify(producer);
+    }
+    ve_tls_runtime_update_finish(producer);
+    return VE_TLS_OK;
+}
+
 ve_tls_result ve_tls_producer_close(ve_tls_producer * producer, int32_t timeout_ms) {
     if (!producer) {
         return VE_TLS_INVALID;
@@ -2371,6 +2524,7 @@ void ve_tls_producer_destroy(ve_tls_producer * producer) {
     ve_tls_secure_free_str(&producer->cfg_access_key_id);
     ve_tls_secure_free_str(&producer->cfg_access_key_secret);
     ve_tls_secure_free_str(&producer->cfg_security_token);
+    ve_tls_secure_free_str(&producer->cfg_api_key);
     ve_tls_free(producer->cfg_api_version);
     ve_tls_free(producer->cfg_compress_type);
     ve_tls_free(producer->cfg_ca_cert_path);
@@ -2392,6 +2546,7 @@ void ve_tls_producer_destroy(ve_tls_producer * producer) {
     producer->cfg_access_key_id = NULL;
     producer->cfg_access_key_secret = NULL;
     producer->cfg_security_token = NULL;
+    producer->cfg_api_key = NULL;
     producer->cfg_api_version = NULL;
     producer->cfg_compress_type = NULL;
     producer->cfg_ca_cert_path = NULL;
@@ -3378,6 +3533,61 @@ ve_tls_result ve_tls_producer_flush(ve_tls_producer * producer) {
         }
     }
     return ve_tls_map_persistent_flush_error(producer, flush_rc);
+}
+
+ve_tls_result ve_tls_producer_notify_network_recovered(ve_tls_producer * producer) {
+    if (!producer) {
+        return VE_TLS_INVALID;
+    }
+    producer->config.platform.mutex_lock(producer->mutex);
+    if (producer->closing || producer->stop) {
+        producer->config.platform.mutex_unlock(producer->mutex);
+        return VE_TLS_CLOSED;
+    }
+    if (producer->config.memory_retry_retention_ms <= 0 && !producer->persistent) {
+        producer->config.platform.mutex_unlock(producer->mutex);
+        return VE_TLS_OK;
+    }
+    int64_t now_ms = producer->config.platform.time_ms
+        ? producer->config.platform.time_ms()
+        : 0;
+    /* Detach the complete original chain before reordering any member. If a
+     * queue is inserted into the live delayed list while its old successor is
+     * still linked, add_sorted can make that successor point back to the
+     * current queue and the walk never terminates. The detached dnext chain is
+     * stable because no detached node is visible to add_sorted yet. */
+    ve_tls_key_queue * q = producer->delayed_head;
+    producer->delayed_head = NULL;
+    producer->delayed_tail = NULL;
+    int woke = 0;
+    while (q) {
+        ve_tls_key_queue * next = q->dnext;
+        int eligible = 0;
+        int64_t original_next_ready_ms = q->next_ready_ms;
+        if (q->count > 0 && q->auth_wait_cred_version <= 0) {
+            ve_tls_send_task * task = &q->q[q->head];
+            eligible = task->memory_retry_retained || task->persistent_retry_cycle > 0;
+        }
+        q->delayed = 0;
+        q->dprev = NULL;
+        q->dnext = NULL;
+        q->next_ready_ms = 0;
+        if (eligible) {
+            ve_tls_delayed_add_sorted(producer, q, now_ms);
+            woke = 1;
+        } else {
+            ve_tls_delayed_add_sorted(producer, q, original_next_ready_ms);
+        }
+        q = next;
+    }
+    if (woke && producer->send_cond) {
+        producer->config.platform.cond_broadcast(producer->send_cond);
+    }
+    producer->config.platform.mutex_unlock(producer->mutex);
+    if (woke && producer->use_global_env) {
+        ve_tls_env_notify(producer);
+    }
+    return VE_TLS_OK;
 }
 
 ve_tls_result ve_tls_producer_recover(ve_tls_producer * producer) {
