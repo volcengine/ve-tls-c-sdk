@@ -153,7 +153,7 @@ int main(int argc, char ** argv) {
     if (cfg.platform.time_unix_ns) {
         int64_t now_ns = cfg.platform.time_unix_ns();
         if (now_ns > 0) {
-            time_ns = (uint32_t)(now_ns % 1000000000LL);
+            time_ns = (uint32_t)(now_ns % 1000000LL);
         }
     }
     ve_tls_kv kvs[4];
@@ -281,8 +281,8 @@ int main(int argc, char ** argv) {
         body.size,
         api_version,
         context_flow);
-    cfg.http_client.free_response(&cfg.http_client, &resp);
     rc = resp.status_code == 200 ? 0 : 1;
+    cfg.http_client.free_response(&cfg.http_client, &resp);
 
 cleanup:
     free(query);
