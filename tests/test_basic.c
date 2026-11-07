@@ -807,7 +807,7 @@ static int test_path_is_tracked_lease_temp(const char * path) {
 
 static int test_path_is_tracked_checkpoint(const char * path) {
     size_t n;
-    static const char suffix[] = "/checkpoint";
+    static const char suffix[] = "/checkpoint.tmp";
     if (!test_path_in_tracked_dir(path)) {
         return 0;
     }

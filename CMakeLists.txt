@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(ve_tls_c_sdk VERSION 0.3.4 LANGUAGES C)
+project(ve_tls_c_sdk VERSION 0.3.5 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -204,6 +204,7 @@ install(FILES
     docs/platform-contract.md
     docs/release-notes-0.3.0.md
     docs/release-notes-0.3.4.md
+    docs/release-notes-0.3.5.md
     DESTINATION share/doc/ve_tls_core
 )
 
@@ -231,11 +232,23 @@ if(VE_TLS_BUILD_TOOLS AND NOT ANDROID)
     add_executable(ve_tls_demo_putlogsv2 tools/putlogsv2_demo.c)
     target_link_libraries(ve_tls_demo_putlogsv2 PRIVATE ve_tls_core)
 
+    if(BUILD_SHARED_LIBS AND VE_TLS_ENABLE_CURL)
+        # The protocol demos use internal helpers outside the shared-library ABI.
+        foreach(demo IN ITEMS ve_tls_demo_putlogs ve_tls_demo_putlogsv2)
+            target_sources(${demo} PRIVATE
+                core/src/ve_tls_proto.c
+                core/src/ve_tls_hash.c
+                core/src/ve_tls_sign.c
+            )
+        endforeach()
+    endif()
+
     add_executable(ve_tls_demo_real tools/real_demo.c)
     target_link_libraries(ve_tls_demo_real PRIVATE ve_tls_core)
 
     add_executable(ve_tls_bench tools/bench.c)
     target_link_libraries(ve_tls_bench PRIVATE ve_tls_core)
+    target_include_directories(ve_tls_bench PRIVATE core/src)
 
     if(NOT BUILD_SHARED_LIBS)
         # These developer tools intentionally call internal helpers and are not
@@ -287,6 +300,14 @@ if(VE_TLS_BUILD_TESTS)
         endif()
         add_test(NAME ve_tls_test_basic COMMAND ve_tls_test_basic)
 
+        foreach(test_name IN ITEMS checkpoint_ranges persistent_ack_replay)
+            add_executable(ve_tls_test_${test_name} tests/test_${test_name}.c)
+            target_link_libraries(ve_tls_test_${test_name} PRIVATE ve_tls_core)
+            target_include_directories(ve_tls_test_${test_name} PRIVATE core/src)
+            add_test(NAME ve_tls_test_${test_name} COMMAND ve_tls_test_${test_name})
+            set_tests_properties(ve_tls_test_${test_name} PROPERTIES TIMEOUT 120)
+        endforeach()
+
         if(VE_TLS_ENABLE_LZ4)
             add_executable(ve_tls_test_lz4_host_consumer tests/test_lz4_host_consumer.c)
             target_link_libraries(ve_tls_test_lz4_host_consumer PRIVATE ve_tls_core)
@@ -320,6 +341,18 @@ if(VE_TLS_BUILD_TESTS)
                 "-DVE_TLS_EXPECT_CURL=${VE_TLS_ENABLE_CURL}"
                 -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/verify_exports.cmake
         )
+    endif()
+    if(VE_TLS_ENABLE_CURL AND NOT ANDROID)
+        add_executable(ve_tls_test_putlogsv2_demo tests/test_putlogsv2_demo.c)
+        target_link_libraries(ve_tls_test_putlogsv2_demo PRIVATE ve_tls_core)
+        if(BUILD_SHARED_LIBS)
+            target_sources(ve_tls_test_putlogsv2_demo PRIVATE
+                core/src/ve_tls_proto.c
+                core/src/ve_tls_hash.c
+                core/src/ve_tls_sign.c
+            )
+        endif()
+        add_test(NAME ve_tls_test_putlogsv2_demo COMMAND ve_tls_test_putlogsv2_demo)
     endif()
     if(TARGET ve_tls_bench)
         add_test(NAME ve_tls_bench_help COMMAND ve_tls_bench --help)
@@ -414,9 +447,12 @@ if(VE_TLS_ENABLE_ASAN OR VE_TLS_ENABLE_UBSAN)
         ve_tls_core
         ve_tls_test_basic
         ve_tls_test_apikey
+        ve_tls_test_checkpoint_ranges
+        ve_tls_test_persistent_ack_replay
         ve_tls_test_lz4_host_consumer
         ve_tls_test_android_binding
         ve_tls_test_cpp_headers
+        ve_tls_test_putlogsv2_demo
         ve_tls_demo
         ve_tls_demo_putlogs
         ve_tls_demo_putlogsv2

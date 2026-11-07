@@ -77,6 +77,7 @@ struct ve_tls_persistent {
     int lease_fd;
     int32_t creator_pid;
     _Atomic(int64_t) next_heartbeat_ms;
+    _Atomic(int64_t) next_checkpoint_ms;
     _Atomic(int64_t) lease_valid_until_ms;
     uint64_t current_bytes;
     uint64_t current_records;
@@ -89,7 +90,14 @@ struct ve_tls_persistent {
     uint64_t append_dropped_records;
     uint64_t append_dropped_bytes;
     uint8_t checkpoint_dirty;
+    uint8_t checkpoint_retry_pending;
     uint8_t reclaim_pending;
+    uint8_t checkpoint_extension_invalid;
+    ve_tls_checkpoint_range * completed_ranges;
+    size_t completed_range_count;
+    size_t completed_range_capacity;
+    /* Snapshot at open, before reclaim, used to allocate fresh producer IDs. */
+    int64_t recovered_max_log_id;
     ve_tls_persistent_segment_meta * segment_meta;
     uint32_t segment_meta_cap;
     unsigned char * append_buf;
@@ -122,6 +130,10 @@ int ve_tls_persistent_recover(
     void * user
 );
 int ve_tls_persistent_ack_range(ve_tls_persistent * persistent, int64_t start_id, int64_t end_id);
+/* Records only successful delivery ranges; gaps remain eligible for replay. */
+int ve_tls_persistent_ack_completed_range(ve_tls_persistent * persistent, int64_t start_id, int64_t end_id);
+/* Checkpoint only: never seals batches, flushes the WAL, or sends requests. */
+int ve_tls_persistent_checkpoint_if_due(ve_tls_persistent * persistent);
 int ve_tls_persistent_heartbeat_if_due(ve_tls_persistent * persistent, int force);
 int ve_tls_persistent_flush(ve_tls_persistent * persistent);
 

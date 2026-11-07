@@ -1,4 +1,5 @@
 #include "ve_tls_producer_internal.h"
+#include "ve_tls_persistent.h"
 #include "ve_tls_alloc.h"
 
 #include <stdlib.h>
@@ -68,6 +69,10 @@ static void ve_tls_manager_emit_batch_sealed(
 static void ve_tls_manager_heartbeat_persistent(ve_tls_producer * producer) {
     if (producer && producer->persistent) {
         (void)ve_tls_persistent_heartbeat_if_due(producer->persistent, 0);
+        producer->config.platform.mutex_lock(producer->persistent_mutex);
+        int rc = ve_tls_persistent_checkpoint_if_due(producer->persistent);
+        producer->config.platform.mutex_unlock(producer->persistent_mutex);
+        if (rc != 0) ve_tls_metrics_emit(producer, "persistent_checkpoint_save_failed", 0, 0);
     }
 }
 
@@ -338,18 +343,17 @@ static void * ve_tls_worker_main_builder(void * arg) {
                 }
             }
         }
-        while (!producer->stop && producer->queue_count == 0 && producer->ingress_queue_count == 0 && !producer->flush_requested && !producer->sealed_head && !have_any_builder) {
-            producer->config.platform.cond_wait(producer->cond, producer->mutex);
-            have_any_builder = (producer->default_builder && producer->default_builder->log_count > 0) ? 1 : 0;
-            have_ingress = producer->ingress_queue_count > 0 ? 1 : 0;
-            for (size_t i = 0; i < producer->key_bucket_count && !have_any_builder; i++) {
-                for (ve_tls_key_queue * q = producer->key_buckets[i]; q; q = q->hnext) {
-                    if (q->builder && q->builder->log_count > 0) {
-                        have_any_builder = 1;
-                        break;
-                    }
-                }
+        if (!producer->stop && producer->queue_count == 0 && producer->ingress_queue_count == 0 && !producer->flush_requested && !producer->sealed_head && !have_any_builder) {
+            int64_t due = producer->persistent ?
+                atomic_load_explicit(&producer->persistent->next_checkpoint_ms, memory_order_acquire) : 0;
+            if (due != 0) {
+                int64_t wait_ms = due - producer->config.platform.time_ms();
+                if (wait_ms > 0) producer->config.platform.cond_timedwait_ms(producer->cond, producer->mutex, wait_ms);
+            } else {
+                producer->config.platform.cond_wait(producer->cond, producer->mutex);
             }
+            producer->config.platform.mutex_unlock(producer->mutex);
+            continue;
         }
         if (!producer->stop && producer->queue_count == 0 && producer->ingress_queue_count == 0 && !producer->flush_requested && !producer->sealed_head && have_any_builder) {
             int64_t now_wait = producer->config.platform.time_ms ? producer->config.platform.time_ms() : 0;
@@ -373,6 +377,12 @@ static void * ve_tls_worker_main_builder(void * arg) {
                         }
                     }
                 }
+            }
+            int64_t checkpoint_due = producer->persistent ?
+                atomic_load_explicit(&producer->persistent->next_checkpoint_ms, memory_order_acquire) : 0;
+            if (checkpoint_due != 0 && (!have_deadline || checkpoint_due - now_wait < wait_ms)) {
+                wait_ms = checkpoint_due - now_wait;
+                have_deadline = 1;
             }
             if (have_deadline) {
                 if (wait_ms > 0 && producer->config.platform.cond_timedwait_ms) {

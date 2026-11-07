@@ -1,5 +1,6 @@
 #include "ve_tls_producer.h"
 #include "ve_tls_env.h"
+#include "producer/ve_tls_persistent.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -146,6 +147,7 @@ static void usage(const char * argv0) {
     fprintf(stderr, "optional: [--write-mode raw|kv|template] [--template-mode on|off] [--send-thread-count N] [--compress-type none|lz4|zlib]\n");
     fprintf(stderr, "optional: [--queue-full-policy block|drop|drop_sampled] [--send-queue-block-timeout-ms N] [--max-buffer-bytes N] [--send-queue-size N] [--flush-interval-ms N] [--log-count-per-package N]\n");
     fprintf(stderr, "optional: [--use-persistent 0|1] [--persistent-dir PATH] [--profile tls200|tls700|tls5120]\n");
+    fprintf(stderr, "optional: [--persistent-durability buffered|sync] [--persistent-exclusive 0|1] (defaults: buffered, 0)\n");
 }
 
 static uint64_t g_sent = 0;
@@ -226,6 +228,8 @@ int main(int argc, char ** argv) {
     int32_t send_thread_count = 0;
     int32_t send_queue_block_timeout_ms = 5000;
     int32_t use_persistent = 0;
+    int32_t persistent_exclusive = 0;
+    ve_tls_persistent_durability persistent_durability = VE_TLS_PDURABILITY_BUFFERED_WAL;
     const char * persistent_dir_arg = NULL;
     char persistent_dir_buf[PATH_MAX];
     const char * profile = "custom";
@@ -292,6 +296,24 @@ int main(int argc, char ** argv) {
             if (parse_i32(v, &use_persistent) != 0) return 2;
         } else if (strcmp(k, "--persistent-dir") == 0) {
             persistent_dir_arg = v;
+        } else if (strcmp(k, "--persistent-durability") == 0) {
+            if (strcmp(v, "buffered") == 0) {
+                persistent_durability = VE_TLS_PDURABILITY_BUFFERED_WAL;
+            } else if (strcmp(v, "sync") == 0) {
+                persistent_durability = VE_TLS_PDURABILITY_SYNC_WAL;
+            } else {
+                fprintf(stderr, "--persistent-durability must be buffered or sync\n");
+                return 2;
+            }
+        } else if (strcmp(k, "--persistent-exclusive") == 0) {
+            if (strcmp(v, "0") == 0) {
+                persistent_exclusive = 0;
+            } else if (strcmp(v, "1") == 0) {
+                persistent_exclusive = 1;
+            } else {
+                fprintf(stderr, "--persistent-exclusive must be 0 or 1\n");
+                return 2;
+            }
         } else if (strcmp(k, "--profile") == 0) {
             if (parse_profile(v, &message_bytes) != 0) return 2;
             profile = v;
@@ -309,13 +331,27 @@ int main(int argc, char ** argv) {
         }
     }
 
+    if (persistent_exclusive && use_persistent != 1) {
+        fprintf(stderr, "--persistent-exclusive 1 requires --use-persistent 1\n");
+        return 2;
+    }
+#if defined(VE_TLS_SHARED)
+    if (persistent_exclusive) {
+        fprintf(stderr, "--persistent-exclusive 1 requires a static Core build\n");
+        return 2;
+    }
+#endif
+
     char * msg = (char *)malloc((size_t)message_bytes + 1);
     if (!msg) return 3;
     memset(msg, 'a', (size_t)message_bytes);
     msg[message_bytes] = 0;
 
     ve_tls_config cfg;
-    ve_tls_config_init(&cfg);
+    if (ve_tls_config_init_versioned(&cfg, sizeof(cfg), VE_TLS_CONFIG_VERSION_CURRENT) != VE_TLS_OK) {
+        free(msg);
+        return 4;
+    }
     cfg.endpoint = "https://example.com";
     cfg.region = "cn-beijing";
     cfg.topic_id = "bench-topic";
@@ -343,6 +379,7 @@ int main(int argc, char ** argv) {
             persistent_dir_arg = persistent_dir_buf;
         }
         cfg.use_persistent = 1;
+        cfg.persistent_durability = persistent_durability;
         cfg.persistent_file_path = persistent_dir_arg;
         cfg.max_persistent_file_size = 8 * 1024 * 1024;
         cfg.max_persistent_file_count = 64;
@@ -363,7 +400,14 @@ int main(int argc, char ** argv) {
         cfg.use_global_env = 1;
     }
 
-    ve_tls_producer * p = ve_tls_producer_create(&cfg);
+    ve_tls_producer * p;
+#if defined(VE_TLS_SHARED)
+    p = ve_tls_producer_create_versioned(&cfg, sizeof(cfg), VE_TLS_CONFIG_VERSION_CURRENT);
+#else
+    p = persistent_exclusive
+        ? ve_tls_producer_create_exclusive_persistence(&cfg, sizeof(cfg))
+        : ve_tls_producer_create_versioned(&cfg, sizeof(cfg), VE_TLS_CONFIG_VERSION_CURRENT);
+#endif
     if (!p) {
         if (use_global_env) {
             (void)ve_tls_env_destroy(close_timeout_ms);
@@ -454,9 +498,11 @@ int main(int argc, char ** argv) {
     double produce_s = produce_ms > 0 ? (double)produce_ms / 1000.0 : 0.001;
     double close_s = close_ms > 0 ? (double)close_ms / 1000.0 : 0.001;
     uint64_t drained_logs = m.logs_enqueued_total > produced_sent ? (m.logs_enqueued_total - produced_sent) : 0;
-    fprintf(stderr, "bench config write_mode=%s persistent=%d profile=%s target_payload_bytes=%d queue_full_policy=%s compress_type=%s writers=%d senders=%d\n",
+    fprintf(stderr, "bench config write_mode=%s persistent=%d persistent_durability=%s persistent_exclusive=%d profile=%s target_payload_bytes=%d queue_full_policy=%s compress_type=%s writers=%d senders=%d\n",
         write_mode_str(write_mode),
         use_persistent ? 1 : 0,
+        persistent_durability == VE_TLS_PDURABILITY_SYNC_WAL ? "sync" : "buffered",
+        (int)persistent_exclusive,
         profile,
         (int)message_bytes,
         queue_full_policy_str(queue_full_policy),

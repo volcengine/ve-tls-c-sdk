@@ -33,14 +33,14 @@ symbol, and a consumer link test verifies coexistence with host-provided bare
 LZ4 symbols. The private prefixed symbols are implementation details and are
 not added to `abi/approved-symbols.txt`.
 
-The 0.3.4 package's shared release gate supports Mach-O and ELF targets, including
+The shared release gate supports Mach-O and ELF targets, including
 Android ELF. Windows is not a supported build target for this POSIX/mobile
 core release. The Windows branch of `VE_TLS_API` preserves header portability
 for a future platform adapter, but is not DLL compatibility evidence.
 
 ## Versioning
 
-The 0.3.4 SDK package defines `VE_TLS_C_SDK_VERSION` as `"0.3.4"`.
+The 0.3.5 SDK package defines `VE_TLS_C_SDK_VERSION` as `"0.3.5"`.
 `VE_TLS_C_SDK_API_VERSION` remains `"0.3.0"`: it is the default TLS service
 API version sent in the `x-tls-apiversion` request header, not a C ABI version.
 Changing the package version must not silently change the service protocol.

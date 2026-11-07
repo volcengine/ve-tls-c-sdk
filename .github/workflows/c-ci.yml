@@ -47,6 +47,17 @@ jobs:
               -DVE_TLS_ENABLE_ZLIB=OFF
               -DVE_TLS_BUILD_TESTS=ON
               -DVE_TLS_BUILD_TOOLS=OFF
+          - name: shared-curl-tools
+            build_dir: build/shared-curl-tools
+            cc: gcc
+            cxx: g++
+            cmake_args: >-
+              -DCMAKE_BUILD_TYPE=Release
+              -DBUILD_SHARED_LIBS=ON
+              -DVE_TLS_ENABLE_CURL=ON
+              -DVE_TLS_ENABLE_ZLIB=OFF
+              -DVE_TLS_BUILD_TESTS=ON
+              -DVE_TLS_BUILD_TOOLS=ON
           - name: asan-ubsan
             build_dir: build/asan-ubsan
             cc: clang
@@ -69,6 +80,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+
+      - name: Install curl development files
+        if: matrix.name == 'shared-curl-tools'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libcurl4-openssl-dev
 
       - name: Configure
         run: cmake -S . -B "${{ matrix.build_dir }}" ${{ matrix.cmake_args }}

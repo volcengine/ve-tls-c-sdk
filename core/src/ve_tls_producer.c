@@ -886,123 +886,28 @@ static int ve_tls_recover_record_to_queue(
     return 0;
 }
 
-static void ve_tls_persistent_free_ack_ranges(ve_tls_producer * producer) {
-    ve_tls_completed_ack_range * cur;
-    if (!producer) {
-        return;
-    }
-    cur = producer->persistent_ack_head;
-    while (cur) {
-        ve_tls_completed_ack_range * next = cur->next;
-        ve_tls_free(cur);
-        cur = next;
-    }
-    producer->persistent_ack_head = NULL;
-}
-
-static int64_t ve_tls_persistent_record_completed_range_locked(ve_tls_producer * producer, int64_t start_id, int64_t end_id) {
-    int64_t acked;
-    int64_t advance_to;
-    ve_tls_completed_ack_range * prev;
-    ve_tls_completed_ack_range * cur;
-    if (!producer || !producer->persistent || start_id <= 0 || end_id < start_id) {
-        return 0;
-    }
-    acked = producer->persistent->checkpoint.acked_log_id;
-    if (end_id <= acked) {
-        return 0;
-    }
-    if (start_id <= acked) {
-        start_id = acked + 1;
-    }
-    if (start_id > acked + 1) {
-        ve_tls_completed_ack_range * node;
-        prev = NULL;
-        cur = producer->persistent_ack_head;
-        while (cur && cur->end_id < start_id - 1) {
-            prev = cur;
-            cur = cur->next;
-        }
-        while (cur && cur->start_id <= end_id + 1) {
-            ve_tls_completed_ack_range * next = cur->next;
-            if (cur->start_id < start_id) {
-                start_id = cur->start_id;
-            }
-            if (cur->end_id > end_id) {
-                end_id = cur->end_id;
-            }
-            if (prev) {
-                prev->next = next;
-            } else {
-                producer->persistent_ack_head = next;
-            }
-            ve_tls_free(cur);
-            cur = next;
-        }
-        node = (ve_tls_completed_ack_range *)ve_tls_calloc(1, sizeof(*node));
-        if (!node) {
-            return 0;
-        }
-        node->start_id = start_id;
-        node->end_id = end_id;
-        if (prev) {
-            node->next = prev->next;
-            prev->next = node;
-        } else {
-            node->next = producer->persistent_ack_head;
-            producer->persistent_ack_head = node;
-        }
-        return 0;
-    }
-
-    advance_to = end_id;
-    prev = NULL;
-    cur = producer->persistent_ack_head;
-    while (cur && cur->start_id <= advance_to + 1) {
-        ve_tls_completed_ack_range * next = cur->next;
-        if (cur->end_id > advance_to) {
-            advance_to = cur->end_id;
-        }
-        if (prev) {
-            prev->next = next;
-        } else {
-            producer->persistent_ack_head = next;
-        }
-        ve_tls_free(cur);
-        cur = next;
-    }
-    return advance_to > acked ? advance_to : 0;
-}
-
 void ve_tls_persistent_on_final_result(ve_tls_producer * producer, ve_tls_result result, int64_t start_id, int64_t end_id) {
-    int64_t ack_to = 0;
-    int checkpoint_save_failed = 0;
-    if (!ve_tls_persistent_enabled(producer)) {
-        return;
+    int rc;
+    int wake_builder;
+    if (!ve_tls_persistent_enabled(producer) || result != VE_TLS_OK) return;
+    if (start_id <= 0 || end_id < start_id) return;
+    if (producer->persistent_mutex) producer->config.platform.mutex_lock(producer->persistent_mutex);
+    int64_t prior_due = atomic_load_explicit(&producer->persistent->next_checkpoint_ms, memory_order_acquire);
+    rc = ve_tls_persistent_ack_completed_range(producer->persistent, start_id, end_id);
+    wake_builder = prior_due == 0 &&
+        atomic_load_explicit(&producer->persistent->next_checkpoint_ms, memory_order_acquire) != 0;
+    if (producer->persistent_mutex) producer->config.platform.mutex_unlock(producer->persistent_mutex);
+    /* The builder owns the idle timer. Signal under its mutex after releasing
+       persistence locks, without asking it to seal or flush any batch. */
+    if (wake_builder) {
+        producer->config.platform.mutex_lock(producer->mutex);
+        producer->config.platform.cond_signal(producer->cond);
+        producer->config.platform.mutex_unlock(producer->mutex);
     }
-    /* Delivery failures describe the current attempt, not a durable drop policy. */
-    if (result != VE_TLS_OK) {
-        return;
-    }
-    if (start_id <= 0 || end_id <= 0 || end_id < start_id) {
-        return;
-    }
-    if (producer->persistent_mutex) {
-        producer->config.platform.mutex_lock(producer->persistent_mutex);
-    }
-    ack_to = ve_tls_persistent_record_completed_range_locked(producer, start_id, end_id);
-    if (ack_to > 0) {
-        if (ve_tls_persistent_ack_range(producer->persistent, 1, ack_to) != 0 &&
-            producer->persistent->checkpoint.acked_log_id >= ack_to &&
-            producer->persistent->durable_checkpoint_acked_log_id < ack_to) {
-            checkpoint_save_failed = 1;
-        }
-    }
-    if (producer->persistent_mutex) {
-        producer->config.platform.mutex_unlock(producer->persistent_mutex);
-    }
-    if (checkpoint_save_failed) {
-        ve_tls_metrics_emit(producer, "persistent_checkpoint_save_failed", start_id, end_id);
+    if (rc != 0) {
+        ve_tls_metrics_emit(producer,
+            rc == VE_TLS_PERSISTENT_FLUSH_CHECKPOINT_FAILED ?
+                "persistent_checkpoint_save_failed" : "persistent_ack_failed", start_id, end_id);
     }
 }
 
@@ -1848,6 +1753,10 @@ static ve_tls_producer * ve_tls_producer_create_current(
             ve_tls_producer_destroy(producer);
             return NULL;
         }
+        producer->next_id = producer->persistent->recovered_max_log_id + 1;
+        if (producer->persistent->checkpoint_extension_invalid) {
+            ve_tls_metrics_emit(producer, "persistent_checkpoint_extension_invalid", 0, 0);
+        }
     }
     producer->use_global_env = producer->config.use_global_env ? 1 : 0;
     producer->fast_send = 0;
@@ -2564,7 +2473,6 @@ void ve_tls_producer_destroy(ve_tls_producer * producer) {
         ve_tls_free(producer->persistent);
         producer->persistent = NULL;
     }
-    ve_tls_persistent_free_ack_ranges(producer);
     if (producer->persistent_mutex) {
         producer->config.platform.mutex_destroy(producer->persistent_mutex);
         producer->persistent_mutex = NULL;
