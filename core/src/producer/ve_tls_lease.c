@@ -4,6 +4,7 @@
 #include <stdatomic.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/file.h>
@@ -167,8 +168,9 @@ int ve_tls_lease_guard_enter(const char * lease_path, int wait, int * fd_out) {
     }
 
     if (ve_tls_lease_guard_lock(fd, wait) != 0) {
+        int busy = !wait && (errno == EWOULDBLOCK || errno == EAGAIN);
         ve_tls_lease_guard_close(fd);
-        return -1;
+        return busy ? VE_TLS_LEASE_GUARD_BUSY : -1;
     }
     *fd_out = fd;
     return 0;
@@ -355,7 +357,8 @@ done:
 
 int ve_tls_lease_acquire_locked(
     const ve_tls_lease_options * options,
-    ve_tls_lease_state * state
+    ve_tls_lease_state * state,
+    int allow_dead_local_owner
 ) {
     ve_tls_lease_state current;
     ve_tls_path_info info;
@@ -372,17 +375,22 @@ int ve_tls_lease_acquire_locked(
         if (ve_tls_lease_load(options->platform, options->lease_path, &current) != 0) {
             return -1;
         }
+        if (current.fencing_token == UINT64_MAX ||
+            options->mode != VE_TLS_LEASE_OPEN_TAKEOVER_IF_STALE) {
+            return -1;
+        }
         if (!lease_is_stale(
                 options->now_ms,
                 current.last_heartbeat_ms,
                 options->lease_timeout_ms)) {
-            return -1;
-        }
-        if (options->mode != VE_TLS_LEASE_OPEN_TAKEOVER_IF_STALE) {
-            return -1;
-        }
-        if (current.fencing_token == UINT64_MAX) {
-            return -1;
+            /* Only local exclusive lifetime ownership may recover early.
+               The shared path still waits for expiry. With the guard held,
+               only definitive ESRCH permits recovery; PID 0 and inconclusive
+               probes wait. */
+            if (!(allow_dead_local_owner && current.owner_pid > 0 &&
+                  kill((pid_t)current.owner_pid, 0) != 0 && errno == ESRCH)) {
+                return VE_TLS_LEASE_PENDING;
+            }
         }
         *state = current;
         state->fencing_token++;
@@ -431,9 +439,9 @@ int ve_tls_lease_acquire(const ve_tls_lease_options * options, ve_tls_lease_stat
     if (ve_tls_lease_guard_enter(options->lease_path, 0, &guard_fd) != 0) {
         return -1;
     }
-    rc = ve_tls_lease_acquire_locked(options, state);
+    rc = ve_tls_lease_acquire_locked(options, state, 0);
     ve_tls_lease_guard_leave(guard_fd);
-    return rc;
+    return rc == 0 ? 0 : -1;
 }
 
 int ve_tls_lease_heartbeat(const ve_tls_lease_options * options, ve_tls_lease_state * state) {

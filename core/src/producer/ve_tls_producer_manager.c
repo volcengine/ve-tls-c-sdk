@@ -69,9 +69,9 @@ static void ve_tls_manager_emit_batch_sealed(
 static void ve_tls_manager_heartbeat_persistent(ve_tls_producer * producer) {
     if (producer && producer->persistent) {
         (void)ve_tls_persistent_heartbeat_if_due(producer->persistent, 0);
-        producer->config.platform.mutex_lock(producer->persistent_mutex);
+        /* The checkpoint operation takes the WAL guard when a save is due.
+           Routine builder wakeups do not need to queue behind an append. */
         int rc = ve_tls_persistent_checkpoint_if_due(producer->persistent);
-        producer->config.platform.mutex_unlock(producer->persistent_mutex);
         if (rc != 0) ve_tls_metrics_emit(producer, "persistent_checkpoint_save_failed", 0, 0);
     }
 }
@@ -137,7 +137,7 @@ static int ve_tls_should_skip_compress(const char * compress_type, size_t body_s
     return 0;
 }
 
-static size_t ve_tls_manager_compress_scratch_bound(size_t body_size) {
+size_t ve_tls_compress_scratch_bound(size_t body_size) {
     size_t extra = body_size / 8 + 4096;
     if (body_size > (size_t)-1 - extra) {
         return (size_t)-1;
@@ -161,7 +161,7 @@ static int ve_tls_manager_prepare_send_task(ve_tls_producer * producer, ve_tls_s
     } else if (!ve_tls_should_skip_compress(compress_type, t->body_size)) {
         t->precompressed_pool = NULL;
         size_t pool_cap = producer->compress_buf_pool.obj_size;
-        if (pool_cap > 0) {
+        if (pool_cap > 0 && !producer->persistent) {
             unsigned char * pooled = (unsigned char *)ve_tls_obj_pool_get(&producer->compress_buf_pool);
             if (pooled) {
                 size_t pooled_size = 0;
@@ -179,9 +179,16 @@ static int ve_tls_manager_prepare_send_task(ve_tls_producer * producer, ve_tls_s
         if (!t->precompressed || t->precompressed_size == 0) {
             ve_tls_bytes c;
             memset(&c, 0, sizeof(c));
-            size_t scratch = ve_tls_manager_compress_scratch_bound(t->body_size);
-            int scratch_rc = (scratch == (size_t)-1) ? -1 : ve_tls_producer_reserve_scratch_bytes(producer, scratch);
+            size_t scratch = ve_tls_compress_scratch_bound(t->body_size);
+            int scratch_rc = -1;
+            if (scratch != (size_t)-1) {
+                scratch_rc = producer->persistent
+                    ? ve_tls_producer_reserve_wal_scratch(producer, scratch)
+                    : ve_tls_producer_reserve_scratch_bytes(producer, scratch);
+            }
             if (scratch_rc != 0) {
+                /* The complete WAL body is already within the send budget. */
+                if (producer->persistent) goto check_send_size;
                 if (err_code) *err_code = (scratch_rc == -2) ? "ProducerClosed" : (scratch_rc == -3) ? "BufferFullTimeout" : "BufferFull";
                 if (err_msg) *err_msg = "buffer budget exceeded before compression";
                 return -1;
@@ -201,11 +208,12 @@ static int ve_tls_manager_prepare_send_task(ve_tls_producer * producer, ve_tls_s
              * 直到 push 阶段把它原子迁移到 send_queue_bytes 为止。这样可以
              * 避免在 release_scratch 与 reserve_send_task_bytes 之间出现
              * buffered_bytes 少计的窗口期，从而严格保护 max_buffer_bytes。 */
-            t->scratch_held = scratch;
+            t->scratch_held += scratch;
             t->scratch_owner = producer;
         }
     }
 
+check_send_size:
     if (producer->config.agg_strategy == 1 && producer->config.agg_max_compressed_bytes_per_request > 0) {
         size_t maxc = (size_t)producer->config.agg_max_compressed_bytes_per_request;
         if (send_size > maxc) {
@@ -235,7 +243,10 @@ static int ve_tls_manager_push_send_task(ve_tls_producer * producer, ve_tls_send
         }
     }
     int wait_ms = 0;
-    if (producer->config.send_queue_full_policy == VE_TLS_SEND_QUEUE_FULL_BLOCK) {
+    if (producer->persistent) {
+        /* WAL capacity is the admission limit for durable records. */
+        wait_ms = -1;
+    } else if (producer->config.send_queue_full_policy == VE_TLS_SEND_QUEUE_FULL_BLOCK) {
         wait_ms = producer->config.send_queue_block_timeout_ms;
         if (wait_ms == 0) {
             wait_ms = -1;
@@ -477,6 +488,7 @@ static void * ve_tls_worker_main_builder(void * arg) {
             ve_tls_log_item item;
             producer->config.platform.mutex_lock(producer->mutex);
             int ok = ve_tls_queue_pop(producer, &item);
+            if (ok == 0 && producer->persistent) producer->scratch_bytes += item.size;
             producer->config.platform.mutex_unlock(producer->mutex);
             if (ok != 0) {
                 break;
@@ -493,6 +505,10 @@ static void * ve_tls_worker_main_builder(void * arg) {
             t.start_id = item.id;
             t.end_id = item.id;
             t.hash_key = item.hash_key;
+            if (producer->persistent) {
+                t.scratch_owner = producer;
+                t.scratch_held = item.size;
+            }
             item.data = NULL;
             item.hash_key = NULL;
             ve_tls_manager_emit_batch_sealed(producer, &t);
@@ -514,26 +530,54 @@ static void * ve_tls_worker_main_builder(void * arg) {
             sealed = sealed->next;
             size_t bytes_in_builder = b->logs_len;
             ve_tls_send_task t;
-            if (ve_tls_builder_move_to_send_task(producer, b, &t) != 0) {
+            ve_tls_builder_move_result move_rc = ve_tls_builder_move_to_send_task(producer, b, &t);
+            if (move_rc == VE_TLS_BUILDER_MOVE_ALLOC_FAILED && producer->persistent) {
+                /* Retry in place before handing the batch to the send queue.
+                   The worker still owns the logs and their memory budget. */
+                producer->config.platform.mutex_lock(producer->mutex);
+                if (!producer->stop) {
+                    (void)producer->config.platform.cond_timedwait_ms(producer->cond, producer->mutex, 50);
+                }
+                int retry = !producer->stop;
+                producer->config.platform.mutex_unlock(producer->mutex);
+                if (retry) move_rc = ve_tls_builder_move_to_send_task(producer, b, &t);
+            }
+            if (move_rc != VE_TLS_BUILDER_MOVE_OK) {
                 ve_tls_manager_drop_range(producer, bytes_in_builder, b->start_id, b->end_id, "MemoryAllocFailed", "build body failed");
             } else {
-                ve_tls_manager_emit_batch_sealed(producer, &t);
-                const char * err_code = NULL;
-                const char * err_msg = NULL;
-                if (ve_tls_manager_prepare_send_task(producer, &t, &err_code, &err_msg) != 0) {
-                    ve_tls_manager_drop_range(producer, t.batch_bytes, t.start_id, t.end_id, err_code ? err_code : "ClientError", err_msg ? err_msg : "drop");
+                int transfer_rc = 0;
+                if (producer->persistent) {
+                    transfer_rc = ve_tls_producer_transfer_wal_body(producer, &t, bytes_in_builder);
+                    if (transfer_rc == 0) bytes_in_builder = 0;
+                }
+                if (transfer_rc != 0) {
+                    ve_tls_manager_drop_range(producer, t.batch_bytes, t.start_id, t.end_id,
+                        "ProducerClosed", "producer stopped while preparing WAL batch");
                     ve_tls_send_task_free(&t);
                 } else {
-                    (void)ve_tls_manager_push_send_task(producer, &t);
+                    ve_tls_manager_emit_batch_sealed(producer, &t);
+                    const char * err_code = NULL;
+                    const char * err_msg = NULL;
+                    if (ve_tls_manager_prepare_send_task(producer, &t, &err_code, &err_msg) != 0) {
+                        ve_tls_manager_drop_range(producer, t.batch_bytes, t.start_id, t.end_id, err_code ? err_code : "ClientError", err_msg ? err_msg : "drop");
+                        ve_tls_send_task_free(&t);
+                    } else {
+                        (void)ve_tls_manager_push_send_task(producer, &t);
+                    }
                 }
             }
             producer->config.platform.mutex_lock(producer->mutex);
+            if (b->recovered) producer->recovery_builders--;
             if (producer->queue_bytes >= bytes_in_builder) {
                 producer->queue_bytes -= bytes_in_builder;
             } else {
                 producer->queue_bytes = 0;
             }
-            producer->config.platform.cond_signal(producer->cond);
+            if (producer->recovering) {
+                producer->config.platform.cond_broadcast(producer->cond);
+            } else {
+                producer->config.platform.cond_signal(producer->cond);
+            }
             producer->config.platform.mutex_unlock(producer->mutex);
             ve_tls_log_builder_free(b);
         }
@@ -811,7 +855,7 @@ void * ve_tls_worker_main(void * arg) {
                     ve_tls_bytes c = {0};
                     int c_rc = -2;
                     if (max_comp > 0) {
-                        size_t scratch = ve_tls_manager_compress_scratch_bound(body.size);
+                        size_t scratch = ve_tls_compress_scratch_bound(body.size);
                         int scratch_rc = (scratch == (size_t)-1) ? -1 : ve_tls_producer_reserve_scratch_bytes(producer, scratch);
                         if (scratch_rc != 0) {
                             ve_tls_manager_drop_range(

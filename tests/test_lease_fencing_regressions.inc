@@ -1736,7 +1736,7 @@ static int test_producer_aba_owner_identity(void) {
     cfg.persistent_lease_timeout_ms = 1000;
     cfg.persistent_heartbeat_interval_ms = 100;
     cfg.persistent_open_mode = VE_TLS_POPEN_TAKEOVER_IF_STALE;
-    threads_per_producer = (cfg.pack_thread_count > 0 ? cfg.pack_thread_count : 1) +
+    threads_per_producer = 1 + (cfg.pack_thread_count > 0 ? cfg.pack_thread_count : 1) +
         (cfg.send_thread_count > 0 ? cfg.send_thread_count : 1);
 
     stage = 1;
@@ -1978,6 +1978,235 @@ static int test_exclusive_persistence_factory_contract(void) {
         ve_tls_producer_destroy(producer);
     }
     lf_cleanup_dir(dir);
+    return failed ? -1 : 0;
+}
+
+static int test_exclusive_persistence_dead_owner_restart(void) {
+    static const unsigned char first[] = "already-acked";
+    static const unsigned char second[] = "replay-me";
+    char dir[PATH_MAX] = {0};
+    ve_tls_config cfg;
+    ve_tls_producer * producer = NULL;
+    ep_recover_records recovered = {0};
+    int ready[2] = {-1, -1};
+    int release[2] = {-1, -1};
+    pid_t child = -1;
+    int child_status = 0;
+    int failed = 1;
+    int stage = 0;
+    ve_tls_create_status status = VE_TLS_CREATE_FAILED;
+    char byte = 0;
+
+    if (make_temp_dir(dir, sizeof(dir)) != 0 || ep_prepare_config(&cfg, dir) != 0 ||
+        pipe(ready) != 0 || pipe(release) != 0) goto done;
+    stage = 1;
+    cfg.max_buffer_bytes = 8 * 1024 * 1024;
+    cfg.persistent_max_bytes = 10 * 1024 * 1024;
+    cfg.platform.time_ms = test_fake_time_ms;
+    g_fake_time = 1000;
+    child = fork();
+    if (child < 0) goto done;
+    if (child == 0) {
+        close(ready[0]);
+        close(release[1]);
+        producer = ve_tls_producer_create_exclusive_persistence(&cfg, sizeof(cfg));
+        if (!producer ||
+            ve_tls_persistent_append(producer->persistent, 1, NULL, first, sizeof(first) - 1) != 0 ||
+            ve_tls_persistent_append(producer->persistent, 2, NULL, second, sizeof(second) - 1) != 0 ||
+            ve_tls_persistent_ack_range(producer->persistent, 1, 1) != 0 ||
+            ve_tls_persistent_flush(producer->persistent) != 0) {
+            (void)write(ready[1], "F", 1);
+            _exit(1);
+        }
+        if (write(ready[1], "R", 1) != 1 || read(release[0], &byte, 1) != 1) _exit(1);
+        /* Simulate process death without producer cleanup. */
+        _exit(0);
+    }
+    close(ready[1]); ready[1] = -1;
+    close(release[0]); release[0] = -1;
+    if (read(ready[0], &byte, 1) != 1 || byte != 'R') goto done;
+    stage = 2;
+    producer = ve_tls_producer_create_exclusive_persistence_with_status(&cfg, sizeof(cfg), &status);
+    if (producer || status != VE_TLS_CREATE_WAL_LOCK_BUSY) goto done;
+    if (write(release[1], "X", 1) != 1) goto done;
+    close(release[1]); release[1] = -1;
+    if (waitpid(child, &child_status, 0) != child) goto done;
+    child = -1;
+    if (!WIFEXITED(child_status) || WEXITSTATUS(child_status) != 0) goto done;
+
+    stage = 3;
+    /* Neither the shared path nor the explicit refusal policy may use the fast path. */
+    producer = ve_tls_producer_create_versioned(&cfg, sizeof(cfg), VE_TLS_CONFIG_VERSION_CURRENT);
+    if (producer) goto done;
+    cfg.persistent_open_mode = VE_TLS_POPEN_FAIL_IF_OWNED;
+    producer = ve_tls_producer_create_exclusive_persistence_with_status(&cfg, sizeof(cfg), &status);
+    if (producer || status != VE_TLS_CREATE_WAL_OPEN_FAILED) goto done;
+    cfg.persistent_open_mode = VE_TLS_POPEN_TAKEOVER_IF_STALE;
+    producer = ve_tls_producer_create_exclusive_persistence_with_status(&cfg, sizeof(cfg), &status);
+    if (!producer || status != VE_TLS_CREATE_OK || producer->persistent->lease.fencing_token != 2 ||
+        producer->persistent->checkpoint.acked_log_id != 1 ||
+        ve_tls_persistent_recover(producer->persistent, ep_collect_recovered_record, &recovered) != 0 ||
+        recovered.calls != 1 || recovered.ids[0] != 2 ||
+        recovered.sizes[0] != sizeof(second) - 1 ||
+        memcmp(recovered.payloads[0], second, sizeof(second) - 1) != 0) goto done;
+    failed = 0;
+
+done:
+    if (failed) fprintf(stderr, "dead-owner restart failed at stage %d\n", stage);
+    if (producer) ve_tls_producer_destroy(producer);
+    if (ready[0] >= 0) close(ready[0]);
+    if (ready[1] >= 0) close(ready[1]);
+    if (release[0] >= 0) close(release[0]);
+    if (release[1] >= 0) close(release[1]);
+    if (child > 0) (void)waitpid(child, &child_status, 0);
+    if (dir[0]) lf_cleanup_dir(dir);
+    return failed ? -1 : 0;
+}
+
+static int ep_seed_lease(ve_tls_config * cfg, const char * dir, int32_t owner_pid) {
+    char path[PATH_MAX];
+    ve_tls_lease_options options;
+    ve_tls_lease_state state;
+    join_path(path, sizeof(path), dir, "lease");
+    memset(&options, 0, sizeof(options));
+    options.platform = &cfg->platform;
+    options.lease_path = path;
+    options.owner_id = "synthetic-lease";
+    options.owner_pid = owner_pid;
+    options.owner_process_name = "test";
+    options.now_ms = 1000;
+    options.lease_timeout_ms = 1000;
+    options.mode = VE_TLS_LEASE_OPEN_TAKEOVER_IF_STALE;
+    return ve_tls_lease_acquire(&options, &state);
+}
+
+static int test_exclusive_persistence_fresh_owner_waits(void) {
+    char dir[PATH_MAX] = {0};
+    ve_tls_config cfg;
+    ve_tls_producer * producer = NULL;
+    ve_tls_create_status status = VE_TLS_CREATE_FAILED;
+    int failed = 1;
+    int stage = 0;
+
+    if (make_temp_dir(dir, sizeof(dir)) != 0 || ep_prepare_config(&cfg, dir) != 0) goto done;
+    cfg.max_buffer_bytes = 8 * 1024 * 1024;
+    cfg.persistent_max_bytes = 10 * 1024 * 1024;
+    cfg.platform.time_ms = test_fake_time_ms;
+    g_fake_time = 1000;
+    if (ep_seed_lease(&cfg, dir, (int32_t)getpid()) != 0) goto done;
+    stage = 1;
+    producer = ve_tls_producer_create_exclusive_persistence_with_status(&cfg, sizeof(cfg), &status);
+    if (producer || status != VE_TLS_CREATE_WAL_LEASE_PENDING) goto done;
+    cfg.persistent_open_mode = VE_TLS_POPEN_FAIL_IF_OWNED;
+    producer = ve_tls_producer_create_exclusive_persistence_with_status(&cfg, sizeof(cfg), &status);
+    if (producer || status != VE_TLS_CREATE_WAL_OPEN_FAILED) goto done;
+    g_fake_time = 2001;
+    producer = ve_tls_producer_create_exclusive_persistence_with_status(&cfg, sizeof(cfg), &status);
+    if (producer || status != VE_TLS_CREATE_WAL_OPEN_FAILED) goto done;
+    cfg.persistent_open_mode = VE_TLS_POPEN_TAKEOVER_IF_STALE;
+    producer = ve_tls_producer_create_exclusive_persistence_with_status(&cfg, sizeof(cfg), &status);
+    if (!producer || status != VE_TLS_CREATE_OK) goto done;
+    ve_tls_producer_destroy(producer);
+    producer = NULL;
+
+    stage = 2;
+    g_fake_time = 1000;
+    if (ep_seed_lease(&cfg, dir, 0) != 0) goto done;
+    producer = ve_tls_producer_create_exclusive_persistence_with_status(&cfg, sizeof(cfg), &status);
+    if (producer || status != VE_TLS_CREATE_WAL_LEASE_PENDING) goto done;
+    g_fake_time = 2000;
+    producer = ve_tls_producer_create_exclusive_persistence_with_status(&cfg, sizeof(cfg), &status);
+    if (producer || status != VE_TLS_CREATE_WAL_LEASE_PENDING) goto done;
+    g_fake_time = 2001;
+    producer = ve_tls_producer_create_exclusive_persistence_with_status(&cfg, sizeof(cfg), &status);
+    if (!producer || status != VE_TLS_CREATE_OK || producer->persistent->lease.fencing_token != 2) goto done;
+    failed = 0;
+
+done:
+    if (failed) fprintf(stderr, "fresh-owner waits failed at stage %d status=%d\n", stage, (int)status);
+    if (producer) ve_tls_producer_destroy(producer);
+    if (dir[0]) lf_cleanup_dir(dir);
+    return failed ? -1 : 0;
+}
+
+static int test_exclusive_persistence_permanent_create_status(void) {
+    char dir[PATH_MAX] = {0};
+    char path[PATH_MAX];
+    ve_tls_config cfg;
+    ve_tls_producer * producer = NULL;
+    ve_tls_create_status status = VE_TLS_CREATE_OK;
+    FILE * file = NULL;
+    int failed = 1;
+    int stage = 0;
+
+    if (make_temp_dir(dir, sizeof(dir)) != 0 || ep_prepare_config(&cfg, dir) != 0) goto done;
+    cfg.max_buffer_bytes = 8 * 1024 * 1024;
+    cfg.persistent_max_bytes = 10 * 1024 * 1024;
+    producer = ve_tls_producer_create_exclusive_persistence_with_status(NULL, sizeof(cfg), &status);
+    if (producer || status != VE_TLS_CREATE_INVALID_CONFIG) goto done;
+    producer = ve_tls_producer_create_exclusive_persistence_with_status(&cfg, sizeof(cfg) - 1, &status);
+    if (producer || status != VE_TLS_CREATE_INVALID_CONFIG) goto done;
+    cfg.use_persistent = 0;
+    producer = ve_tls_producer_create_exclusive_persistence_with_status(&cfg, sizeof(cfg), &status);
+    if (producer || status != VE_TLS_CREATE_INVALID_CONFIG) goto done;
+    cfg.use_persistent = 1;
+    cfg.endpoint = "invalid";
+    producer = ve_tls_producer_create_exclusive_persistence_with_status(&cfg, sizeof(cfg), &status);
+    if (producer || status != VE_TLS_CREATE_INVALID_CONFIG) goto done;
+    cfg.endpoint = "https://example.com";
+    cfg.log_tag_count = 1;
+    cfg.log_tags = NULL;
+    producer = ve_tls_producer_create_exclusive_persistence_with_status(&cfg, sizeof(cfg), &status);
+    if (producer || status != VE_TLS_CREATE_INVALID_CONFIG) goto done;
+    cfg.log_tag_count = 0;
+    stage = 1;
+    ve_tls_alloc_fault_inject("producer_create", 0, 1);
+    producer = ve_tls_producer_create_exclusive_persistence_with_status(&cfg, sizeof(cfg), &status);
+    ve_tls_alloc_fault_inject(NULL, 0, 0);
+    if (producer || status != VE_TLS_CREATE_FAILED) goto done;
+
+    stage = 2;
+    join_path(path, sizeof(path), dir, "lease.lock");
+    if (mkdir(path, 0700) != 0) goto done;
+    errno = EWOULDBLOCK;
+    producer = ve_tls_producer_create_exclusive_persistence_with_status(&cfg, sizeof(cfg), &status);
+    if (producer || status != VE_TLS_CREATE_WAL_OPEN_FAILED || rmdir(path) != 0) goto done;
+
+    stage = 3;
+    join_path(path, sizeof(path), dir, "manifest");
+    file = fopen(path, "wb");
+    if (!file || fputs("invalid-manifest", file) == EOF) goto done;
+    if (fclose(file) != 0) {
+        file = NULL;
+        goto done;
+    }
+    file = NULL;
+    producer = ve_tls_producer_create_exclusive_persistence_with_status(&cfg, sizeof(cfg), &status);
+    if (producer || status != VE_TLS_CREATE_WAL_OPEN_FAILED || unlink(path) != 0) goto done;
+
+    stage = 4;
+    join_path(path, sizeof(path), dir, "lease");
+    file = fopen(path, "wb");
+    if (!file || fputs("invalid-lease", file) == EOF) goto done;
+    if (fclose(file) != 0) {
+        file = NULL;
+        goto done;
+    }
+    file = NULL;
+    producer = ve_tls_producer_create_exclusive_persistence_with_status(&cfg, sizeof(cfg), &status);
+    if (producer || status != VE_TLS_CREATE_WAL_OPEN_FAILED) goto done;
+    failed = 0;
+
+done:
+    ve_tls_alloc_fault_inject(NULL, 0, 0);
+    if (failed) fprintf(stderr, "permanent status failed at stage %d status=%d\n", stage, (int)status);
+    if (file) fclose(file);
+    if (producer) ve_tls_producer_destroy(producer);
+    if (dir[0]) {
+        join_path(path, sizeof(path), dir, "lease.lock");
+        (void)rmdir(path);
+        lf_cleanup_dir(dir);
+    }
     return failed ? -1 : 0;
 }
 

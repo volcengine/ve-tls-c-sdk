@@ -371,20 +371,20 @@ static int test_load_errors_and_oom(void) {
     use_fault(FAULT_READ_FIRST);
     rc = ve_tls_checkpoint_load_ranges(&fault_platform, checkpoint_path, &actual, &ranges, &count);
     use_fault(FAULT_NONE);
-    CHECK(rc == VE_TLS_CHECKPOINT_LOAD_ERROR);
+    CHECK(rc == VE_TLS_CHECKPOINT_LOAD_IO_ERROR);
     use_fault(FAULT_READ_EXTENSION);
     rc = ve_tls_checkpoint_load_ranges(&fault_platform, checkpoint_path, &actual, &ranges, &count);
     use_fault(FAULT_NONE);
-    CHECK(rc == VE_TLS_CHECKPOINT_LOAD_ERROR);
+    CHECK(rc == VE_TLS_CHECKPOINT_LOAD_IO_ERROR);
     use_fault(FAULT_SEEK);
     rc = ve_tls_checkpoint_load_ranges(&fault_platform, checkpoint_path, &actual, &ranges, &count);
     use_fault(FAULT_NONE);
-    CHECK(rc == VE_TLS_CHECKPOINT_LOAD_ERROR);
+    CHECK(rc == VE_TLS_CHECKPOINT_LOAD_IO_ERROR);
     before[0] ^= 0x01;
     CHECK(write_bytes(before, before_size) == 0);
-    CHECK(ve_tls_checkpoint_load_ranges(&real_platform, checkpoint_path, &actual, &ranges, &count) == VE_TLS_CHECKPOINT_LOAD_ERROR);
+    CHECK(ve_tls_checkpoint_load_ranges(&real_platform, checkpoint_path, &actual, &ranges, &count) == VE_TLS_CHECKPOINT_LOAD_INVALID);
     CHECK(write_bytes(before, sizeof(legacy_file) - 1) == 0);
-    CHECK(ve_tls_checkpoint_load_ranges(&real_platform, checkpoint_path, &actual, &ranges, &count) == VE_TLS_CHECKPOINT_LOAD_ERROR);
+    CHECK(ve_tls_checkpoint_load_ranges(&real_platform, checkpoint_path, &actual, &ranges, &count) == VE_TLS_CHECKPOINT_LOAD_INVALID);
     return 0;
 }
 

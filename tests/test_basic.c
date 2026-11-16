@@ -12705,7 +12705,6 @@ static int test_segment_store_append_read_rotate_and_repair(void) {
     size_t encoded2_size = 0;
     ve_tls_config cfg;
     ve_tls_file * file = NULL;
-    uint64_t valid_end = 0;
     static const unsigned char payload1[] = {'l', 'o', 'g', '1'};
     static const unsigned char payload2[] = {'l', 'o', 'g', '2'};
 
@@ -12786,7 +12785,8 @@ static int test_segment_store_append_read_rotate_and_repair(void) {
         return -1;
     }
     cfg.platform.file_close(file);
-    if (ve_tls_segment_store_repair_tail(&store, 2, &valid_end) != 0 || valid_end != 0) {
+    if (ve_tls_segment_store_repair_tail(&store, 2, ref2.offset) != 0 ||
+        store.active_size != ref2.offset || store.active_records != 0) {
         ve_tls_segment_store_close(&store);
         cleanup_persistent_dir(dir);
         return -1;
@@ -16862,6 +16862,9 @@ static int test_persistent_recover_repairs_truncated_tail_record(void) {
     return 0;
 }
 
+static ve_tls_thread * regression_prod_persistent_no_thread_create(ve_tls_thread_fn fn, void * arg);
+static void regression_prod_persistent_no_thread_join(ve_tls_thread * thread);
+
 static int test_persistent_recover_repairs_corrupted_checkpoint_file(void) {
     char dir[PATH_MAX];
     char checkpoint_path[PATH_MAX];
@@ -16890,6 +16893,9 @@ static int test_persistent_recover_repairs_corrupted_checkpoint_file(void) {
     cfg.max_persistent_log_count = 64;
     cfg.max_persistent_file_size = 4096;
     cfg.max_persistent_file_count = 4;
+    /* Inspect the result of recover before the raw queue is drained. */
+    cfg.platform.thread_create = regression_prod_persistent_no_thread_create;
+    cfg.platform.thread_join = regression_prod_persistent_no_thread_join;
     p1 = ve_tls_producer_create(&cfg);
     if (!p1 || !p1->persistent) {
         cleanup_persistent_dir(dir);
@@ -17659,9 +17665,6 @@ static int test_segment_store_scan_large_records_without_heap_decode(void) {
     ve_tls_alloc_hooks saved;
     alloc_select_fail_state st;
     unsigned char payload[1024];
-    uint64_t valid_end = 0;
-    uint64_t record_count = 0;
-    int64_t max_log_id = 0;
     int alloc_calls;
     int rc = -1;
     if (make_temp_dir(dir, sizeof(dir)) != 0) {
@@ -17695,11 +17698,12 @@ static int test_segment_store_scan_large_records_without_heap_decode(void) {
     }
     ve_tls_alloc_get_hooks(&saved);
     set_alloc_select_fail(&st, 0, 0, 0, 0);
-    if (ve_tls_segment_store_scan_segment(&persistent.store, 1, &valid_end, &record_count, &max_log_id) != 0) {
+    ve_tls_segment_scan scan;
+    if (ve_tls_segment_store_scan_segment(&persistent.store, 1, &scan) != 0) {
         goto done;
     }
     alloc_calls = st.malloc_calls + st.calloc_calls + st.realloc_calls + st.strdup_calls;
-    if (alloc_calls != 0 || valid_end == 0 || record_count != 2 || max_log_id != 2) {
+    if (alloc_calls != 0 || scan.framed_size == 0 || scan.record_count != 2 || scan.max_log_id != 2) {
         goto done;
     }
     rc = 0;
@@ -17769,6 +17773,9 @@ static int test_producer_takeover_recovers_and_invalidates_old_writer(void) {
     }
     g_fake_time = 1100;
 
+    /* Keep the replacement's recovered raw request available for export. */
+    cfg.platform.thread_create = regression_prod_persistent_no_thread_create;
+    cfg.platform.thread_join = regression_prod_persistent_no_thread_join;
     p2 = ve_tls_producer_create_versioned(
         &cfg, sizeof(cfg), VE_TLS_CONFIG_VERSION_CURRENT);
     if (!p2 || !p2->persistent) {
@@ -20020,6 +20027,9 @@ int main(void) {
     RUN(1506, test_lease_fencing_recover_callback_reentry());
     RUN(1507, test_lease_fencing_guard_error_paths());
     RUN(1530, test_exclusive_persistence_factory_contract());
+    RUN(1537, test_exclusive_persistence_dead_owner_restart());
+    RUN(1538, test_exclusive_persistence_fresh_owner_waits());
+    RUN(1539, test_exclusive_persistence_permanent_create_status());
     RUN(1531, test_exclusive_persistence_lifetime_takeover());
     RUN(1532, test_exclusive_persistence_hot_path_recovery());
     RUN(1533, test_exclusive_persistence_concurrent_append_recovery());

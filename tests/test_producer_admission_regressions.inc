@@ -911,7 +911,7 @@ static int regression_prod_test_persistent_raw_queue_oom(void) {
     regression_prod_persistent_alloc_end(&alloc_state);
     alloc_active = 0;
     g_regression_prod_persistent_wal_write = NULL;
-    if (result != VE_TLS_PERSISTENT_ERROR || id != 1 ||
+    if (result != VE_TLS_OK || id != 1 ||
         alloc_state.failed_calloc != 1 || write_state.record_writes < 1 ||
         producer->persistent->current_records != 1 ||
         producer->persistent->checkpoint.acked_log_id != 0 ||
@@ -936,7 +936,7 @@ done:
     return ok ? 0 : -1;
 }
 
-static int regression_prod_test_persistent_merge_and_ingress_oom(void) {
+static int regression_prod_test_persistent_merge_oom(void) {
 #define REGRESSION_PROD_PERSISTENT_MERGE_VALUE_LEN 40
     char old_value[REGRESSION_PROD_PERSISTENT_MERGE_VALUE_LEN + 1];
     char rejected_value[REGRESSION_PROD_PERSISTENT_MERGE_VALUE_LEN + 1];
@@ -985,7 +985,6 @@ static int regression_prod_test_persistent_merge_and_ingress_oom(void) {
         producer->default_builder != NULL || !producer->sealed_head) {
         goto done;
     }
-    producer->ingress_queue_count = producer->ingress_queue_cap;
     regression_prod_persistent_alloc_begin(&alloc_state);
     alloc_active = 1;
     write_state.alloc = &alloc_state;
@@ -996,11 +995,11 @@ static int regression_prod_test_persistent_merge_and_ingress_oom(void) {
     regression_prod_persistent_alloc_end(&alloc_state);
     alloc_active = 0;
     g_regression_prod_persistent_wal_write = NULL;
-    if (result != VE_TLS_DROP_ERROR || rejected_id != 2 ||
+    if (result != VE_TLS_OK || rejected_id != 2 ||
         alloc_state.failed_calloc != 1 || write_state.record_writes < 2 ||
         producer->persistent->current_records != 2 ||
         producer->persistent->checkpoint.acked_log_id != 0 ||
-        producer->ingress_queue_count != producer->ingress_queue_cap) {
+        producer->ingress_queue_count != 0) {
         goto done;
     }
     expected_old = regression_prod_build_expected(
@@ -1064,7 +1063,7 @@ static void * regression_prod_persistent_close_thread_main(void * arg) {
         return NULL;
     }
     g_regression_prod_persistent_close_tls = state;
-    state->close_result = ve_tls_producer_close(state->producer, 10000);
+    state->close_result = ve_tls_producer_close(state->producer, 250);
     g_real_platform.mutex_lock(state->sync_mutex);
     state->close_done = 1;
     g_real_platform.cond_signal(state->sync_cond);
@@ -1199,13 +1198,13 @@ static int regression_prod_test_persistent_append_close_interleave(void) {
         close_state.thread = NULL;
     }
     g_regression_prod_persistent_close = NULL;
-    if (result != VE_TLS_CLOSED || id != 1 || close_state.launch_failed ||
+    if (result != VE_TLS_OK || id != 1 || close_state.launch_failed ||
         close_state.wait_failed ||
         !close_state.launched || !close_state.close_begun ||
-        !close_state.close_done || close_state.close_result != VE_TLS_OK ||
+        !close_state.close_done || close_state.close_result != VE_TLS_TIMEOUT ||
         producer->persistent->current_records != 1 ||
         producer->persistent->checkpoint.acked_log_id != 0 ||
-        producer->queue_count != 0 || producer->ingress_queue_count != 0) {
+        producer->queue_count != 1 || producer->ingress_queue_count != 0) {
         goto done;
     }
     ve_tls_producer_destroy(producer);
@@ -1242,7 +1241,7 @@ static int test_producer_admission_regressions(void) {
     if (regression_prod_test_merge_oom_rolls_back_current() != 0) return -5;
     if (regression_prod_test_initial_builder_oom_retries() != 0) return -6;
     if (regression_prod_test_persistent_raw_queue_oom() != 0) return -7;
-    if (regression_prod_test_persistent_merge_and_ingress_oom() != 0) return -8;
+    if (regression_prod_test_persistent_merge_oom() != 0) return -8;
     if (regression_prod_test_persistent_append_close_interleave() != 0) return -9;
     return 0;
 }

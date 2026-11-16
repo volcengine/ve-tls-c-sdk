@@ -459,48 +459,128 @@ static int ve_tls_wire_read_varint(
     return -1;
 }
 
-int ve_tls_log_payload_rewrite_time(
+typedef struct {
+    uint32_t number;
+    uint32_t wire_type;
+    const unsigned char * data;
+    size_t size;
+} ve_tls_wire_field;
+
+static int ve_tls_wire_read_field(const unsigned char * data, size_t size, size_t * offset,
+    ve_tls_wire_field * field) {
+    uint64_t key;
+    uint64_t length;
+    if (ve_tls_wire_read_varint(data, size, offset, &key) != 0 || key < 8 || key > UINT32_MAX) {
+        return -1;
+    }
+    field->number = (uint32_t)(key >> 3);
+    field->wire_type = (uint32_t)(key & 7);
+    switch (field->wire_type) {
+    case 0:
+        return ve_tls_wire_read_varint(data, size, offset, &length);
+    case 1:
+        length = 8;
+        break;
+    case 2:
+        if (ve_tls_wire_read_varint(data, size, offset, &length) != 0) return -1;
+        break;
+    case 5:
+        length = 4;
+        break;
+    default:
+        return -1;
+    }
+    if (length > size - *offset) return -1;
+    field->data = data + *offset;
+    field->size = (size_t)length;
+    *offset += field->size;
+    return 0;
+}
+
+/* LogContent and LogTag share the two string fields. */
+static int ve_tls_log_kv_fields_valid(const unsigned char * data, size_t size) {
+    size_t offset = 0;
+    while (offset < size) {
+        ve_tls_wire_field field;
+        if (ve_tls_wire_read_field(data, size, &offset, &field) != 0 ||
+            (field.number <= 2 && field.wire_type != 2)) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int ve_tls_log_fields_valid(const unsigned char * data, size_t size) {
+    size_t offset = 0;
+    while (offset < size) {
+        ve_tls_wire_field field;
+        if (ve_tls_wire_read_field(data, size, &offset, &field) != 0) return 0;
+        if (field.number == 1 && field.wire_type != 0) return 0;
+        if (field.number == 2 &&
+            (field.wire_type != 2 || !ve_tls_log_kv_fields_valid(field.data, field.size))) return 0;
+        if (field.number == 3 && field.wire_type != 5) return 0;
+    }
+    return 1;
+}
+
+int ve_tls_log_payload_is_group_list(const unsigned char * data, size_t size) {
+    size_t offset = 0;
+    int has_log = 0;
+    while (offset < size) {
+        ve_tls_wire_field group;
+        if (ve_tls_wire_read_field(data, size, &offset, &group) != 0) return 0;
+        if (group.number != 1) continue;
+        if (group.wire_type != 2) return 0;
+        size_t group_offset = 0;
+        while (group_offset < group.size) {
+            ve_tls_wire_field field;
+            if (ve_tls_wire_read_field(group.data, group.size, &group_offset, &field) != 0 ||
+                (field.number <= 5 && field.wire_type != 2)) {
+                return 0;
+            }
+            if (field.number == 1) {
+                if (!ve_tls_log_fields_valid(field.data, field.size)) return 0;
+                has_log = 1;
+            } else if (field.number == 3 && !ve_tls_log_kv_fields_valid(field.data, field.size)) {
+                return 0;
+            }
+        }
+    }
+    return has_log;
+}
+
+typedef struct {
+    size_t outer_key_end;
+    size_t message_start;
+    size_t message_end;
+    size_t value_start;
+    size_t value_end;
+    uint64_t value;
+} ve_tls_log_time_field;
+
+static int ve_tls_log_payload_find_time(
     const unsigned char * payload,
     size_t payload_size,
-    int64_t time_ms,
-    unsigned char ** out_payload,
-    size_t * out_size
+    ve_tls_log_time_field * field
 ) {
-    size_t outer_key_end = 0;
-    size_t outer_message_start;
-    size_t outer_message_end;
     size_t cursor = 0;
-    size_t time_value_start = 0;
-    size_t time_value_end = 0;
     uint64_t key = 0;
     uint64_t outer_size_u64 = 0;
-    size_t new_time_size;
-    size_t new_message_size;
-    size_t new_outer_size_size;
-    size_t trailing_size;
-    size_t total_size;
-    unsigned char * result;
-    unsigned char * dst;
-    if (!payload || payload_size == 0 || time_ms <= 0 || !out_payload || !out_size) {
-        return -2;
-    }
-    *out_payload = NULL;
-    *out_size = 0;
-
     if (ve_tls_wire_read_varint(payload, payload_size, &cursor, &key) != 0 ||
         key != ((1u << 3) | 2u)) {
         return -2;
     }
-    outer_key_end = cursor;
+    field->outer_key_end = cursor;
     if (ve_tls_wire_read_varint(payload, payload_size, &cursor, &outer_size_u64) != 0 ||
         outer_size_u64 > SIZE_MAX) {
         return -2;
     }
-    outer_message_start = cursor;
-    if ((size_t)outer_size_u64 > payload_size - outer_message_start) {
+    field->message_start = cursor;
+    if ((size_t)outer_size_u64 > payload_size - cursor) {
         return -2;
     }
-    outer_message_end = outer_message_start + (size_t)outer_size_u64;
+    size_t outer_message_end = cursor + (size_t)outer_size_u64;
+    field->message_end = outer_message_end;
 
     while (cursor < outer_message_end) {
         uint64_t field_key = 0;
@@ -512,13 +592,12 @@ int ve_tls_log_payload_rewrite_time(
         field_number = (uint32_t)(field_key >> 3);
         wire_type = (uint32_t)(field_key & 7u);
         if (field_number == 1 && wire_type == 0) {
-            uint64_t ignored = 0;
-            time_value_start = cursor;
-            if (ve_tls_wire_read_varint(payload, outer_message_end, &cursor, &ignored) != 0) {
+            field->value_start = cursor;
+            if (ve_tls_wire_read_varint(payload, outer_message_end, &cursor, &field->value) != 0) {
                 return -2;
             }
-            time_value_end = cursor;
-            break;
+            field->value_end = cursor;
+            return 0;
         }
         if (wire_type == 0) {
             uint64_t ignored = 0;
@@ -538,39 +617,57 @@ int ve_tls_log_payload_rewrite_time(
             return -2;
         }
     }
-    if (time_value_end <= time_value_start) {
-        return -2;
-    }
+    return -2;
+}
 
-    new_time_size = ve_tls_varint_u64_size((uint64_t)time_ms);
-    new_message_size = (size_t)outer_size_u64 - (time_value_end - time_value_start);
+int64_t ve_tls_log_payload_time_ms(const unsigned char * payload, size_t payload_size) {
+    ve_tls_log_time_field field;
+    return ve_tls_log_payload_find_time(payload, payload_size, &field) == 0 && field.value <= INT64_MAX
+        ? (int64_t)field.value : 0;
+}
+
+int ve_tls_log_payload_rewrite_time(
+    const unsigned char * payload,
+    size_t payload_size,
+    int64_t time_ms,
+    unsigned char ** out_payload,
+    size_t * out_size
+) {
+    if (!payload || payload_size == 0 || time_ms <= 0 || !out_payload || !out_size) return -2;
+    *out_payload = NULL;
+    *out_size = 0;
+    ve_tls_log_time_field field;
+    if (ve_tls_log_payload_find_time(payload, payload_size, &field) != 0) return -2;
+
+    size_t new_time_size = ve_tls_varint_u64_size((uint64_t)time_ms);
+    size_t new_message_size = field.message_end - field.message_start - (field.value_end - field.value_start);
     new_message_size = ve_tls_size_add_safe(new_message_size, new_time_size);
     if (new_message_size == SIZE_MAX) {
         return -2;
     }
-    new_outer_size_size = ve_tls_varint_u64_size((uint64_t)new_message_size);
-    trailing_size = payload_size - outer_message_end;
-    total_size = ve_tls_size_add_safe(outer_key_end, new_outer_size_size);
+    size_t new_outer_size_size = ve_tls_varint_u64_size((uint64_t)new_message_size);
+    size_t trailing_size = payload_size - field.message_end;
+    size_t total_size = ve_tls_size_add_safe(field.outer_key_end, new_outer_size_size);
     total_size = ve_tls_size_add_safe(total_size, new_message_size);
     total_size = ve_tls_size_add_safe(total_size, trailing_size);
     if (total_size == SIZE_MAX) {
         return -2;
     }
-    result = (unsigned char *)ve_tls_malloc(total_size);
+    unsigned char * result = (unsigned char *)ve_tls_malloc(total_size);
     if (!result) {
         return -1;
     }
-    dst = result;
-    memcpy(dst, payload, outer_key_end);
-    dst += outer_key_end;
+    unsigned char * dst = result;
+    memcpy(dst, payload, field.outer_key_end);
+    dst += field.outer_key_end;
     dst = ve_tls_varint_u64_pack((uint64_t)new_message_size, dst);
-    memcpy(dst, payload + outer_message_start, time_value_start - outer_message_start);
-    dst += time_value_start - outer_message_start;
+    memcpy(dst, payload + field.message_start, field.value_start - field.message_start);
+    dst += field.value_start - field.message_start;
     dst = ve_tls_varint_u64_pack((uint64_t)time_ms, dst);
-    memcpy(dst, payload + time_value_end, outer_message_end - time_value_end);
-    dst += outer_message_end - time_value_end;
+    memcpy(dst, payload + field.value_end, field.message_end - field.value_end);
+    dst += field.message_end - field.value_end;
     if (trailing_size > 0) {
-        memcpy(dst, payload + outer_message_end, trailing_size);
+        memcpy(dst, payload + field.message_end, trailing_size);
         dst += trailing_size;
     }
     *out_payload = result;
@@ -712,7 +809,7 @@ fail:
     return -1;
 }
 
-int ve_tls_builder_move_to_send_task(
+ve_tls_builder_move_result ve_tls_builder_move_to_send_task(
     ve_tls_producer * producer,
     ve_tls_log_group_builder * b,
     ve_tls_send_task * out
@@ -723,18 +820,17 @@ int ve_tls_builder_move_to_send_task(
     unsigned char * body;
     unsigned char * cursor;
     if (!producer || !b || !out) {
-        return -1;
+        return VE_TLS_BUILDER_MOVE_INVALID;
     }
     memset(out, 0, sizeof(*out));
     if (ve_tls_builder_group_sizes(producer, b, &group_len, &prefix_len, &total_len) != 0) {
-        return -1;
+        return VE_TLS_BUILDER_MOVE_INVALID;
     }
-    /* Allocate all fallible metadata before mutating the builder. A failed
-     * conversion therefore leaves the sealed batch available to the caller
-     * for deterministic drop accounting and cleanup. */
+    /* Leave the sealed batch intact until metadata and the complete
+       envelope fit, so a failed allocation can be retried. */
     if (ve_tls_builder_fill_task_metadata(b, group_len, out) != 0) {
         ve_tls_send_task_free(out);
-        return -1;
+        return VE_TLS_BUILDER_MOVE_ALLOC_FAILED;
     }
     body = b->logs;
     if (b->logs_cap < total_len) {
@@ -744,7 +840,7 @@ int ve_tls_builder_move_to_send_task(
         body = (unsigned char *)ve_tls_realloc(body, total_len);
         if (!body) {
             ve_tls_send_task_free(out);
-            return -1;
+            return VE_TLS_BUILDER_MOVE_ALLOC_FAILED;
         }
         b->logs = body;
         b->logs_cap = total_len;
@@ -769,5 +865,5 @@ int ve_tls_builder_move_to_send_task(
     b->logs = NULL;
     b->logs_len = 0;
     b->logs_cap = 0;
-    return 0;
+    return VE_TLS_BUILDER_MOVE_OK;
 }

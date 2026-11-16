@@ -23,9 +23,10 @@ enum {
     VE_TLS_CHECKPOINT_LOAD_OK = 0,
     /* The V1 prefix is valid, but an extension is damaged or unsupported. */
     VE_TLS_CHECKPOINT_LOAD_EXT_INVALID = 1,
-    VE_TLS_CHECKPOINT_LOAD_ERROR = -1,
-    /* Allocation failed: the caller must not reset or overwrite the file. */
-    VE_TLS_CHECKPOINT_LOAD_OOM = -2
+    VE_TLS_CHECKPOINT_LOAD_INVALID = -1,
+    /* Neither resource failure establishes that the checkpoint is corrupt. */
+    VE_TLS_CHECKPOINT_LOAD_OOM = -2,
+    VE_TLS_CHECKPOINT_LOAD_IO_ERROR = -3
 };
 
 /* Legacy APIs read/write only the V1 contiguous acknowledgement prefix.
@@ -37,7 +38,7 @@ int ve_tls_checkpoint_load(ve_tls_platform * platform, const char * path, ve_tls
 
 /* The returned range array belongs to the caller and must be freed with
  * ve_tls_free. On any nonzero result no ranges are returned. EXT_INVALID
- * preserves the valid V1 prefix; ERROR means the prefix or I/O failed. */
+ * preserves the valid V1 prefix; INVALID means the prefix is damaged. */
 int ve_tls_checkpoint_save_ranges(ve_tls_platform * platform, const char * path,
     const ve_tls_checkpoint_state * state, const ve_tls_checkpoint_range * ranges, size_t count);
 int ve_tls_checkpoint_load_ranges(ve_tls_platform * platform, const char * path,

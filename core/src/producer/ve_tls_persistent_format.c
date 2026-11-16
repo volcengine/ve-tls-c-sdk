@@ -76,12 +76,15 @@ static const uint32_t crc32_table[256] = {
     0xB3667A2Eu, 0xC4614AB8u, 0x5D681B02u, 0x2A6F2B94u, 0xB40BBE37u, 0xC30C8EA1u, 0x5A05DF1Bu, 0x2D02EF8Du
 };
 
-static uint32_t crc32_bytes(const unsigned char * buf, size_t size) {
-    uint32_t crc = 0xFFFFFFFFu;
+uint32_t ve_tls_wal_crc32_update(uint32_t crc, const unsigned char * buf, size_t size) {
     for (size_t i = 0; i < size; i++) {
         crc = crc32_table[(crc ^ (uint32_t)buf[i]) & 0xFFu] ^ (crc >> 8);
     }
-    return crc ^ 0xFFFFFFFFu;
+    return crc;
+}
+
+static uint32_t crc32_bytes(const unsigned char * buf, size_t size) {
+    return ve_tls_wal_crc32_update(UINT32_MAX, buf, size) ^ UINT32_MAX;
 }
 
 static size_t ext_metadata_size(const ve_tls_persistent_record_view * view) {
@@ -119,6 +122,7 @@ size_t ve_tls_persistent_record_encoded_size(const ve_tls_persistent_record_view
         return 0;
     }
     ext_len += ext_metadata_size(view);
+    if (view->raw_time_ms) ext_len += 4 + 8;
     if (ext_len > VE_TLS_PERSISTENT_RECORD_EXT_MAX) {
         return 0;
     }
@@ -147,6 +151,7 @@ int ve_tls_persistent_record_encode(unsigned char * out, size_t out_cap, const v
     hash_key_ext_len = ext_hash_key_size(view);
     metadata_ext_len = ext_metadata_size(view);
     ext_len = hash_key_ext_len + metadata_ext_len;
+    if (view->raw_time_ms) ext_len += 4 + 8;
     flags = view->flags;
     if (ext_len > 0) {
         flags |= VE_TLS_PERSISTENT_RECORD_FLAG_HAS_EXT;
@@ -177,6 +182,13 @@ int ve_tls_persistent_record_encode(unsigned char * out, size_t out_cap, const v
         write_u32_le(out + pos + 16, crc32_bytes(out + pos + 4, 12));
         pos += metadata_ext_len;
     }
+    if (view->raw_time_ms) {
+        out[pos] = VE_TLS_PERSISTENT_EXT_TYPE_RAW_TIME;
+        out[pos + 1] = 0;
+        write_u16_le(out + pos + 2, 8);
+        write_u64_le(out + pos + 4, (uint64_t)view->raw_time_ms);
+        pos += 4 + 8;
+    }
     memcpy(out + pos, view->payload, view->payload_size);
     *out_size = total_len;
     return 0;
@@ -191,6 +203,8 @@ int ve_tls_persistent_record_decode(const unsigned char * buf, size_t size, ve_t
     size_t payload_size;
     size_t pos;
     int has_metadata = 0;
+    int has_raw_time = 0;
+    int bad_metadata_crc = 0;
     if (!buf || !out || size < VE_TLS_PERSISTENT_RECORD_HEADER_SIZE) {
         return -1;
     }
@@ -246,10 +260,8 @@ int ve_tls_persistent_record_decode(const unsigned char * buf, size_t size, ve_t
                 metadata_version = read_u32_le(buf + pos);
                 metadata_crc = read_u32_le(buf + pos + 12);
                 if (crc32_bytes(buf + pos, 12) != metadata_crc) {
-                    ve_tls_persistent_record_free(out);
-                    return -1;
-                }
-                if (metadata_version != VE_TLS_PERSISTENT_RECORD_VERSION_LEGACY &&
+                    bad_metadata_crc = 1;
+                } else if (metadata_version != VE_TLS_PERSISTENT_RECORD_VERSION_LEGACY &&
                     metadata_version != VE_TLS_PERSISTENT_RECORD_VERSION_CURRENT) {
                     ve_tls_persistent_record_free(out);
                     return VE_TLS_PERSISTENT_RECORD_UNSUPPORTED_VERSION;
@@ -257,6 +269,13 @@ int ve_tls_persistent_record_decode(const unsigned char * buf, size_t size, ve_t
                 has_metadata = 1;
                 out->record_version = metadata_version;
                 out->enqueue_time_ms = (int64_t)read_u64_le(buf + pos + 4);
+            } else if (type == VE_TLS_PERSISTENT_EXT_TYPE_RAW_TIME) {
+                if (has_raw_time || len != 8 || !(flags & VE_TLS_PERSISTENT_RECORD_FLAG_RAW)) {
+                    ve_tls_persistent_record_free(out);
+                    return -1;
+                }
+                has_raw_time = 1;
+                out->raw_time_ms = (int64_t)read_u64_le(buf + pos);
             }
             pos += len;
         }
@@ -266,16 +285,17 @@ int ve_tls_persistent_record_decode(const unsigned char * buf, size_t size, ve_t
         ve_tls_persistent_record_free(out);
         return -1;
     }
+    if (bad_metadata_crc || crc32_bytes(buf + pos, payload_size) != payload_crc) {
+        ve_tls_persistent_record_free(out);
+        out->log_id = (int64_t)read_u64_le(buf + 8);
+        return VE_TLS_PERSISTENT_RECORD_BAD_CRC;
+    }
     out->payload = (unsigned char *)ve_tls_malloc(payload_size);
     if (!out->payload) {
         ve_tls_persistent_record_free(out);
         return -1;
     }
     memcpy(out->payload, buf + pos, payload_size);
-    if (crc32_bytes(out->payload, payload_size) != payload_crc) {
-        ve_tls_persistent_record_free(out);
-        return -1;
-    }
     out->log_id = (int64_t)read_u64_le(buf + 8);
     out->flags = flags;
     out->payload_size = payload_size;
