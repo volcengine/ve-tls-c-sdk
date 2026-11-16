@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(ve_tls_c_sdk VERSION 0.3.5 LANGUAGES C)
+project(ve_tls_c_sdk VERSION 0.3.6 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -205,6 +205,7 @@ install(FILES
     docs/release-notes-0.3.0.md
     docs/release-notes-0.3.4.md
     docs/release-notes-0.3.5.md
+    docs/release-notes-0.3.6.md
     DESTINATION share/doc/ve_tls_core
 )
 
