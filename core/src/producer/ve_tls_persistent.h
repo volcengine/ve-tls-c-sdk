@@ -4,6 +4,7 @@
 #include "ve_tls_producer.h"
 #include "ve_tls_checkpoint.h"
 #include "ve_tls_lease.h"
+#include "ve_tls_persistent_format.h"
 #include "ve_tls_segment_store.h"
 
 #include <stdint.h>
@@ -16,6 +17,17 @@ enum {
     VE_TLS_PERSISTENT_FLUSH_CHECKPOINT_FAILED = -5,
     VE_TLS_PERSISTENT_APPEND_UNSUPPORTED_VERSION = -6
 };
+
+typedef enum {
+    VE_TLS_CREATE_OK = 0,
+    VE_TLS_CREATE_FAILED = 1,
+    VE_TLS_CREATE_INVALID_CONFIG = 2,
+    VE_TLS_CREATE_WAL_LOCK_BUSY = 3,
+    VE_TLS_CREATE_WAL_LEASE_PENDING = 4,
+    VE_TLS_CREATE_WAL_OPEN_FAILED = 5,
+    /* Status 6 is reserved for the Android binding's recovery phase. */
+    VE_TLS_CREATE_WAL_OPEN_IO_ERROR = 7
+} ve_tls_create_status;
 
 typedef struct {
     ve_tls_platform * platform;
@@ -45,8 +57,13 @@ typedef struct {
 typedef struct {
     uint64_t size;
     uint64_t records;
+    uint64_t replay_limit;
+    int64_t min_log_id;
     int64_t max_log_id;
+    uint64_t reset_generation;
     uint8_t exists;
+    uint8_t has_bad_crc;
+    uint8_t can_retire_bad_crc;
 } ve_tls_persistent_segment_meta;
 
 struct ve_tls_persistent {
@@ -83,12 +100,14 @@ struct ve_tls_persistent {
     uint64_t current_records;
     uint32_t current_segments;
     int64_t durable_checkpoint_acked_log_id;
+    uint32_t durable_checkpoint_last_segment_id;
     int64_t last_checkpoint_save_ms;
     int64_t checkpoint_dirty_since_ms;
     uint32_t next_reclaim_segment_id;
     int64_t last_reclaim_acked_log_id;
     uint64_t append_dropped_records;
     uint64_t append_dropped_bytes;
+    uint64_t sample_sequence;
     uint8_t checkpoint_dirty;
     uint8_t checkpoint_retry_pending;
     uint8_t reclaim_pending;
@@ -115,18 +134,50 @@ typedef struct ve_tls_persistent ve_tls_persistent;
    users of this object before closing it. A fork child fails closed and must
    create a new producer instance. */
 int ve_tls_persistent_open(ve_tls_persistent * persistent, const ve_tls_persistent_options * options);
+int ve_tls_persistent_open_with_status(
+    ve_tls_persistent * persistent,
+    const ve_tls_persistent_options * options,
+    ve_tls_create_status * status
+);
 void ve_tls_persistent_close(ve_tls_persistent * persistent);
 int ve_tls_persistent_append(ve_tls_persistent * persistent, int64_t log_id, const char * hash_key, const unsigned char * payload, size_t payload_size);
+/* A nonzero ref.segment_id means the record was written or may still exist.
+   ref.size is set only for a complete write, even if sync fails. sampled
+   starts at -1 on a new Producer add and is preserved across capacity retries. */
+int ve_tls_persistent_append_record(ve_tls_persistent * persistent, const ve_tls_persistent_record_view * record,
+    ve_tls_segment_record_ref * ref, int * sampled);
+typedef int (*ve_tls_persistent_recover_fn)(
+    int64_t log_id, int64_t enqueue_time_ms, const char * hash_key,
+    const unsigned char * payload, size_t payload_size, void * user
+);
+
+/* PAUSED and IO_ERROR leave the current record at the cursor for retry. */
+enum {
+    VE_TLS_PERSISTENT_RECOVER_PAUSED = 1,
+    VE_TLS_PERSISTENT_RECOVER_IO_ERROR = -2
+};
+typedef struct {
+    uint32_t segment_id;
+    uint64_t offset;
+    uint64_t segment_generation;
+} ve_tls_persistent_recovery_position;
+
+/* A checksum failure is reported with recovery_crc set and no payload. */
+typedef int (*ve_tls_persistent_recover_record_fn)(ve_tls_persistent_record * record, void * user);
+
 int ve_tls_persistent_recover(
     ve_tls_persistent * persistent,
-    int (*on_record)(
-        int64_t log_id,
-        int64_t enqueue_time_ms,
-        const char * hash_key,
-        const unsigned char * payload,
-        size_t payload_size,
-        void * user
-    ),
+    ve_tls_persistent_recover_fn on_record,
+    void * user
+);
+/* A zero end snapshots the active file. Otherwise read through the
+   supplied exclusive end, which the Producer publishes after admission. */
+int ve_tls_persistent_recover_from(
+    ve_tls_persistent * persistent,
+    ve_tls_persistent_recovery_position * position,
+    ve_tls_persistent_recovery_position * end,
+    int repair_tail,
+    ve_tls_persistent_recover_record_fn on_record,
     void * user
 );
 int ve_tls_persistent_ack_range(ve_tls_persistent * persistent, int64_t start_id, int64_t end_id);
@@ -139,6 +190,12 @@ int ve_tls_persistent_flush(ve_tls_persistent * persistent);
 
 /* Private bridge factory. Only the current complete configuration with
    persistence enabled is accepted; public factories remain mode 0. */
+ve_tls_producer * ve_tls_producer_create_exclusive_persistence_with_status(
+    const ve_tls_config * config,
+    size_t config_size,
+    ve_tls_create_status * status
+);
+
 ve_tls_producer * ve_tls_producer_create_exclusive_persistence(
     const ve_tls_config * config,
     size_t config_size

@@ -8,6 +8,7 @@
 #include "ve_tls_error.h"
 #include "ve_tls_pool.h"
 #include "ve_tls_snapshot.h"
+#include "ve_tls_persistent.h"
 
 #include <stdint.h>
 #include <stddef.h>
@@ -26,7 +27,6 @@ typedef struct {
 } ve_tls_log_item;
 
 typedef struct ve_tls_log_group_builder ve_tls_log_group_builder;
-typedef struct ve_tls_persistent ve_tls_persistent;
 
 struct ve_tls_log_group_builder {
     char * norm_key;
@@ -42,6 +42,7 @@ struct ve_tls_log_group_builder {
     int64_t start_id;
     int64_t end_id;
     int64_t first_append_ms;
+    int recovered;
     ve_tls_log_group_builder * next;
 };
 
@@ -177,6 +178,16 @@ struct ve_tls_producer {
     int closing;
     int32_t worker_flushing_count;
     int32_t active_persistent_appends;
+    int recovering;
+    ve_tls_thread * recovery_thread;
+    ve_tls_cond * recovery_cond;
+    int recovery_startup;
+    /* Protected by mutex. A zero end means the background reader is idle. */
+    ve_tls_persistent_recovery_position recovery_position;
+    ve_tls_persistent_recovery_position recovery_end;
+    size_t recovery_batch_bytes;
+    size_t recovery_send_headroom;
+    size_t recovery_builders;
     int32_t runtime_updates_inflight;
     _Alignas(8) int64_t next_id;
     ve_tls_log_item * queue;
@@ -284,6 +295,9 @@ void ve_tls_producer_release_send_queue_task_bytes(ve_tls_producer * producer, c
 void ve_tls_producer_move_send_task_to_inflight(ve_tls_producer * producer, const ve_tls_send_task * task);
 void ve_tls_producer_release_inflight_task_bytes(ve_tls_producer * producer, const ve_tls_send_task * task);
 int ve_tls_producer_reserve_scratch_bytes(ve_tls_producer * producer, size_t bytes);
+int ve_tls_producer_reserve_wal_scratch(ve_tls_producer * producer, size_t bytes);
+int ve_tls_producer_transfer_wal_body(ve_tls_producer * producer, ve_tls_send_task * task, size_t bytes);
+size_t ve_tls_compress_scratch_bound(size_t body_size);
 void ve_tls_producer_release_scratch_bytes(ve_tls_producer * producer, size_t bytes);
 int ve_tls_producer_swap_scratch_to_send_task_bytes(ve_tls_producer * producer, ve_tls_send_task * task);
 int ve_tls_latency_bucket_index(int64_t ms);
@@ -330,6 +344,8 @@ ve_tls_log_group_builder * ve_tls_log_builder_create(const char * norm_key);
 void ve_tls_log_builder_free(ve_tls_log_group_builder * b);
 size_t ve_tls_log_builder_estimate_kv_lens_size(int64_t time_ms, uint32_t time_ns, int32_t has_time_ns, const size_t * key_lens, const size_t * val_lens, size_t kv_count);
 int ve_tls_log_builder_add_kv_lens(ve_tls_log_group_builder * b, int64_t id, int64_t time_ms, uint32_t time_ns, int32_t has_time_ns, const ve_tls_kv * kvs, const size_t * key_lens, const size_t * val_lens, size_t kv_count);
+int ve_tls_log_payload_is_group_list(const unsigned char * data, size_t size);
+int64_t ve_tls_log_payload_time_ms(const unsigned char * payload, size_t payload_size);
 int ve_tls_log_payload_rewrite_time(
     const unsigned char * payload,
     size_t payload_size,
@@ -341,7 +357,14 @@ int ve_tls_log_builder_append(ve_tls_log_group_builder * b, const unsigned char 
 void ve_tls_log_builder_shrink_if_needed(ve_tls_log_group_builder * b, size_t shrink_threshold, size_t shrink_to);
 int ve_tls_producer_build_group_suffix(ve_tls_producer * producer);
 int ve_tls_builder_to_send_task(ve_tls_producer * producer, ve_tls_log_group_builder * b, ve_tls_send_task * out);
-int ve_tls_builder_move_to_send_task(ve_tls_producer * producer, ve_tls_log_group_builder * b, ve_tls_send_task * out);
+typedef enum {
+    VE_TLS_BUILDER_MOVE_OK = 0,
+    VE_TLS_BUILDER_MOVE_INVALID = -1,
+    VE_TLS_BUILDER_MOVE_ALLOC_FAILED = -2
+} ve_tls_builder_move_result;
+/* An allocation failure leaves the sealed builder intact for a retry. */
+ve_tls_builder_move_result ve_tls_builder_move_to_send_task(
+    ve_tls_producer * producer, ve_tls_log_group_builder * b, ve_tls_send_task * out);
 
 int ve_tls_send_queue_init(ve_tls_send_queue * q, ve_tls_platform * platform, size_t cap, ve_tls_obj_pool * task_pool);
 int ve_tls_send_queue_push(ve_tls_send_queue * q, const ve_tls_send_task * t, int wait_ms);

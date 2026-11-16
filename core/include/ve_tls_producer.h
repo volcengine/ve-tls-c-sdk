@@ -415,6 +415,11 @@ VE_TLS_API void ve_tls_producer_set_send_done_v2(ve_tls_producer * producer, ve_
 VE_TLS_API void ve_tls_producer_get_metrics(ve_tls_producer * producer, ve_tls_metrics * out);
 VE_TLS_API size_t ve_tls_producer_get_buffered_bytes(ve_tls_producer * producer);
 
+/* Persistent adds succeed at the configured WAL write/sync boundary. The
+ * Producer drains accepted records when send memory becomes available.
+ * The with_id variants publish an ID for a committed or uncertain WAL
+ * record. A pre-write rejection or a confirmed rollback leaves the ID at
+ * zero. A complete write followed by a sync error keeps its ID. */
 VE_TLS_API ve_tls_result ve_tls_producer_add_log_raw(ve_tls_producer * producer, const char * log_buf, size_t log_size, int flush);
 VE_TLS_API ve_tls_result ve_tls_producer_add_log_raw_time_parts(ve_tls_producer * producer, int64_t time_ms, int32_t has_time_ns, uint32_t time_ns, const char * log_buf, size_t log_size, int flush);
 VE_TLS_API ve_tls_result ve_tls_producer_add_log_raw_with_id(ve_tls_producer * producer, const char * log_buf, size_t log_size, int flush, int64_t * out_log_id);
@@ -437,6 +442,9 @@ VE_TLS_API void ve_tls_template_destroy(ve_tls_log_template * tpl);
 VE_TLS_API ve_tls_result ve_tls_producer_flush(ve_tls_producer * producer);
 /* Wake delayed retry batches early after network recovery. */
 VE_TLS_API ve_tls_result ve_tls_producer_notify_network_recovered(ve_tls_producer * producer);
+/* Recover once after creation and before accepting new logs. Recovery uses the
+ * configured buffer budget. Mobile bindings with exclusive WAL ownership can
+ * continue reading on a worker after the initial in-memory window is filled. */
 VE_TLS_API ve_tls_result ve_tls_producer_recover(ve_tls_producer * producer);
 VE_TLS_API ve_tls_result ve_tls_producer_export_raw_buffer(ve_tls_producer * producer, unsigned char ** out_buf, size_t * out_size);
 VE_TLS_API ve_tls_result ve_tls_producer_import_raw_buffer(ve_tls_producer * producer, const unsigned char * buf, size_t size);

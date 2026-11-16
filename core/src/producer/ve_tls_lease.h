@@ -11,6 +11,11 @@ enum {
     VE_TLS_LEASE_OPEN_TAKEOVER_IF_STALE = 1
 };
 
+enum {
+    VE_TLS_LEASE_GUARD_BUSY = -2,
+    VE_TLS_LEASE_PENDING = -2
+};
+
 typedef struct {
     char owner_id[64];
     int32_t owner_pid;
@@ -59,7 +64,13 @@ int ve_tls_lease_guard_lock(int fd, int wait);
 int ve_tls_lease_guard_unlock(int fd);
 void ve_tls_lease_guard_close(int fd);
 void ve_tls_lease_guard_leave(int fd);
-int ve_tls_lease_acquire_locked(const ve_tls_lease_options * options, ve_tls_lease_state * state);
+/* allow_dead_local_owner is reserved for local exclusive lifetime ownership;
+   shared callers pass 0 and retain the existing expiry-only takeover rule. */
+int ve_tls_lease_acquire_locked(
+    const ve_tls_lease_options * options,
+    ve_tls_lease_state * state,
+    int allow_dead_local_owner
+);
 int ve_tls_lease_heartbeat_locked(const ve_tls_lease_options * options, ve_tls_lease_state * state);
 int ve_tls_lease_validate_locked(
     ve_tls_platform * platform,

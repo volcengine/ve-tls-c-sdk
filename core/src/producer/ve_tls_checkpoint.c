@@ -125,10 +125,12 @@ static int checkpoint_paths(const char * path, char * tmp_path, char * parent) {
 
 static int load_prefix(ve_tls_platform * platform, ve_tls_file * file,
     ve_tls_checkpoint_file * file_data, ve_tls_checkpoint_state * state) {
-    if (read_full(platform, file, file_data, sizeof(*file_data)) != 0 ||
-        file_data->magic != VE_TLS_CHECKPOINT_MAGIC || file_data->version != VE_TLS_CHECKPOINT_VERSION ||
+    if (read_full(platform, file, file_data, sizeof(*file_data)) != 0) {
+        return VE_TLS_CHECKPOINT_LOAD_IO_ERROR;
+    }
+    if (file_data->magic != VE_TLS_CHECKPOINT_MAGIC || file_data->version != VE_TLS_CHECKPOINT_VERSION ||
         file_data->checksum != checksum_bytes((const unsigned char *)file_data, offsetof(ve_tls_checkpoint_file, checksum))) {
-        return -1;
+        return VE_TLS_CHECKPOINT_LOAD_INVALID;
     }
     state->acked_log_id = file_data->acked_log_id;
     state->replay_begin_log_id = file_data->replay_begin_log_id;
@@ -218,7 +220,7 @@ int ve_tls_checkpoint_load(ve_tls_platform * platform, const char * path, ve_tls
     if (!file) return -1;
     rc = load_prefix(platform, file, &file_data, state);
     platform->file_close(file);
-    return rc;
+    return rc == VE_TLS_CHECKPOINT_LOAD_OK ? 0 : -1;
 }
 
 int ve_tls_checkpoint_load_ranges(ve_tls_platform * platform, const char * path,
@@ -231,23 +233,26 @@ int ve_tls_checkpoint_load_ranges(ve_tls_platform * platform, const char * path,
     uint64_t stored_count;
     int64_t previous_end;
     uint32_t crc;
-    int rc = VE_TLS_CHECKPOINT_LOAD_ERROR;
-    if (!platform || !path || !state || !ranges || !count) return rc;
+    int rc = VE_TLS_CHECKPOINT_LOAD_IO_ERROR;
+    if (!platform || !path || !state || !ranges || !count) return VE_TLS_CHECKPOINT_LOAD_INVALID;
     memset(state, 0, sizeof(*state));
     *ranges = NULL;
     *count = 0;
     file = platform->file_open(path, VE_TLS_FILE_OPEN_RDONLY, 0);
     if (!file) return rc;
-    if (load_prefix(platform, file, &file_data, state) != 0) goto done;
     file_size = platform->file_seek(file, 0, VE_TLS_FILE_SEEK_END);
-    if (file_size < 0 || platform->file_seek(file, (int64_t)sizeof(file_data), VE_TLS_FILE_SEEK_SET) < 0) goto done;
-    if ((uint64_t)file_size == sizeof(file_data)) {
-        rc = VE_TLS_CHECKPOINT_LOAD_OK;
+    if (file_size < 0) goto done;
+    if ((uint64_t)file_size < sizeof(file_data)) {
+        rc = VE_TLS_CHECKPOINT_LOAD_INVALID;
         goto done;
     }
+    if (platform->file_seek(file, 0, VE_TLS_FILE_SEEK_SET) < 0) goto done;
+    rc = load_prefix(platform, file, &file_data, state);
+    if (rc != VE_TLS_CHECKPOINT_LOAD_OK || (uint64_t)file_size == sizeof(file_data)) goto done;
+
     rc = VE_TLS_CHECKPOINT_LOAD_EXT_INVALID;
     if ((uint64_t)file_size < sizeof(file_data) + sizeof(header)) goto done;
-    rc = VE_TLS_CHECKPOINT_LOAD_ERROR;
+    rc = VE_TLS_CHECKPOINT_LOAD_IO_ERROR;
     if (read_full(platform, file, header, sizeof(header)) != 0) goto done;
     rc = VE_TLS_CHECKPOINT_LOAD_EXT_INVALID;
     stored_count = read_u64_le(header + 8);
@@ -267,7 +272,7 @@ int ve_tls_checkpoint_load_ranges(ve_tls_platform * platform, const char * path,
     for (uint64_t i = 0; i < stored_count; i++) {
         uint64_t start;
         uint64_t end;
-        rc = VE_TLS_CHECKPOINT_LOAD_ERROR;
+        rc = VE_TLS_CHECKPOINT_LOAD_IO_ERROR;
         if (read_full(platform, file, record, sizeof(record)) != 0) goto done;
         crc = crc32_update(crc, record, sizeof(record));
         start = read_u64_le(record);

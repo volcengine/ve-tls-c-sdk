@@ -40,7 +40,7 @@ for a future platform adapter, but is not DLL compatibility evidence.
 
 ## Versioning
 
-The 0.3.5 SDK package defines `VE_TLS_C_SDK_VERSION` as `"0.3.5"`.
+The 0.3.6 SDK package defines `VE_TLS_C_SDK_VERSION` as `"0.3.6"`.
 `VE_TLS_C_SDK_API_VERSION` remains `"0.3.0"`: it is the default TLS service
 API version sent in the `x-tls-apiversion` request header, not a C ABI version.
 Changing the package version must not silently change the service protocol.
